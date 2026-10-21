@@ -163,6 +163,7 @@ fn test_cmd(
         Err(e) => eprintln!("警告：{e:#}"),
     }
 
+    let (started_wall, started) = (std::time::SystemTime::now(), std::time::Instant::now());
     let batch = runner::run_batch(&items);
     let (mut pass, mut fail, mut skip) = (0usize, 0usize, 0usize);
     for r in &batch.results {
@@ -176,7 +177,15 @@ fn test_cmd(
     println!("\n通过 {pass} / 失败 {fail} / 跳过 {skip}");
 
     if let Some(p) = report_path {
-        match std::fs::write(&p, report::render_text(&batch.device, &batch.results)) {
+        let meta = report::ReportMeta {
+            station: cfg.station.clone(),
+            started_utc: report::time_str(started_wall),
+            elapsed_secs: started.elapsed().as_secs(),
+        };
+        match std::fs::write(
+            &p,
+            report::render_text(&meta, &batch.device, &batch.results),
+        ) {
             Ok(()) => println!("报告已写入 {p}"),
             Err(e) => eprintln!("写报告失败: {e}"),
         }

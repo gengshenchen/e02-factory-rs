@@ -123,6 +123,13 @@ pub fn show(ctx: &egui::Context, app: &mut E02App) {
             });
 
             ui.separator();
+            ui.strong("报告");
+            ui.checkbox(
+                &mut app.config.report_by_sn,
+                "按 SN 归档到 reports/<SN>/（关闭则按时间戳平铺；空 SN 归入 unknown/）",
+            );
+
+            ui.separator();
             ui.horizontal(|ui| {
                 if ui.button("保存到 config.toml").clicked() {
                     save_msg = Some(

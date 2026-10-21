@@ -12,7 +12,7 @@ use crate::report;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
 /// 一键全测顺序，对应原程序 OnBnClickedButton14 的调用顺序（陀螺仪追加在末尾）。
 pub const BATCH_ORDER: [TestItem; 12] = [
@@ -43,6 +43,7 @@ pub fn run_sequence(
     let _ = std::fs::create_dir_all(media_dir);
     let _ = std::fs::create_dir_all(reports_dir);
     let _ = tx.send(UiEvent::Started);
+    let (started_wall, started) = (SystemTime::now(), Instant::now());
 
     let mut device = DeviceInfo::default();
     let mut results: Vec<TestResult> = Vec::new();
@@ -70,7 +71,20 @@ pub fn run_sequence(
         let _ = tx.send(UiEvent::Result(result.clone(), dev));
         results.push(result);
     }
-    report::write_report(reports_dir, &device, &results)
+    let meta = report::ReportMeta {
+        station: cfg.station.clone(),
+        started_utc: report::time_str(started_wall),
+        elapsed_secs: started.elapsed().as_secs(),
+    };
+    // SN 归档（V2.3）：开启后落到 reports/<SN>/，空 SN 归入 unknown/
+    let sn_dir = cfg.report_by_sn.then(|| {
+        if device.sn.is_empty() {
+            "unknown".to_string()
+        } else {
+            device.sn.clone()
+        }
+    });
+    report::write_report(reports_dir, sn_dir.as_deref(), &meta, &device, &results)
 }
 
 /// 日志/detail 截断（尾部加省略号）。
@@ -499,7 +513,10 @@ mod tests {
         ];
         let media_c = media.clone();
         let reports_c = reports.clone();
-        let cfg = Config::default();
+        let cfg = Config {
+            report_by_sn: true, // V2.3：主流程端到端顺带验证 SN 归档
+            ..Config::default()
+        };
         let handle =
             thread::spawn(move || run_sequence(&items, &tx, &mrx, &media_c, &reports_c, &cfg));
 
@@ -543,6 +560,11 @@ mod tests {
         let text = std::fs::read_to_string(&report).unwrap();
         assert!(text.contains("sn-address:002"));
         assert!(text.contains("指示灯测试:PASS"));
+        assert!(text.contains("工位: complete"));
+        assert!(text.contains("汇总: 4 项，PASS 4，FAIL 0，跳过 0"));
+        // SN 归档 + JSON 成对
+        assert!(report.starts_with(reports.join("002")));
+        assert!(report.with_extension("json").exists());
 
         // —— V2.1 按键引导：三场景（顺序执行，防 ADB 环境变量竞争）——
         let kscript = base.join("adb-keys");

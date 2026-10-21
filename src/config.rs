@@ -142,6 +142,9 @@ pub struct Config {
     pub keys: KeysCfg,
     #[serde(default)]
     pub gyro: GyroCfg,
+    /// 报告按 SN 归档到 reports/<SN>/（V2.3）
+    #[serde(default)]
+    pub report_by_sn: bool,
 }
 
 fn d_station() -> String {
@@ -176,6 +179,7 @@ impl Default for Config {
             wifi: WifiCfg::default(),
             keys: KeysCfg::default(),
             gyro: GyroCfg::default(),
+            report_by_sn: false,
         }
     }
 }

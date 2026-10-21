@@ -8,7 +8,7 @@ pub mod worker;
 use crate::protocol::CameraFactory;
 
 /// 单个测试项的判定结果。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum Verdict {
     /// 未执行
     Pending,
@@ -41,7 +41,7 @@ impl Verdict {
 }
 
 /// 测试项：与 camera-factory 子命令对应的 11 项 + 陀螺仪（V2.2，shell 命令实现）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
 pub enum TestItem {
     Video,
     Photo,
@@ -133,7 +133,7 @@ impl TestItem {
 }
 
 /// 一条测试结果。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct TestResult {
     pub item: TestItem,
     pub verdict: Verdict,
