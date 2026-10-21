@@ -1,0 +1,78 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: e02-factory-rs-linux-x86_64
+          - os: windows-latest
+            artifact: e02-factory-rs-windows-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Release 构建
+        run: cargo build --release --locked
+
+      # ---- Linux: tar.gz + deb ----
+      - name: 打包 tar.gz
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p dist
+          tar -czf dist/${{ matrix.artifact }}.tar.gz -C target/release e02-factory-rs
+
+      - name: 构建 deb 安装包
+        if: runner.os == 'Linux'
+        run: |
+          cargo install cargo-deb --locked
+          cargo deb --no-build --output dist/e02-factory-rs_amd64.deb
+
+      # ---- Windows: zip + MSI ----
+      - name: 打包 zip
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Compress-Archive -Path target/release/e02-factory-rs.exe -DestinationPath dist/${{ matrix.artifact }}.zip
+
+      - name: 构建 MSI 安装包
+        if: runner.os == 'Windows'
+        run: |
+          cargo install cargo-wix --locked
+          cargo wix init
+          cargo wix
+          Get-ChildItem target/wix/*.msi | Move-Item -Destination dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

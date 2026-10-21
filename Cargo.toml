@@ -1,0 +1,22 @@
+[package]
+name = "e02-factory-rs"
+version = "0.1.0"
+edition = "2021"
+description = "E02 工厂测试上位机（跨平台，Rust 重写）"
+authors = ["gengshenchen <karlchen.me@outlook.com>"]
+
+[dependencies]
+eframe = "0.29"
+egui = "0.29"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# deb 打包元数据（cargo deb 使用）
+[package.metadata.deb]
+maintainer = "gengshenchen <karlchen.me@outlook.com>"
+depends = "$auto"
+section = "utils"
