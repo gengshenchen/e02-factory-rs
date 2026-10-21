@@ -93,26 +93,38 @@ pub fn render_text(
     s
 }
 
-/// 写入报告文件 `e02-<stem>-<SN|unknown>.txt`，返回路径。
-/// 序列内边测边写复用同一 stem；SN 中途解析到后文件名变化，
-/// 由调用方（worker）删除旧文件。
+/// 写入报告，返回路径。文件名规则（V3.2 产线反馈：同机重测要更新同一份报告）：
+/// - SN 已知：`e02-<日期>-<SN>.txt` —— 同机同日一份，重测/单项补测覆盖更新；
+/// - SN 未知：`e02-<日期>-<时分秒>-unknown.txt` —— 带时间戳，多台未知机不互踩。
+///
+/// SN 中途解析到后文件名变化，旧文件由调用方（worker）删除。
 pub fn write_report(
     dir: &Path,
     meta: &ReportMeta,
     device: &DeviceInfo,
     results: &[TestResult],
-    stem: &str,
     finished: bool,
 ) -> Option<PathBuf> {
     std::fs::create_dir_all(dir).ok()?;
-    let sn = if device.sn.is_empty() {
-        "unknown".to_string()
+    let path = dir.join(file_name(meta, device));
+    std::fs::write(&path, render_text(meta, device, results, finished)).ok()?;
+    Some(path)
+}
+
+/// 报告文件名（meta.started 为 `yyyymmdd-hhmmss`，长度不足时整体兜底）。
+fn file_name(meta: &ReportMeta, device: &DeviceInfo) -> String {
+    let ts = &meta.started;
+    let (day, hms) = if ts.len() == 15 {
+        (&ts[..8], &ts[9..])
+    } else {
+        (ts.as_str(), "unknown")
+    };
+    let tail = if device.sn.is_empty() {
+        format!("{hms}-unknown")
     } else {
         sanitize_sn(&device.sn)
     };
-    let path = dir.join(format!("e02-{stem}-{sn}.txt"));
-    std::fs::write(&path, render_text(meta, device, results, finished)).ok()?;
-    Some(path)
+    format!("e02-{day}-{tail}.txt")
 }
 
 /// SN 作文件名成分：非 `[A-Za-z0-9._-]` 字符替换为 `_`（防路径穿越/非法文件名字符）。
@@ -262,31 +274,31 @@ mod tests {
     }
 
     #[test]
-    fn filename_carries_sn_and_renames() {
+    fn filename_is_per_unit_per_day() {
         let dir = std::env::temp_dir().join(format!("e02-report-{}", std::process::id()));
         let r = result(TestItem::Wifi, Verdict::Pass);
-        // SN 未解析到 → unknown
+        // SN 未解析到 → 日期+时分秒+unknown
         let p1 = write_report(
             &dir,
             &meta(),
             &DeviceInfo::default(),
             std::slice::from_ref(&r),
-            "t1",
             true,
         )
         .unwrap();
-        assert!(p1.ends_with("e02-t1-unknown.txt"));
-        assert!(p1.exists());
-        // SN 解析到 → 新文件名（调用方删旧文件）
+        assert!(p1.ends_with("e02-20261022-103012-unknown.txt"));
+        // SN 解析到 → 同机同日一份
         let dev = DeviceInfo {
             sn: "SN 123".into(),
             ..Default::default()
         };
-        let p2 = write_report(&dir, &meta(), &dev, &[r], "t1", true).unwrap();
-        assert!(p2.ends_with("e02-t1-SN_123.txt"));
-        assert!(p2.exists());
+        let p2 = write_report(&dir, &meta(), &dev, &[r], true).unwrap();
+        assert!(p2.ends_with("e02-20261022-SN_123.txt"));
+        // 同机同日再写 → 同一路径（重测覆盖更新）
+        let p3 = write_report(&dir, &meta(), &dev, &[], true).unwrap();
+        assert_eq!(p2, p3);
         // SN 含路径字符 → 替换为 _（防目录穿越）
-        let p3 = write_report(
+        let p4 = write_report(
             &dir,
             &meta(),
             &DeviceInfo {
@@ -294,47 +306,41 @@ mod tests {
                 ..Default::default()
             },
             &[],
-            "t2",
             true,
         )
         .unwrap();
-        assert!(p3.ends_with("e02-t2-.._x.txt"));
+        assert!(p4.ends_with("e02-20261022-.._x.txt"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn scan_stats_and_listing_by_day() {
         let dir = std::env::temp_dir().join(format!("e02-stats-{}", std::process::id()));
-        let dev = DeviceInfo {
-            sn: "SN1".into(),
-            ..Default::default()
+        // 当日三台（两 PASS 一 FAIL，SN 各异），他日一台不计数
+        for (sn, verdict) in [
+            ("SN1", Verdict::Pass),
+            ("SN2", Verdict::Pass),
+            ("SN3", Verdict::Fail),
+        ] {
+            let dev = DeviceInfo {
+                sn: sn.into(),
+                ..Default::default()
+            };
+            let r = result(TestItem::Wifi, verdict);
+            write_report(&dir, &meta(), &dev, std::slice::from_ref(&r), true);
+        }
+        let other_day = ReportMeta {
+            started: "20261021-080000".into(),
+            ..meta()
         };
-        // 当日两 PASS 一 FAIL，他日一条不计数
         write_report(
             &dir,
-            &meta(),
-            &dev,
+            &other_day,
+            &DeviceInfo {
+                sn: "SN9".into(),
+                ..Default::default()
+            },
             &[result(TestItem::Wifi, Verdict::Pass)],
-            "20261022-080000",
-            true,
-        );
-        write_report(
-            &dir,
-            &meta(),
-            &dev,
-            &[result(TestItem::Wifi, Verdict::Pass)],
-            "20261022-090000",
-            true,
-        );
-        let mut fail_r = result(TestItem::Wifi, Verdict::Fail);
-        fail_r.detail = "丢包".into();
-        write_report(&dir, &meta(), &dev, &[fail_r], "20261022-100000", true);
-        write_report(
-            &dir,
-            &meta(),
-            &dev,
-            &[result(TestItem::Wifi, Verdict::Pass)],
-            "20261021-080000",
             true,
         );
         let s = scan_stats(&dir, "20261022");
@@ -346,11 +352,11 @@ mod tests {
                 fail: 1
             }
         );
-        // 列表新→旧，仅当日与他日共 4 条，最多取 2
+        // 列表新→旧：同日按文件名倒序，最多取 2
         let list = list_reports(&dir, 2);
         assert_eq!(list.len(), 2);
-        assert!(list[0].ends_with("e02-20261022-100000-SN1.txt"));
-        assert!(list[1].ends_with("e02-20261022-090000-SN1.txt"));
+        assert!(list[0].ends_with("e02-20261022-SN3.txt"));
+        assert!(list[1].ends_with("e02-20261022-SN2.txt"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

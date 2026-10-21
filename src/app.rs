@@ -126,6 +126,7 @@ pub struct E02App {
 impl E02App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         install_cjk_font(&cc.egui_ctx);
+        ui::theme::apply(&cc.egui_ctx);
         // 配置：exe 同目录 config.toml；缺失用内置默认，坏文件降级并提示
         let (cfg, cfg_err) = match Config::load(&config::default_path()) {
             Ok(c) => (c, None),
@@ -452,98 +453,102 @@ impl eframe::App for E02App {
         self.drain_events(ctx);
         self.tick_video(ctx);
 
-        egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
-            ui.horizontal_centered(|ui| {
-                ui.heading("E02 工厂测试工具");
-                ui.label(format!("工位: {}", self.config.station));
-                // 今日看板（V3 报告中心）
-                if let Some(t) = &self.today {
-                    let text = format!("今日 {} 台: PASS {} / FAIL {}", t.total, t.pass, t.fail);
-                    ui.colored_label(
-                        if t.fail > 0 {
-                            egui::Color32::RED
-                        } else if t.total > 0 {
-                            egui::Color32::GREEN
-                        } else {
-                            egui::Color32::GRAY
-                        },
-                        text,
+        egui::TopBottomPanel::top("top_bar")
+            .frame(
+                egui::Frame::default()
+                    .fill(ui::theme::SURFACE)
+                    .inner_margin(egui::Margin::symmetric(16.0, 10.0)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal_centered(|ui| {
+                    ui.label(
+                        egui::RichText::new("E02 工厂测试")
+                            .strong()
+                            .size(18.0)
+                            .color(ui::theme::INK),
                     );
-                }
-                if self.busy {
-                    if let Some(p) = &self.progress {
-                        let frac = p.done as f32 / p.total.max(1) as f32;
-                        let elapsed = p.started.elapsed();
-                        let text = format!(
-                            "{}/{}（{}）{:02}:{:02}",
-                            p.done,
-                            p.total,
-                            self.current
-                                .map(|i| i.label().to_string())
-                                .unwrap_or_default(),
-                            elapsed.as_secs() / 60,
-                            elapsed.as_secs() % 60
-                        );
-                        ui.add(egui::ProgressBar::new(frac).text(text).desired_width(320.0));
+                    ui.add_space(12.0);
+                    ui.label(
+                        egui::RichText::new(format!("工位 {}", self.config.station))
+                            .small()
+                            .color(ui::theme::INK_3),
+                    );
+                    // 今日看板（V3 报告中心）
+                    if let Some(t) = &self.today {
+                        ui.add_space(6.0);
+                        ui::theme::today_badges(ui, t);
                     }
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if self.busy
-                        && ui
-                            .add(
-                                egui::Button::new(
-                                    egui::RichText::new("停止测试").color(egui::Color32::WHITE),
-                                )
-                                .fill(egui::Color32::from_rgb(190, 50, 50)),
-                            )
-                            .clicked()
-                    {
-                        self.request_stop();
+                    if self.busy {
+                        if let Some(p) = &self.progress {
+                            let frac = p.done as f32 / p.total.max(1) as f32;
+                            let elapsed = p.started.elapsed();
+                            let text = format!(
+                                "{}/{}（{}）{:02}:{:02}",
+                                p.done,
+                                p.total,
+                                self.current
+                                    .map(|i| i.label().to_string())
+                                    .unwrap_or_default(),
+                                elapsed.as_secs() / 60,
+                                elapsed.as_secs() % 60
+                            );
+                            ui.add_space(10.0);
+                            ui.add(
+                                egui::ProgressBar::new(frac)
+                                    .text(text)
+                                    .desired_width(300.0)
+                                    .fill(ui::theme::ACCENT),
+                            );
+                        }
                     }
-                    if ui.button("设置").clicked() {
-                        self.settings_open = true;
-                    }
-                    if ui.button("查看报告").clicked() {
-                        self.refresh_reports();
-                        self.report_open = true;
-                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if self.busy && ui.add(ui::theme::danger("停止测试")).clicked() {
+                            self.request_stop();
+                        }
+                        if ui.button("查看报告").clicked() {
+                            self.refresh_reports();
+                            self.report_open = true;
+                        }
+                        if ui.button("设置").clicked() {
+                            self.settings_open = true;
+                        }
+                    });
                 });
             });
-        });
-        // 先注册的在最外沿：状态条贴底，日志面板在状态条上方
-        egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                if self.busy {
-                    ui.spinner();
-                    ui.label(format!(
-                        "正在测试：{}",
-                        self.current
-                            .map(|i| i.label().to_string())
-                            .unwrap_or_default()
-                    ));
-                } else {
-                    ui.label("就绪");
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if let Some(last) = self.log.back() {
-                        ui.small(last);
-                    }
-                });
-            });
-        });
+        // 深底日志面板贴底（状态并入日志标题行，去掉独立状态条）
         egui::TopBottomPanel::bottom("log_panel")
-            .default_height(140.0)
+            .default_height(150.0)
             .resizable(true)
+            .frame(
+                egui::Frame::default()
+                    .fill(ui::theme::DARK)
+                    .inner_margin(egui::Margin::symmetric(16.0, 8.0)),
+            )
             .show(ctx, |ui| ui::log_panel::show(ui, self));
         egui::SidePanel::left("test_panel")
             .resizable(false)
-            .default_width(216.0)
+            // 固定宽度：PanelState 会跨帧/跨次启动记忆面板实际宽度，
+            // 内容一旦收缩会被"锁"在窄宽度上，钉死免受污染
+            .exact_width(236.0)
+            .frame(
+                egui::Frame::default()
+                    .fill(ui::theme::SURFACE)
+                    .inner_margin(egui::Margin::symmetric(14.0, 12.0)),
+            )
             .show(ctx, |ui| ui::panel_tests::show(ui, self));
         egui::SidePanel::right("device_panel")
             .resizable(false)
-            .default_width(300.0)
+            .exact_width(320.0)
+            .frame(
+                egui::Frame::default()
+                    .fill(ui::theme::SURFACE)
+                    .inner_margin(egui::Margin::symmetric(14.0, 12.0)),
+            )
             .show(ctx, |ui| ui::panel_device::show(ui, self));
-        egui::CentralPanel::default().show(ctx, |ui| ui::panel_media::show(ui, self));
+        // 媒体区：深底"屏幕井"，拍照/录像内容突出呈现
+        egui::CentralPanel::default()
+            .frame(egui::Frame::default().fill(ui::theme::DARK))
+            .show(ctx, |ui| ui::panel_media::show(ui, self));
         // 人工判定模态窗（指示灯 / MIC·喇叭）
         ui::dialog_manual::show(ctx, self);
         // 按键引导弹窗（V2.1）

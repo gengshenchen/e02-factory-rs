@@ -58,7 +58,6 @@ pub fn run_sequence(
 
     let mut device = DeviceInfo::default();
     let mut results: Vec<TestResult> = Vec::new();
-    let stem = report::time_str(started_wall);
     let _ = tx.send(UiEvent::Log(format!(
         "序列开始，工位 {}，共 {} 项（自动 {} + 人工 {}），单项超时 {}",
         cfg.station,
@@ -98,14 +97,13 @@ pub fn run_sequence(
         }
         let _ = tx.send(UiEvent::Result(result.clone(), dev));
         results.push(result);
-        // 报告边测边写（V2.3）：文件名固定、逐项覆盖，中途卡死/退出也留有报告；
-        // SN 中途解析到后文件名变化，删除旧文件（V3）
+        // 报告边测边写：中途卡死/退出也留有报告；文件名同机同日固定，
+        // 重测覆盖更新，SN 中途解析到后改名并删旧文件（V3.2）
         let _ = write_update(
             reports_dir,
             &meta(cfg, started_wall, started),
             &device,
             &results,
-            &stem,
             false,
             &mut written,
         );
@@ -132,24 +130,21 @@ pub fn run_sequence(
         &meta(cfg, started_wall, started),
         &device,
         &results,
-        &stem,
         true,
         &mut written,
     )
 }
 
 /// 写报告并在文件名变化（SN 解析到）时删除旧文件，返回最终路径。
-#[allow(clippy::too_many_arguments)]
 fn write_update(
     reports_dir: &Path,
     meta: &report::ReportMeta,
     device: &DeviceInfo,
     results: &[TestResult],
-    stem: &str,
     finished: bool,
     written: &mut Option<PathBuf>,
 ) -> Option<PathBuf> {
-    let path = report::write_report(reports_dir, meta, device, results, stem, finished);
+    let path = report::write_report(reports_dir, meta, device, results, finished);
     if let (Some(new), Some(old)) = (&path, &*written) {
         if new != old {
             let _ = std::fs::remove_file(old);
@@ -326,7 +321,8 @@ fn video_flow(tx: &Sender<UiEvent>, media_dir: &Path) -> RunOutcome {
     }
 }
 
-/// 人工判定流程：发命令 → 弹窗询问 → 阻塞等待应答（原 MessageBox 语义）。
+/// 人工判定流程：先弹窗再驱动设备（V3.2：原顺序先跑完命令才弹窗，
+/// 操作员盯着空界面干等）→ 弹窗询问 → 阻塞等待应答（原 MessageBox 语义）。
 fn manual_flow(
     item: TestItem,
     question: &str,
@@ -342,14 +338,16 @@ fn manual_flow(
         .expect("人工判定项必有设备命令")
         .device_cmd();
     let n = repeat.unwrap_or(1);
-    let _ = tx.send(UiEvent::Log(format!("执行 adb shell {cmd} 共 {n} 次")));
-    for _ in 0..n {
-        let _ = adb::shell(&cmd);
-    }
     let _ = tx.send(UiEvent::Manual {
         item,
         question: question.to_string(),
     });
+    let _ = tx.send(UiEvent::Log(format!(
+        "执行 adb shell {cmd} 共 {n} 次，请观察"
+    )));
+    for _ in 0..n {
+        let _ = adb::shell(&cmd);
+    }
     match recv_manual(manual, manual_secs) {
         Ok(UiResponse::Manual(true)) => r.verdict = Verdict::ManualYes,
         Ok(UiResponse::Manual(false)) => r.verdict = Verdict::ManualNo,

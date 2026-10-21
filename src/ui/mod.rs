@@ -9,3 +9,4 @@ pub mod panel_device;
 pub mod panel_media;
 pub mod panel_settings;
 pub mod panel_tests;
+pub mod theme;

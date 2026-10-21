@@ -1,7 +1,9 @@
-//! 报告中心（V3）：历史报告浏览——左侧列表（新→旧）+ 右侧内容，
-//! 顶部今日统计与"打开报告文件夹"。
+//! 报告中心（V3，V3.2 视觉强化）：历史报告浏览——左侧列表 + 右侧内容，
+//! 顶部今日看板与"打开报告文件夹"。
 
 use crate::app::E02App;
+use crate::ui::theme;
+use egui::{Color32, Rounding, Sense};
 
 pub fn show(ctx: &egui::Context, app: &mut E02App) {
     if !app.report_open {
@@ -12,15 +14,12 @@ pub fn show(ctx: &egui::Context, app: &mut E02App) {
     egui::Window::new("报告中心")
         .open(&mut open)
         .collapsible(false)
-        .default_size([820.0, 540.0])
+        .default_size([860.0, 560.0])
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
                 if let Some(t) = &app.today {
-                    ui.strong(format!(
-                        "今日 {} 台: PASS {} / FAIL {}",
-                        t.total, t.pass, t.fail
-                    ));
+                    theme::today_badges(ui, t);
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("刷新").clicked() {
@@ -33,46 +32,80 @@ pub fn show(ctx: &egui::Context, app: &mut E02App) {
                     }
                 });
             });
-            ui.separator();
+            ui.add_space(6.0);
             egui::SidePanel::left("report_list")
                 .resizable(true)
-                .default_width(230.0)
+                .default_width(240.0)
                 .show_inside(ui, |ui| {
                     egui::ScrollArea::vertical().show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 2.0;
                         if app.report_list.is_empty() {
-                            ui.label("报告目录暂无报告");
-                            ui.small(app.reports_dir.display().to_string());
+                            ui.label(egui::RichText::new("报告目录暂无报告").color(theme::INK_3));
+                            ui.small(
+                                egui::RichText::new(app.reports_dir.display().to_string())
+                                    .color(theme::INK_3),
+                            );
                             return;
                         }
                         let sel = app.report_sel.clone();
                         let list = app.report_list.clone();
                         for p in list {
-                            // 文件名 e02-<时间>-<SN>.txt → 显示去前后缀
                             let stem = p
                                 .file_stem()
                                 .map(|s| s.to_string_lossy().to_string())
                                 .unwrap_or_default();
-                            let name = stem
-                                .strip_prefix("e02-")
-                                .map(str::to_string)
-                                .unwrap_or(stem);
                             let selected = sel.as_ref() == Some(&p);
-                            if ui.selectable_label(selected, name).clicked() {
+                            let resp = egui::Frame::default()
+                                .fill(if selected {
+                                    theme::ACCENT_BG
+                                } else {
+                                    Color32::TRANSPARENT
+                                })
+                                .rounding(Rounding::same(8.0))
+                                .inner_margin(egui::Margin::symmetric(8.0, 6.0))
+                                .show(ui, |ui| {
+                                    let name = egui::RichText::new(display_name(&stem));
+                                    let name = if selected { name.strong() } else { name };
+                                    ui.label(name.color(if selected {
+                                        theme::INK
+                                    } else {
+                                        theme::INK_2
+                                    }));
+                                })
+                                .response
+                                .interact(Sense::click());
+                            if resp.hovered() {
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                ui.painter().rect_filled(
+                                    resp.rect,
+                                    Rounding::same(8.0),
+                                    Color32::from_black_alpha(5),
+                                );
+                            }
+                            if resp.clicked() {
                                 app.report_sel = Some(p);
                             }
                         }
                     });
                 });
-            egui::CentralPanel::default().show_inside(ui, |ui| match app.report_content() {
-                Some(text) => {
-                    egui::ScrollArea::vertical()
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| ui.monospace(text));
-                }
-                None => {
-                    ui.label("选择左侧报告查看内容");
-                }
-            });
+            egui::CentralPanel::default()
+                .frame(egui::Frame::default().fill(theme::SURFACE))
+                .show_inside(ui, |ui| match app.report_content() {
+                    Some(text) => {
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.label(egui::RichText::new(text).monospace().color(theme::INK_2));
+                            });
+                    }
+                    None => {
+                        ui.centered_and_justified(|ui| {
+                            ui.label(
+                                egui::RichText::new("选择左侧报告查看内容").color(theme::INK_3),
+                            );
+                        });
+                    }
+                });
         });
     app.report_open = open;
     if open_failed {
@@ -81,6 +114,24 @@ pub fn show(ctx: &egui::Context, app: &mut E02App) {
             app.reports_dir.display()
         ));
     }
+}
+
+/// 列表显示名：`e02-<yyyymmdd>-<SN|hhmmss-unknown>` → `10-22 SN_123` / `10-22 10:30:12（无SN）`。
+fn display_name(stem: &str) -> String {
+    let Some(rest) = stem.strip_prefix("e02-") else {
+        return stem.to_string();
+    };
+    let (day, tail) = rest.split_at(rest.len().min(8));
+    if day.len() != 8 || !day.bytes().all(|b| b.is_ascii_digit()) {
+        return rest.to_string();
+    }
+    let date = format!("{}-{}", &day[4..6], &day[6..8]);
+    if let Some(t) = tail.strip_suffix("-unknown") {
+        if t.len() == 6 && t.bytes().all(|b| b.is_ascii_digit()) {
+            return format!("{date} {}:{}:{}（无SN）", &t[..2], &t[2..4], &t[4..6]);
+        }
+    }
+    format!("{date} {tail}")
 }
 
 /// 用系统文件管理器打开报告目录（Windows explorer / Linux xdg-open）。

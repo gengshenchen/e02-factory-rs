@@ -1,12 +1,13 @@
-//! 中央媒体区：拍照图片显示 / 录像抽帧回放（对应原 CImage 与 VLC 播放区域）。
+//! 中央媒体区：拍照图片显示 / 录像抽帧回放（深底"屏幕井"）。
 
 use crate::app::{E02App, MediaState};
+use crate::ui::theme;
 
 pub fn show(ui: &mut egui::Ui, app: &mut E02App) {
     match &app.media {
         MediaState::Note(note) => {
             ui.centered_and_justified(|ui| {
-                ui.label(note);
+                ui.label(egui::RichText::new(note.as_str()).color(theme::DARK_INK));
             });
         }
         MediaState::Photo { texture, size } => {
@@ -21,12 +22,16 @@ pub fn show(ui: &mut egui::Ui, app: &mut E02App) {
         } => {
             draw_fit(ui, &frames[*idx], sizes[*idx]);
             ui.with_layout(egui::Layout::bottom_up(egui::Align::RIGHT), |ui| {
-                ui.small(format!(
-                    "录像回放 {}/{}{}",
-                    idx + 1,
-                    frames.len(),
-                    if *has_audio { "（含音频流）" } else { "" }
-                ));
+                ui.label(
+                    egui::RichText::new(format!(
+                        "录像回放 {}/{}{}",
+                        idx + 1,
+                        frames.len(),
+                        if *has_audio { "（含音频流）" } else { "" }
+                    ))
+                    .small()
+                    .color(theme::DARK_INK_2),
+                );
             });
         }
     }
