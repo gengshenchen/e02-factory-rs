@@ -1,13 +1,12 @@
 //! E02 工厂测试工具（跨平台重写版）入口。
 //!
-//! M0 骨架：窗口 + 中文字体 + 三栏布局空壳。
-// TODO(M1/M2): adb/protocol/report 的函数接入引擎后移除此豁免
-#![allow(dead_code)]
+//! GUI 三栏布局（测试项/媒体/设备信息）+ 无参启动 CLI 模式。
 
 mod adb;
 mod app;
 mod cli;
 mod engine;
+mod player;
 mod protocol;
 mod report;
 mod ui;

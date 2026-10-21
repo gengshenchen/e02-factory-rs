@@ -31,6 +31,10 @@ impl CameraFactory {
     }
 }
 
+/// 设备侧媒体文件远端路径（原程序 adb pull 的参数）。
+pub const REMOTE_PHOTO: &str = "/tmp/mnt/sdcard/F1/Videos/testjpeg.jpg";
+pub const REMOTE_VIDEO: &str = "/tmp/mnt/sdcard/F1/Videos/testvideo.mp4";
+
 /// 设备信息（原 Deviceinfo 结构）。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceInfo {

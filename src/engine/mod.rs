@@ -1,10 +1,11 @@
 //! 测试引擎数据模型：测试项定义、判定状态与结果。
 //! M2 起接入 worker 线程编排（命令分发、结果回传）。
 
+pub mod events;
 pub mod runner;
+pub mod worker;
 
 use crate::protocol::CameraFactory;
-use std::time::SystemTime;
 
 /// 单个测试项的判定结果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,7 +134,6 @@ pub struct TestResult {
     pub verdict: Verdict,
     /// 附加信息：电压值、失败原因等
     pub detail: String,
-    pub at: SystemTime,
 }
 
 impl TestResult {
@@ -142,7 +142,6 @@ impl TestResult {
             item,
             verdict: Verdict::Pending,
             detail: String::new(),
-            at: SystemTime::now(),
         }
     }
 }

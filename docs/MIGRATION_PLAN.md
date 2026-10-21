@@ -77,6 +77,8 @@
 | egui-video (ffmpeg-next) | 纯 Rust 集成；成熟度一般，解码器要自己编 |
 
 > 测试场景只是"确认录像能正常播放数秒"，libmpv 完全够用且最省事。
+>
+> **落地决策（2026-10）**：M4 最终采用 **ffmpeg sidecar**（全程解码 + 2fps 抽帧 + ffprobe 音频流探测）而非 libmpv——开发机与多数 Linux 发行版的 mpv 均静态链接 libmpv，无独立 .so 可链接，且系统级依赖加重产线部署。ffmpeg 全程解码成功即证明录像文件有效，验证强度高于原"能播 2.5 秒即过"；抽帧 PNG 在 UI 内 2fps 回放兼顾人工确认。如后续需要有声平滑播放，`player.rs` 接口不变，可平滑升级为 libmpv render API。
 
 ### 2.3 其余组件
 
@@ -104,7 +106,7 @@ anyhow = "1"               # 错误处理
 tracing = "0.1"
 tracing-appender = "0.2"
 serialport = "4"           # 可选：串口阶段启用
-libmpv = { package = "libmpv2", version = "4" }  # 视频阶段启用
+libmpv = { package = "libmpv2", version = "4" }  # 可选升级路径；M4 实际采用 ffmpeg sidecar
 
 [target.'cfg(windows)'.build-dependencies]
 # 如需嵌入图标: winresource = "0.1"
@@ -129,7 +131,7 @@ e02-factory-rs/
     ├── ui/
     │   ├── mod.rs         # 主布局：左侧测试按钮 / 中间媒体区 / 右侧设备信息+结果
     │   ├── panel_tests.rs # 12 个测试项按钮 + 全测进度
-    │   ├── panel_media.rs # 图片/视频显示区（egui 纹理 + libmpv 画面）
+    │   ├── panel_media.rs # 图片/视频显示区（egui 纹理 + ffmpeg 抽帧回放）
     │   ├── panel_device.rs# SN / WiFi MAC / BT MAC / 版本 / 电池 只读字段
     │   └── dialog_manual.rs # 人工判定模态（指示灯、MIC/喇叭）
     ├── adb.rs             # adb 封装：shell(cmd) -> String、pull(remote, local)、设备在线检测
@@ -137,7 +139,7 @@ e02-factory-rs/
     ├── engine/
     │   ├── mod.rs         # TestItem trait + TestStatus；测试编排器（线程）
     │   └── items.rs       # 12 个测试项实现（自动判定/人工判定/媒体展示）
-    ├── player.rs          # libmpv render API 封装 → egui 纹理
+    ├── player.rs          # ffmpeg sidecar 封装（抽帧解码 / 音频流探测）
     ├── report.rs          # 测试结果落盘（T32.txt 风格 / JSON，附时间戳）
     └── serial/            # 可选阶段：serialport + RealTimeInstruct 协议移植
 ```
@@ -186,7 +188,7 @@ struct DeviceInfo {                        // 对应原 Deviceinfo 结构
 | **M1 核心无 UI** | `adb.rs` + `protocol.rs` + 解析器 + CLI 入口 | 不开界面即可对真机跑单项测试并打印判定（回归对照原程序行为） |
 | **M2 UI + 自动判定项** | 按钮面板、设备信息、结果绿/红显示、信息/SD/电池/充电器/WiFi/按键测试 | Windows/Linux 上单项自动判定全通过 |
 | **M3 拍照显示** | image 解码 + 等比缩放上屏 | 拍照测试可见图片 |
-| **M4 视频播放** | libmpv render → egui 纹理；播放数秒自动停止 | 录像测试正常播放（对照原 2.5 秒逻辑改为可配置） |
+| **M4 视频验证** | ffmpeg sidecar 全程解码 + 2fps 抽帧回放（替代 libmpv，见 2.2 决策） | 解码成功且帧数正常；ffprobe 探测音频流 |
 | **M5 人工判定 + 全测 + 报告** | 模态判定、一键全测编排、结果落盘（JSON+文本）、日志 | 全流程与原程序等效 |
 | **M6 打包与 CI** | Windows 下Release 单 exe + mpv 依赖携带；GitLab CI 编译两平台 | 产线可部署 |
 
@@ -196,7 +198,7 @@ struct DeviceInfo {                        // 对应原 Deviceinfo 结构
 
 | 风险 | 对策 |
 |---|---|
-| libmpv Windows 分发 | 随程序带 mpv-2.dll + mpv 编解码依赖（约 40–70M），远小于 VLC 125M；或回退 libvlc FFI 方案 |
+| ffmpeg Windows 分发 | 随包带 ffmpeg.exe / ffprobe.exe（约 100M），或产线预装并置于 PATH；Linux/macOS CI 已预装。如日后换 libmpv，则随包带 mpv-2.dll（约 40–70M） |
 | 解析器行为差异导致误判 | M1 阶段用真机输出做对照测试（把 T32.txt 样例做成单元测试） |
 | 人工判定线程同步 | channel 暂停/恢复语义，先写集成测试再接 UI |
 | 产线习惯改变 | UI 布局按原对话框 1:1 排布，按钮文字沿用原中文 |
