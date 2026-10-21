@@ -8,6 +8,7 @@ use egui::Color32;
 pub fn verdict_color(verdict: Verdict) -> Color32 {
     match verdict {
         Verdict::Pending => Color32::GRAY,
+        Verdict::Skipped => Color32::DARK_GRAY,
         Verdict::Pass | Verdict::ManualYes => Color32::GREEN,
         Verdict::Fail | Verdict::ManualNo => Color32::RED,
     }

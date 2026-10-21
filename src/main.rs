@@ -6,6 +6,7 @@
 
 mod adb;
 mod app;
+mod cli;
 mod engine;
 mod protocol;
 mod report;
@@ -18,6 +19,12 @@ fn main() -> eframe::Result<()> {
         )
         .init();
     tracing::info!("E02 工厂测试工具启动");
+
+    // 有命令行参数 → CLI 模式（M1）；无参数 → 图形界面
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if !args.is_empty() {
+        std::process::exit(cli::run(&args));
+    }
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

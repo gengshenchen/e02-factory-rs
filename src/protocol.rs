@@ -25,9 +25,9 @@ pub enum CameraFactory {
 }
 
 impl CameraFactory {
-    /// 完整 adb 命令行。
-    pub fn adb_cmd(self) -> String {
-        format!("adb shell camera-factory {}", self as u8)
+    /// 设备侧命令（不含 `adb shell` 前缀，由 adb 层负责拼接）。
+    pub fn device_cmd(self) -> String {
+        format!("camera-factory {}", self as u8)
     }
 }
 
@@ -40,6 +40,32 @@ pub struct DeviceInfo {
     pub t32_ver: String,
     pub hardware_ver: String,
     pub battery: String,
+}
+
+impl DeviceInfo {
+    /// 用非空字段覆盖合并（camera-factory 3 与 10 返回的字段子集不同）。
+    pub fn merge(&mut self, other: DeviceInfo) {
+        let DeviceInfo {
+            sn,
+            wifi_mac,
+            bt_mac,
+            t32_ver,
+            hardware_ver,
+            battery,
+        } = other;
+        for (dst, src) in [
+            (&mut self.sn, sn),
+            (&mut self.wifi_mac, wifi_mac),
+            (&mut self.bt_mac, bt_mac),
+            (&mut self.t32_ver, t32_ver),
+            (&mut self.hardware_ver, hardware_ver),
+            (&mut self.battery, battery),
+        ] {
+            if !src.is_empty() {
+                *dst = src;
+            }
+        }
+    }
 }
 
 /// 解析 `camera-factory 3` / `10` 的输出（样例见仓库 T32.txt）。
@@ -148,9 +174,9 @@ mod tests {
     }
 
     #[test]
-    fn adb_cmd_format() {
-        assert_eq!(CameraFactory::Video.adb_cmd(), "adb shell camera-factory 1");
-        assert_eq!(CameraFactory::Keys.adb_cmd(), "adb shell camera-factory 15");
+    fn device_cmd_format() {
+        assert_eq!(CameraFactory::Video.device_cmd(), "camera-factory 1");
+        assert_eq!(CameraFactory::Keys.device_cmd(), "camera-factory 15");
     }
 
     #[test]

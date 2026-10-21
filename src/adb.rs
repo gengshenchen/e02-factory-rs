@@ -7,9 +7,14 @@ use anyhow::{bail, Context, Result};
 use std::path::Path;
 use std::process::Command;
 
+/// adb 可执行文件路径；环境变量 `ADB` 可覆盖（非常规安装路径/测试桩）。
+fn adb_path() -> String {
+    std::env::var("ADB").unwrap_or_else(|_| "adb".into())
+}
+
 /// 执行 `adb shell <cmd>`，返回去除首尾空白与 `\r` 的 stdout。
 pub fn shell(cmd: &str) -> Result<String> {
-    let out = Command::new("adb")
+    let out = Command::new(adb_path())
         .arg("shell")
         .arg(cmd)
         .output()
@@ -28,7 +33,7 @@ pub fn shell(cmd: &str) -> Result<String> {
 
 /// `adb pull <remote> <local>`。
 pub fn pull(remote: &str, local: &Path) -> Result<()> {
-    let out = Command::new("adb")
+    let out = Command::new(adb_path())
         .args(["pull", remote])
         .arg(local)
         .output()
@@ -62,7 +67,7 @@ pub fn parse_devices_output(output: &str) -> Vec<String> {
 
 /// 当前在线设备序列号列表。
 pub fn devices() -> Result<Vec<String>> {
-    let out = Command::new("adb")
+    let out = Command::new(adb_path())
         .arg("devices")
         .output()
         .context("执行 adb devices 失败")?;

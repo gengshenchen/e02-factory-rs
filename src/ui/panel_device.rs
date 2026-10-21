@@ -27,7 +27,7 @@ pub fn show(ui: &mut egui::Ui, app: &E02App) {
     let done: Vec<_> = app
         .results
         .iter()
-        .filter(|r| r.verdict != Verdict::Pending)
+        .filter(|r| !matches!(r.verdict, Verdict::Pending | Verdict::Skipped))
         .collect();
     if done.is_empty() {
         ui.colored_label(Color32::GRAY, "等待测试");

@@ -13,7 +13,10 @@ pub fn render_text(device: &DeviceInfo, results: &[TestResult]) -> String {
     s.push_str(&format!("hard-ware:{}\n", device.hardware_ver));
     s.push('\n');
     for r in results {
-        if r.verdict != crate::engine::Verdict::Pending {
+        if !matches!(
+            r.verdict,
+            crate::engine::Verdict::Pending | crate::engine::Verdict::Skipped
+        ) {
             s.push_str(&format!(
                 "{}:{} {}\n",
                 r.item.label(),

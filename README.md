@@ -23,7 +23,20 @@ cargo build --release        # 开发调试用 cargo run
 cargo test                   # 解析器等单元测试（无需真机）
 ```
 
-运行期依赖：`adb` 在 PATH 中；Linux 无其他系统库依赖。
+运行期依赖：`adb` 在 PATH 中（或用环境变量 `ADB` 指定路径）；Linux 无其他系统库依赖。
+
+## CLI（M1）
+
+无界面对真机跑自动判定测试，产线可脚本化：
+
+```bash
+e02-factory-rs list                # 测试项清单
+e02-factory-rs devices             # adb 在线设备
+e02-factory-rs test info wifi      # 跑指定测试项（空格分隔）
+e02-factory-rs all --report r.txt  # 全部自动判定项 + 文本报告
+```
+
+人工判定项（指示灯/MIC·喇叭）与媒体项（录像/拍照）在 CLI 下标记为跳过，待 GUI 阶段接入。退出码：有 FAIL 为 1。
 
 ## CI / 发布
 
@@ -39,7 +52,7 @@ git tag v0.1.0 && git push origin v0.1.0
 ## 进度
 
 - [x] M0 骨架：窗口 + 中文字体 + 布局（本仓库当前状态）
-- [ ] M1 无 UI 核心：adb 层 + 协议解析 + CLI
+- [x] M1 无 UI 核心：adb 层 + 协议解析 + CLI（已可用，真机回归待验证）
 - [ ] M2 UI + 自动判定项
 - [ ] M3 拍照图片显示
 - [ ] M4 视频播放（libmpv）
