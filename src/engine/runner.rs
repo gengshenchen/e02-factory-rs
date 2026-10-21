@@ -128,6 +128,11 @@ pub fn run_auto(item: TestItem) -> RunOutcome {
             };
             None
         }
+        TestItem::Gyro => {
+            r.verdict = Verdict::Skipped;
+            r.detail = "陀螺仪需配置命令（GUI/配置接入）".into();
+            None
+        }
     };
     RunOutcome { result: r, device }
 }

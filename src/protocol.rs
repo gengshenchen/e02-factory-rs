@@ -169,6 +169,58 @@ pub fn parse_keys_strict(output: &str) -> Vec<u8> {
 
 use anyhow::Context as _;
 
+/// 解析 `ip route` 的默认网关（WiFi 速率测试用）。
+/// 样例：`default via 192.168.1.1 dev wlan0  proto static`
+pub fn parse_default_gateway(output: &str) -> Option<String> {
+    let line = output
+        .lines()
+        .find(|l| l.trim_start().starts_with("default"))?;
+    let mut it = line.split_whitespace();
+    while let Some(tok) = it.next() {
+        if tok == "via" {
+            return it.next().map(str::to_string);
+        }
+    }
+    None
+}
+
+/// 解析 ping 统计：`(丢包率 %, avg RTT ms)`。
+///
+/// 兼容两种格式（阈值判定见 config `[item.wifi.throughput]`）：
+/// - toybox: `... 0% packet loss` + `rtt min/avg/max/mdev = 1.2/23.4/99.0/5.0 ms`
+/// - busybox: `... 0% packet loss` + `round-trip min/avg/max = 1.2/23.4/99.0 ms`
+pub fn parse_ping_stats(output: &str) -> Option<(f32, f32)> {
+    let loss = output.lines().find_map(|l| {
+        let idx = l.find("% packet loss").or_else(|| l.find("% loss"))?;
+        // 取百分号前紧邻的数字（如 "..., 0% packet loss" → 0）
+        let head: String = l[..idx]
+            .chars()
+            .rev()
+            .take_while(|c| c.is_ascii_digit() || *c == '.')
+            .collect();
+        let pct: String = head.chars().rev().collect();
+        pct.parse().ok()
+    });
+    let avg = output
+        .lines()
+        .filter(|l| l.contains("rtt") || l.contains("round-trip"))
+        .find_map(|l| {
+            let eq = l.find('=')?;
+            let nums = l[eq + 1..].trim().trim_end_matches("ms").trim();
+            let parts: Vec<&str> = nums.split('/').collect();
+            // min/avg/max(/mdev)：avg 恒为第 2 段
+            if parts.len() >= 2 {
+                parts[1].trim().parse().ok()
+            } else {
+                None
+            }
+        });
+    match (loss, avg) {
+        (Some(l), Some(a)) => Some((l, a)),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -201,6 +253,29 @@ mod tests {
     fn device_cmd_format() {
         assert_eq!(CameraFactory::Video.device_cmd(), "camera-factory 1");
         assert_eq!(CameraFactory::Keys.device_cmd(), "camera-factory 15");
+    }
+
+    #[test]
+    fn wifi_throughput_parsers() {
+        let route = "default via 192.168.1.1 dev wlan0  proto static\n\
+                     192.168.1.0/24 dev wlan0  proto kernel";
+        assert_eq!(
+            parse_default_gateway(route),
+            Some("192.168.1.1".to_string())
+        );
+        assert_eq!(parse_default_gateway("192.168.1.0/24 dev wlan0"), None);
+
+        // toybox 格式
+        let ping = "PING 192.168.1.1 (192.168.1.1) 56(84) bytes of data.\n\
+                    20 packets transmitted, 19 received, 5% packet loss, time 32ms\n\
+                    rtt min/avg/max/mdev = 1.2/23.4/99.0/5.0 ms";
+        assert_eq!(parse_ping_stats(ping), Some((5.0, 23.4)));
+        // busybox 格式（round-trip 三段）
+        let busy = "20 packets transmitted, 20 received, 0% packet loss\n\
+                    round-trip min/avg/max = 1.0/8.5/40.0 ms";
+        assert_eq!(parse_ping_stats(busy), Some((0.0, 8.5)));
+        // 乱码/空输出
+        assert_eq!(parse_ping_stats("nothing here"), None);
     }
 
     #[test]

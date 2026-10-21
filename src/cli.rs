@@ -6,16 +6,20 @@
 //! e02-factory-rs devices          # 列出 adb 在线设备
 //! e02-factory-rs test info wifi   # 跑指定测试项（空格分隔多个）
 //! e02-factory-rs all              # 跑全部（人工/媒体项自动跳过）
+//! e02-factory-rs config           # 打印生效配置（可重定向为 config.toml 模板）
 //! ```
-//! 可选 `--report <文件>`：附带 T32.txt 风格文本报告。
+//! 可选 `--report <文件>`、`--profile <工位>`、`--config <文件>`。
 //! 退出码：有 FAIL 为 1，参数错误为 2，其余 0。
 
 use crate::adb;
+use crate::config::{self, Config};
 use crate::engine::{runner, TestItem, Verdict};
 use crate::report;
 
 pub fn run(args: &[String]) -> i32 {
     let mut report_path: Option<String> = None;
+    let mut profile: Option<String> = None;
+    let mut config_file: Option<String> = None;
     let mut rest: Vec<&str> = Vec::new();
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -27,8 +31,41 @@ pub fn run(args: &[String]) -> i32 {
                     return 2;
                 }
             }
+        } else if a == "--profile" {
+            match it.next() {
+                Some(p) => profile = Some(p.clone()),
+                None => {
+                    eprintln!("--profile 缺少工位名参数");
+                    return 2;
+                }
+            }
+        } else if a == "--config" {
+            match it.next() {
+                Some(p) => config_file = Some(p.clone()),
+                None => {
+                    eprintln!("--config 缺少文件参数");
+                    return 2;
+                }
+            }
         } else {
             rest.push(a.as_str());
+        }
+    }
+
+    let cfg = match load_config(&config_file) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("{e:#}");
+            return 1;
+        }
+    };
+    if let Some(p) = &profile {
+        if !cfg.profiles.contains_key(p) {
+            eprintln!(
+                "工位 {p} 不存在（可选: {:?}）",
+                cfg.profiles.keys().collect::<Vec<_>>()
+            );
+            return 2;
         }
     }
 
@@ -42,13 +79,28 @@ pub fn run(args: &[String]) -> i32 {
             0
         }
         Some("devices") => devices_cmd(),
-        Some("test") if rest.len() >= 2 => test_cmd(&rest[1..], report_path),
-        Some("all") => test_cmd(&[], report_path),
+        Some("test") if rest.len() >= 2 => {
+            test_cmd(&rest[1..], report_path, &cfg, profile.as_deref())
+        }
+        Some("all") => test_cmd(&[], report_path, &cfg, profile.as_deref()),
+        Some("config") => {
+            print!("{}", cfg.to_toml().unwrap_or_default());
+            0
+        }
         _ => {
             print_usage();
             2
         }
     }
+}
+
+/// 加载配置：--config 指定文件，否则 exe 同目录 config.toml（缺失即内置默认）。
+fn load_config(path: &Option<String>) -> anyhow::Result<Config> {
+    let p = path
+        .clone()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(config::default_path);
+    Config::load(&p)
 }
 
 fn print_usage() {
@@ -87,12 +139,22 @@ fn devices_cmd() -> i32 {
     }
 }
 
-fn test_cmd(slugs: &[&str], report_path: Option<String>) -> i32 {
-    let items = match resolve_items(slugs) {
-        Ok(items) => items,
-        Err(e) => {
-            eprintln!("{e}");
-            return 2;
+fn test_cmd(
+    slugs: &[&str],
+    report_path: Option<String>,
+    cfg: &Config,
+    profile: Option<&str>,
+) -> i32 {
+    // --profile：空 slug 列表时用工位档案；显式 slug 仍优先
+    let items = if slugs.is_empty() && profile.is_some() {
+        cfg.active_items()
+    } else {
+        match resolve_items(slugs) {
+            Ok(items) => items,
+            Err(e) => {
+                eprintln!("{e}");
+                return 2;
+            }
         }
     };
     match adb::devices() {

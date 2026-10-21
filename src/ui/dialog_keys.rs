@@ -2,7 +2,6 @@
 //! 弹窗期间 worker 阻塞等待应答（对应指示灯/MIC 的模态语义）。
 
 use crate::app::E02App;
-use crate::engine::worker::KEYS_REQUIRED;
 use crate::protocol::key_name;
 
 pub fn show(ctx: &egui::Context, app: &mut E02App) {
@@ -11,6 +10,7 @@ pub fn show(ctx: &egui::Context, app: &mut E02App) {
     };
     let detected = prompt.detected.clone();
     let awaiting = prompt.awaiting;
+    let required = app.config.keys.required.clone();
     egui::Window::new("按键测试")
         .collapsible(false)
         .resizable(false)
@@ -19,7 +19,7 @@ pub fn show(ctx: &egui::Context, app: &mut E02App) {
             ui.set_min_width(320.0);
             ui.label("请依次按下以下按键：");
             ui.add_space(6.0);
-            for &code in KEYS_REQUIRED.iter() {
+            for &code in required.iter() {
                 let ok = detected.contains(&code);
                 ui.horizontal(|ui| {
                     ui.colored_label(

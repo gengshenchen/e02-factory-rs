@@ -1,5 +1,6 @@
 //! 应用状态与窗口装配：worker 事件消费、媒体显示、人工判定应答。
 
+use crate::config::{self, Config};
 use crate::engine::events::{UiEvent, UiResponse};
 use crate::engine::worker;
 use crate::engine::{TestItem, TestResult};
@@ -96,6 +97,10 @@ pub struct E02App {
     progress: Option<Progress>,
     /// 按键引导弹窗；无按键测试进行时 None
     pub keys_prompt: Option<KeysPrompt>,
+    /// 工位配置（V2.2）
+    pub config: Config,
+    /// 设置窗口开关
+    pub settings_open: bool,
     event_rx: Option<Receiver<UiEvent>>,
     manual_tx: Option<Sender<UiResponse>>,
 }
@@ -104,7 +109,15 @@ impl E02App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         install_cjk_font(&cc.egui_ctx);
         apply_style(cc);
-        Self {
+        // 配置：exe 同目录 config.toml；缺失用内置默认，坏文件降级并提示
+        let (cfg, cfg_err) = match Config::load(&config::default_path()) {
+            Ok(c) => (c, None),
+            Err(e) => (
+                Config::builtin(),
+                Some(format!("配置加载失败，已用内置默认: {e:#}")),
+            ),
+        };
+        let mut app = Self {
             device: DeviceInfo::default(),
             results: TestItem::ALL.map(TestResult::new).to_vec(),
             busy: false,
@@ -114,9 +127,29 @@ impl E02App {
             log: VecDeque::new(),
             progress: None,
             keys_prompt: None,
+            config: cfg,
+            settings_open: false,
             event_rx: None,
             manual_tx: None,
+        };
+        if let Some(msg) = cfg_err {
+            app.push_log(msg);
         }
+        app.push_log(format!(
+            "工位: {}（启用 {} 项）",
+            app.config.station,
+            app.config.active_items().len()
+        ));
+        app
+    }
+
+    /// 一键全测项集：当前工位启用项，按原程序批次顺序执行。
+    pub fn batch_items(&self) -> Vec<TestItem> {
+        let active = self.config.active_items();
+        worker::BATCH_ORDER
+            .into_iter()
+            .filter(|i| active.contains(i))
+            .collect()
     }
 
     /// 启动测试序列（单项或全测）；busy 期间忽略重复触发。
@@ -139,14 +172,15 @@ impl E02App {
         let media = PathBuf::from("media");
         let reports = PathBuf::from("reports");
         let n = items.len();
+        let cfg = self.config.clone();
         thread::spawn(move || {
-            let report = worker::run_sequence(&items, &tx, &mrx, &media, &reports);
+            let report = worker::run_sequence(&items, &tx, &mrx, &media, &reports, &cfg);
             let _ = tx.send(UiEvent::Finished { report });
         });
         self.push_log(format!("开始测试，共 {n} 项"));
     }
 
-    fn push_log(&mut self, line: impl Into<String>) {
+    pub fn push_log(&mut self, line: impl Into<String>) {
         self.log
             .push_back(format!("{} {}", report::now_hms(), line.into()));
         while self.log.len() > 200 {
@@ -359,6 +393,7 @@ impl eframe::App for E02App {
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
             ui.horizontal_centered(|ui| {
                 ui.heading("E02 工厂测试工具");
+                ui.label(format!("工位: {}", self.config.station));
                 if self.busy {
                     if let Some(p) = &self.progress {
                         let frac = p.done as f32 / p.total.max(1) as f32;
@@ -376,6 +411,11 @@ impl eframe::App for E02App {
                         ui.add(egui::ProgressBar::new(frac).text(text).desired_width(360.0));
                     }
                 }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("⚙ 设置").clicked() {
+                        self.settings_open = true;
+                    }
+                });
             });
         });
         // 先注册的在最外沿：状态条贴底，日志面板在状态条上方
@@ -416,5 +456,7 @@ impl eframe::App for E02App {
         ui::dialog_manual::show(ctx, self);
         // 按键引导弹窗（V2.1）
         ui::dialog_keys::show(ctx, self);
+        // 设置窗口（V2.2）
+        ui::panel_settings::show(ctx, self);
     }
 }

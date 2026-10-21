@@ -40,7 +40,7 @@ impl Verdict {
     }
 }
 
-/// 测试项，与 camera-factory 子命令一一对应。
+/// 测试项：与 camera-factory 子命令对应的 11 项 + 陀螺仪（V2.2，shell 命令实现）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TestItem {
     Video,
@@ -54,11 +54,12 @@ pub enum TestItem {
     Battery,
     MicSpeaker,
     Keys,
+    Gyro,
 }
 
 impl TestItem {
-    /// 侧栏顺序对应原对话框按钮排列。
-    pub const ALL: [TestItem; 11] = [
+    /// 侧栏顺序对应原对话框按钮排列 + 陀螺仪。
+    pub const ALL: [TestItem; 12] = [
         TestItem::Video,
         TestItem::Photo,
         TestItem::DeviceInfo,
@@ -70,6 +71,7 @@ impl TestItem {
         TestItem::Battery,
         TestItem::MicSpeaker,
         TestItem::Keys,
+        TestItem::Gyro,
     ];
 
     pub fn label(self) -> &'static str {
@@ -85,6 +87,7 @@ impl TestItem {
             TestItem::Battery => "电池测试",
             TestItem::MicSpeaker => "MIC/喇叭",
             TestItem::Keys => "按键测试",
+            TestItem::Gyro => "陀螺仪测试",
         }
     }
 
@@ -102,6 +105,7 @@ impl TestItem {
             TestItem::Battery => "battery",
             TestItem::MicSpeaker => "mic",
             TestItem::Keys => "keys",
+            TestItem::Gyro => "gyro",
         }
     }
 
@@ -109,20 +113,21 @@ impl TestItem {
         TestItem::ALL.iter().find(|i| i.slug() == s).copied()
     }
 
-    /// 对应的设备侧测试命令。
-    pub fn factory_cmd(self) -> CameraFactory {
+    /// 对应的设备侧 camera-factory 命令；陀螺仪无对应子命令（走配置的 shell 命令）。
+    pub fn factory_cmd(self) -> Option<CameraFactory> {
         match self {
-            TestItem::Video => CameraFactory::Video,
-            TestItem::Photo => CameraFactory::Photo,
-            TestItem::DeviceInfo => CameraFactory::DeviceInfo,
-            TestItem::Wifi => CameraFactory::Wifi,
-            TestItem::SdCard => CameraFactory::SdCard,
-            TestItem::Led => CameraFactory::Led,
-            TestItem::BtMac => CameraFactory::BtMac,
-            TestItem::Charger => CameraFactory::Charger,
-            TestItem::Battery => CameraFactory::Battery,
-            TestItem::MicSpeaker => CameraFactory::MicSpeaker,
-            TestItem::Keys => CameraFactory::Keys,
+            TestItem::Video => Some(CameraFactory::Video),
+            TestItem::Photo => Some(CameraFactory::Photo),
+            TestItem::DeviceInfo => Some(CameraFactory::DeviceInfo),
+            TestItem::Wifi => Some(CameraFactory::Wifi),
+            TestItem::SdCard => Some(CameraFactory::SdCard),
+            TestItem::Led => Some(CameraFactory::Led),
+            TestItem::BtMac => Some(CameraFactory::BtMac),
+            TestItem::Charger => Some(CameraFactory::Charger),
+            TestItem::Battery => Some(CameraFactory::Battery),
+            TestItem::MicSpeaker => Some(CameraFactory::MicSpeaker),
+            TestItem::Keys => Some(CameraFactory::Keys),
+            TestItem::Gyro => None,
         }
     }
 }
@@ -157,10 +162,14 @@ mod tests {
         labels.dedup();
         assert_eq!(labels.len(), TestItem::ALL.len());
 
-        let mut cmds: Vec<_> = TestItem::ALL.map(|i| i.factory_cmd() as u8).to_vec();
+        let mut cmds: Vec<_> = TestItem::ALL
+            .iter()
+            .filter_map(|i| i.factory_cmd().map(|c| c as u8))
+            .collect();
         cmds.sort_unstable();
         cmds.dedup();
-        assert_eq!(cmds.len(), TestItem::ALL.len());
+        // 陀螺仪无 camera-factory 命令，映射数 = 项数 - 1
+        assert_eq!(cmds.len(), TestItem::ALL.len() - 1);
     }
 
     #[test]

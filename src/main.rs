@@ -5,6 +5,7 @@
 mod adb;
 mod app;
 mod cli;
+mod config;
 mod engine;
 mod player;
 mod protocol;
@@ -13,6 +14,7 @@ mod ui;
 
 fn main() -> eframe::Result<()> {
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr) // CLI 输出走 stdout，日志勿混入
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )

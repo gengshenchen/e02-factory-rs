@@ -2,6 +2,7 @@
 //! 经 [`UiEvent`] 回传状态；人工判定阻塞等待 [`UiResponse`]。
 
 use crate::adb;
+use crate::config::{Config, GyroCfg, KeysCfg, WifiCfg};
 use crate::engine::events::{UiEvent, UiResponse};
 use crate::engine::runner::{self, RunOutcome};
 use crate::engine::{TestItem, TestResult, Verdict};
@@ -13,8 +14,8 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::thread;
 use std::time::Duration;
 
-/// 一键全测顺序，对应原程序 OnBnClickedButton14 的调用顺序。
-pub const BATCH_ORDER: [TestItem; 11] = [
+/// 一键全测顺序，对应原程序 OnBnClickedButton14 的调用顺序（陀螺仪追加在末尾）。
+pub const BATCH_ORDER: [TestItem; 12] = [
     TestItem::Photo,
     TestItem::DeviceInfo,
     TestItem::BtMac,
@@ -26,6 +27,7 @@ pub const BATCH_ORDER: [TestItem; 11] = [
     TestItem::Keys,
     TestItem::Led,
     TestItem::MicSpeaker,
+    TestItem::Gyro,
 ];
 
 /// 同步执行测试序列（worker 线程与测试共用）。
@@ -36,6 +38,7 @@ pub fn run_sequence(
     manual: &Receiver<UiResponse>,
     media_dir: &Path,
     reports_dir: &Path,
+    cfg: &Config,
 ) -> Option<PathBuf> {
     let _ = std::fs::create_dir_all(media_dir);
     let _ = std::fs::create_dir_all(reports_dir);
@@ -43,14 +46,18 @@ pub fn run_sequence(
 
     let mut device = DeviceInfo::default();
     let mut results: Vec<TestResult> = Vec::new();
-    let _ = tx.send(UiEvent::Log(format!("序列开始，共 {} 项", items.len())));
+    let _ = tx.send(UiEvent::Log(format!(
+        "序列开始，工位 {}，共 {} 项",
+        cfg.station,
+        items.len()
+    )));
     for &item in items {
         let _ = tx.send(UiEvent::Current(item));
         let _ = tx.send(UiEvent::Log(format!("── {} 开始", item.label())));
         let RunOutcome {
             result,
             device: dev,
-        } = run_item(item, tx, manual, media_dir);
+        } = run_item(item, tx, manual, media_dir, cfg);
         let _ = tx.send(UiEvent::Log(format!(
             "── {}: {} {}",
             item.label(),
@@ -81,11 +88,14 @@ fn run_item(
     tx: &Sender<UiEvent>,
     manual: &Receiver<UiResponse>,
     media_dir: &Path,
+    cfg: &Config,
 ) -> RunOutcome {
     match item {
         TestItem::Photo => photo_flow(tx, media_dir),
         TestItem::Video => video_flow(tx, media_dir),
-        TestItem::Keys => keys_flow(tx, manual),
+        TestItem::Keys => keys_flow(tx, manual, &cfg.keys),
+        TestItem::Wifi => wifi_flow(tx, &cfg.wifi),
+        TestItem::Gyro => gyro_flow(tx, &cfg.gyro),
         TestItem::Led => manual_flow(item, "指示灯闪烁是否正常？", tx, manual, Some(3)),
         TestItem::MicSpeaker => manual_flow(item, "MIC 与喇叭声音是否正常？", tx, manual, None),
         _ => runner::run_auto(item),
@@ -204,7 +214,11 @@ fn manual_flow(
     repeat: Option<usize>,
 ) -> RunOutcome {
     let mut r = TestResult::new(item);
-    let cmd = item.factory_cmd().device_cmd();
+    // 人工判定项（指示灯/MIC）必有 camera-factory 命令
+    let cmd = item
+        .factory_cmd()
+        .expect("人工判定项必有设备命令")
+        .device_cmd();
     let n = repeat.unwrap_or(1);
     let _ = tx.send(UiEvent::Log(format!("执行 adb shell {cmd}×{n}")));
     for _ in 0..n {
@@ -233,31 +247,26 @@ fn manual_flow(
     }
 }
 
-/// 按键测试必测键集合（V2.2 起由工位配置裁剪；UI 弹窗同用）。
-pub const KEYS_REQUIRED: [u8; 3] = [4, 5, 6];
-
-/// 按键解析模式：false=兼容原程序（任意位置含数字即命中），
-/// true=严格（只认独立数字行，排除版本号/电压假阳性）。V2.2 起由配置切换。
-const KEYS_STRICT: bool = false;
-
 /// 按键引导流程（V2.1）：弹窗提示按键 → 固件监听窗口内操作员按键 →
 /// 回显已检测到的键，收齐自动 PASS；未收齐由操作员重测/改判。
+/// 必测键集合与解析模式由工位配置裁剪（V2.2）。
 ///
 /// 原程序为无提示静默解析（没按到键时什么都不打印、也不判失败），
 /// 一键全测下无人按键必失败，故改为引导式（V2_PLAN.md §1）。
-fn keys_flow(tx: &Sender<UiEvent>, manual: &Receiver<UiResponse>) -> RunOutcome {
+fn keys_flow(tx: &Sender<UiEvent>, manual: &Receiver<UiResponse>, keys: &KeysCfg) -> RunOutcome {
     let mut r = TestResult::new(TestItem::Keys);
     let cmd = CameraFactory::Keys.device_cmd();
     loop {
         let _ = tx.send(UiEvent::Log(format!("执行 adb shell {cmd}，请依次按键…")));
         match adb::shell(&cmd) {
             Ok(out) => {
-                let got = if KEYS_STRICT {
+                let got = if keys.strict {
                     protocol::parse_keys_strict(&out)
                 } else {
                     protocol::parse_keys_codes(&out)
                 };
-                let missing: Vec<&'static str> = KEYS_REQUIRED
+                let missing: Vec<&'static str> = keys
+                    .required
                     .iter()
                     .filter(|c| !got.contains(c))
                     .map(|&c| protocol::key_name(c))
@@ -327,6 +336,105 @@ fn keys_flow(tx: &Sender<UiEvent>, manual: &Receiver<UiResponse>) -> RunOutcome 
     }
 }
 
+/// WiFi 流程（V2.2 深度可配）：
+/// - driver：`camera-factory 5` 驱动通即过（原程序行为）
+/// - throughput：驱动过后追加 ping 网关统计（丢包率/avg RTT 阈值判定）
+fn wifi_flow(tx: &Sender<UiEvent>, wifi: &WifiCfg) -> RunOutcome {
+    // 先跑驱动检查（camera-factory 5），失败直接返回
+    let base = runner::run_auto(TestItem::Wifi);
+    if base.result.verdict != Verdict::Pass || wifi.depth == crate::config::WifiDepth::Driver {
+        return base;
+    }
+
+    let mut r = base.result;
+    let t = &wifi.throughput;
+    let _ = tx.send(UiEvent::Log("WiFi 速率：探测默认网关…".to_string()));
+    let gw = adb::shell("ip route")
+        .ok()
+        .and_then(|out| protocol::parse_default_gateway(&out));
+    let Some(gw) = gw else {
+        r.verdict = Verdict::Fail;
+        r.detail = "驱动通过，但未解析到默认网关（WiFi 未连路由器？）".into();
+        return RunOutcome {
+            result: r,
+            device: base.device,
+        };
+    };
+
+    let _ = tx.send(UiEvent::Log(format!("ping 网关 {gw} ×{}", t.ping_count)));
+    match adb::shell(&format!("ping -c {} -W 2 {gw}", t.ping_count)) {
+        Ok(out) => match protocol::parse_ping_stats(&out) {
+            Some((loss, avg)) => {
+                let ok = loss <= t.loss_max_pct && avg <= t.rtt_max_ms;
+                r.verdict = if ok { Verdict::Pass } else { Verdict::Fail };
+                r.detail = format!(
+                    "丢包 {loss}% · avg {avg}ms（阈值 {}% / {}ms）",
+                    t.loss_max_pct, t.rtt_max_ms
+                );
+            }
+            None => {
+                r.verdict = Verdict::Fail;
+                r.detail = format!("ping 输出无法解析: {}", clip(&runner::one_line(&out), 80));
+            }
+        },
+        Err(e) => {
+            r.verdict = Verdict::Fail;
+            r.detail = format!("ping 失败: {e:#}");
+        }
+    }
+    RunOutcome {
+        result: r,
+        device: base.device,
+    }
+}
+
+/// 陀螺仪流程（V2.2）：按配置命令采样两次，数值有变化即 PASS
+/// （验证芯片上电、注册、出数）。固件日后提供 camera-factory 命令后改 cmd 即可。
+fn gyro_flow(tx: &Sender<UiEvent>, gyro: &GyroCfg) -> RunOutcome {
+    let mut r = TestResult::new(TestItem::Gyro);
+    let _ = tx.send(UiEvent::Log(format!("陀螺仪采样: {}", gyro.cmd)));
+    let a = adb::shell(&gyro.cmd);
+    thread::sleep(Duration::from_millis(gyro.interval_ms));
+    let b = adb::shell(&gyro.cmd);
+    match (a, b) {
+        (Ok(a), Ok(b)) => {
+            let (na, nb) = (number_tokens(&a), number_tokens(&b));
+            if na.is_empty() {
+                r.verdict = Verdict::Fail;
+                r.detail = "无数据输出（无陀螺仪或命令不适用）".into();
+            } else if na == nb {
+                r.verdict = Verdict::Fail;
+                r.detail = format!(
+                    "两次采样数值一致（芯片静止或未出数）: {}",
+                    clip(&runner::one_line(&a), 80)
+                );
+            } else {
+                r.verdict = Verdict::Pass;
+                r.detail = format!("两次采样数据有变化（{} 个数值）", na.len());
+            }
+        }
+        (Err(e), _) | (_, Err(e)) => {
+            r.verdict = Verdict::Fail;
+            r.detail = format!("{e:#}");
+        }
+    }
+    RunOutcome {
+        result: r,
+        device: None,
+    }
+}
+
+/// 提取文本中全部数值（排序后比较，陀螺仪采样对比用）。
+fn number_tokens(s: &str) -> Vec<f64> {
+    let mut v: Vec<f64> = s
+        .split(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-'))
+        .filter(|t| !t.is_empty())
+        .filter_map(|t| t.parse().ok())
+        .collect();
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    v
+}
+
 #[cfg(all(unix, test))] // 假 adb 桩 + ffmpeg 仅在 unix 测试构建可用
 mod tests {
     use super::*;
@@ -391,7 +499,9 @@ mod tests {
         ];
         let media_c = media.clone();
         let reports_c = reports.clone();
-        let handle = thread::spawn(move || run_sequence(&items, &tx, &mrx, &media_c, &reports_c));
+        let cfg = Config::default();
+        let handle =
+            thread::spawn(move || run_sequence(&items, &tx, &mrx, &media_c, &reports_c, &cfg));
 
         let (mut manual_asked, mut photo_ready, mut video_ready) = (0, 0, 0);
         let mut verdicts: Vec<(TestItem, Verdict)> = Vec::new();
@@ -436,52 +546,139 @@ mod tests {
 
         // —— V2.1 按键引导：三场景（顺序执行，防 ADB 环境变量竞争）——
         let kscript = base.join("adb-keys");
+        let keys_case = |body: &str| {
+            format!(
+                "#!/bin/sh\ncase \"$*\" in\n*\"camera-factory 15\"*) {body};;\n\
+                 *) printf 'ok\\n';;\nesac\n"
+            )
+        };
+        let items = |i: TestItem| vec![i];
         // 1) 输出全键码：自动收齐 PASS，全程无人工介入
-        let (v, n) = keys_scenario(&kscript, &media, &reports, "printf '5\\n6\\n4\\n'", || {
-            unreachable!("全键码不应触发人工应答")
-        });
-        assert_eq!((v, n), (Verdict::Pass, 0));
-        // 2) 只回 5：未收齐 → 强制改判失败
-        let (v, n) = keys_scenario(&kscript, &media, &reports, "printf '5\\n'", || {
-            UiResponse::KeysForce(false)
-        });
-        assert_eq!((v, n), (Verdict::ManualNo, 1));
-        // 3) 首轮缺键 → 重测 → 第二轮全键码收齐 PASS
-        std::env::set_var("KEYS_CNT", base.join("cnt").display().to_string());
-        let (v, n) = keys_scenario(
+        let (vs, n) = scenario(
             &kscript,
+            items(TestItem::Keys),
             &media,
             &reports,
-            "n=$(cat \"$KEYS_CNT\" 2>/dev/null || echo 0); n=$((n+1)); echo $n > \"$KEYS_CNT\"; \
-             [ \"$n\" -ge 2 ] && printf '5\\n6\\n4\\n' || printf '5\\n'",
+            Config::default(),
+            &keys_case("printf '5\\n6\\n4\\n'"),
+            || unreachable!("全键码不应触发人工应答"),
+        );
+        assert_eq!((vs[0].1, n), (Verdict::Pass, 0));
+        // 2) 只回 5：未收齐 → 强制改判失败
+        let (vs, n) = scenario(
+            &kscript,
+            items(TestItem::Keys),
+            &media,
+            &reports,
+            Config::default(),
+            &keys_case("printf '5\\n'"),
+            || UiResponse::KeysForce(false),
+        );
+        assert_eq!((vs[0].1, n), (Verdict::ManualNo, 1));
+        // 3) 首轮缺键 → 重测 → 第二轮全键码收齐 PASS
+        std::env::set_var("KEYS_CNT", base.join("cnt").display().to_string());
+        let (vs, n) = scenario(
+            &kscript,
+            items(TestItem::Keys),
+            &media,
+            &reports,
+            Config::default(),
+            &keys_case(
+                "n=$(cat \"$KEYS_CNT\" 2>/dev/null || echo 0); n=$((n+1)); \
+                 echo $n > \"$KEYS_CNT\"; [ \"$n\" -ge 2 ] && printf '5\\n6\\n4\\n' \
+                 || printf '5\\n'",
+            ),
             || UiResponse::KeysRetry,
         );
-        assert_eq!((v, n), (Verdict::Pass, 1));
+        assert_eq!((vs[0].1, n), (Verdict::Pass, 1));
         std::env::remove_var("KEYS_CNT");
+
+        // —— V2.2 WiFi 速率（ping 法）——
+        let wscript = base.join("adb-wifi");
+        // 注：数据里的 % 需经 %s 格式串输出（printf 参数含 % 会被 dash 当格式符）
+        let wifi_case = "#!/bin/sh\ncase \"$*\" in\n\
+             *\"camera-factory 5\"*) printf 'wifi ok\\n';;\n\
+             *\"ip route\"*) printf 'default via 192.168.1.1 dev wlan0\\n';;\n\
+             *\"ping\"*) printf '%s\\n%s\\n' \
+             '20 packets transmitted, 20 received, 0% packet loss' \
+             'rtt min/avg/max/mdev = 1.2/23.4/99.0/5.0 ms';;\n\
+             *) printf 'ok\\n';;\nesac\n";
+        // driver 深度：不 ping，驱动过即过
+        let (vs, n) = scenario(
+            &wscript,
+            items(TestItem::Wifi),
+            &media,
+            &reports,
+            Config::default(),
+            wifi_case,
+            || unreachable!(),
+        );
+        assert_eq!((vs[0].1, n), (Verdict::Pass, 0));
+        // throughput 深度：驱动过 + ping 统计达标
+        let mut cfg = Config::default();
+        cfg.wifi.depth = crate::config::WifiDepth::Throughput;
+        let (vs, n) = scenario(
+            &wscript,
+            items(TestItem::Wifi),
+            &media,
+            &reports,
+            cfg,
+            wifi_case,
+            || unreachable!(),
+        );
+        assert_eq!((vs[0].1, n), (Verdict::Pass, 0));
+
+        // —— V2.2 陀螺仪 ——
+        let gscript = base.join("adb-gyro");
+        let gitems = items(TestItem::Gyro);
+        // 两次采样数值变化 → PASS
+        std::env::set_var("GYRO_CNT", base.join("gcnt").display().to_string());
+        let (vs, _) = scenario(
+            &gscript,
+            gitems.clone(),
+            &media,
+            &reports,
+            Config::default(),
+            "#!/bin/sh\ncase \"$*\" in\n\
+             *\"sensorservice\"*) n=$(cat \"$GYRO_CNT\" 2>/dev/null || echo 0); n=$((n+1)); \
+             echo $n > \"$GYRO_CNT\"; echo \"gyro: $n.$n $n.$n $n.$n\";;\n\
+             *) printf 'ok\\n';;\nesac\n",
+            || unreachable!(),
+        );
+        assert_eq!(vs[0].1, Verdict::Pass);
+        // 数值恒定 → FAIL
+        let (vs, _) = scenario(
+            &gscript,
+            gitems,
+            &media,
+            &reports,
+            Config::default(),
+            "#!/bin/sh\ncase \"$*\" in\n\
+             *\"sensorservice\"*) printf 'gyro: 1.0 2.0 3.0\\n';;\n\
+             *) printf 'ok\\n';;\nesac\n",
+            || unreachable!(),
+        );
+        assert_eq!(vs[0].1, Verdict::Fail);
+        std::env::remove_var("GYRO_CNT");
 
         std::env::remove_var("ADB");
         std::env::remove_var("PULL_SRC");
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// 按键引导场景驱动：`body` 为假 adb 对 camera-factory 15 的输出体；
+    /// 场景驱动：写入完整假 adb 脚本后跑 `items` 序列；
     /// 每次收到 awaiting 应答请求时调 `respond` 决定应答。
-    /// 返回 (最终判定, awaiting 次数)。
-    fn keys_scenario(
+    /// 返回 (逐项判定, awaiting 次数)。
+    fn scenario(
         script: &Path,
+        items: Vec<TestItem>,
         media: &Path,
         reports: &Path,
-        body: &str,
+        cfg: Config,
+        script_text: &str,
         mut respond: impl FnMut() -> UiResponse,
-    ) -> (Verdict, usize) {
-        std::fs::write(
-            script,
-            format!(
-                "#!/bin/sh\ncase \"$*\" in\n*\"camera-factory 15\"*) {body};;\n\
-                 *) printf 'ok\\n';;\nesac\n"
-            ),
-        )
-        .unwrap();
+    ) -> (Vec<(TestItem, Verdict)>, usize) {
+        std::fs::write(script, script_text).unwrap();
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(script, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -490,22 +687,21 @@ mod tests {
 
         let (tx, rx) = mpsc::channel();
         let (mtx, mrx) = mpsc::channel();
-        let items = vec![TestItem::Keys];
         let (m, r) = (media.to_path_buf(), reports.to_path_buf());
-        let handle = thread::spawn(move || run_sequence(&items, &tx, &mrx, &m, &r));
+        let handle = thread::spawn(move || run_sequence(&items, &tx, &mrx, &m, &r, &cfg));
 
-        let (mut verdict, mut awaiting) = (Verdict::Pending, 0usize);
+        let (mut verdicts, mut awaiting) = (Vec::new(), 0usize);
         while let Ok(ev) = rx.recv_timeout(Duration::from_secs(60)) {
             match ev {
                 UiEvent::KeysUpdate { awaiting: true, .. } => {
                     awaiting += 1;
                     mtx.send(respond()).unwrap();
                 }
-                UiEvent::Result(res, _) => verdict = res.verdict,
+                UiEvent::Result(res, _) => verdicts.push((res.item, res.verdict)),
                 _ => {}
             }
         }
         handle.join().unwrap();
-        (verdict, awaiting)
+        (verdicts, awaiting)
     }
 }

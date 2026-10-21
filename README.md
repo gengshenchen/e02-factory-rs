@@ -34,9 +34,20 @@ e02-factory-rs list                # 测试项清单
 e02-factory-rs devices             # adb 在线设备
 e02-factory-rs test info wifi      # 跑指定测试项（空格分隔）
 e02-factory-rs all --report r.txt  # 全部自动判定项 + 文本报告
+e02-factory-rs all --profile module # 按"模组工位"档案执行
+e02-factory-rs config > config.toml # 打印生效配置（可重定向为模板）
 ```
 
 人工判定项（指示灯/MIC·喇叭）与媒体项（录像/拍照）在 CLI 下标记为跳过，请在 GUI 中执行。退出码：有 FAIL 为 1。
+
+## 工位配置（V2.2）
+
+exe 同目录 `config.toml`（缺失用内置默认；GUI "⚙ 设置" 可视化编辑并保存）。要点：
+
+- **工位档案**：`module`（模组工位：info/btmac/wifi/sdcard/photo/led 浅测）、`complete`（整机工位：全项）；顶栏/设置页切换，左栏只启用当前工位的项
+- **WiFi 深度**：`driver`（camera-factory 5 驱动通即过）/ `throughput`（追加 ping 网关统计丢包率与 avg RTT，阈值可配）
+- **按键**：必测键集合（4=多功能 5=开机 6=音量）可裁剪；strict 解析只认独立数字行
+- **陀螺仪**：无 camera-factory 命令，默认 `dumpsys sensorservice` 采样两次比数值；固件支持后改 `cmd` 即可
 
 ## GUI（M2–M5）
 
@@ -68,8 +79,8 @@ git tag v0.1.0 && git push origin v0.1.0
 ## V2 产线反馈改进（方案见 [docs/V2_PLAN.md](docs/V2_PLAN.md)）
 
 - [x] V2.1 按键引导式流程（弹窗按键回显/收齐自动过/未收齐人工改判）+ UI 优化（字号放大、顶栏进度条、底部实时日志）
-- [ ] V2.2 配置页 + 模组/整机工位档案 + WiFi 测试深度（驱动/速率）
-- [ ] V2.3 报告增强（每项固定行/汇总/JSON/SN 归档）+ 陀螺仪测试
+- [x] V2.2 配置页 + 模组/整机工位档案 + WiFi 测试深度（驱动/速率）+ 陀螺仪项（自定义通用项框架顺延 V2.3）
+- [ ] V2.3 报告增强（每项固定行/汇总/JSON/SN 归档）+ 陀螺仪真机校准
 
 ## 进度
 
