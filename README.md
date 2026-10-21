@@ -61,4 +61,9 @@ git tag v0.1.0 && git push origin v0.1.0
 - [x] M3 拍照图片显示
 - [x] M4 视频验证（ffmpeg sidecar 抽帧解码，替代 libmpv，见迁移方案）
 - [x] M5 人工判定 + 一键全测 + 报告
-- [ ] M6 打包完善与产线部署（安装包模板仍为 cargo-wix/cargo-deb 默认配置）
+- [ ] M6 打包完善与产线部署
+  - [x] CI / Release 流水线（M0 已建：三平台测试 + tag 自动出 zip / MSI / deb / tar.gz）
+  - [ ] MSI 品牌化（图标 / 开始菜单快捷方式；需在 Windows 上用 cargo-wix 定制 main.wxs）
+  - [ ] ffmpeg 分发方式定稿：随包携带（+~100M）或产线预装置于 PATH（当前按预装）
+  - [ ] 安装包元数据定稿（license / 维护者信息）
+  - [ ] 真机回归（adb + E02 设备）与产线试运行
