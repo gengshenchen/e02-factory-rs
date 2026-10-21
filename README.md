@@ -23,7 +23,7 @@ cargo build --release        # 开发调试用 cargo run
 cargo test                   # 解析器等单元测试（无需真机）
 ```
 
-运行期依赖：`adb` 在 PATH 中（或用环境变量 `ADB` 指定路径）；录像测试另需 `ffmpeg` / `ffprobe`（或用环境变量 `FFMPEG` / `FFPROBE` 指定路径）；Linux 无其他系统库依赖。
+运行期依赖：`adb` 在 PATH 中（或用环境变量 `ADB` 指定路径）；录像测试需要 `ffmpeg` / `ffprobe`——官方 zip / tar.gz 安装包已随包附带（与程序同目录自动识别），其他安装方式需置于 PATH 或用环境变量 `FFMPEG` / `FFPROBE` 指定路径；Linux 无其他系统库依赖。
 
 ## CLI（M1）
 
@@ -58,8 +58,8 @@ exe 同目录 `config.toml`（缺失用内置默认；GUI "⚙ 设置" 可视化
 
 - 推送任意分支：GitHub Actions 在 Ubuntu / Windows / macOS 上跑 `fmt + clippy + test + release build`
 - 推送 `v*` 标签：自动构建各平台安装包并发布到 GitHub Releases
-  - Windows：zip（裸 exe）+ MSI（cargo-wix）
-  - Linux：tar.gz + deb（cargo-deb）
+  - Windows：zip（exe + 随包 ffmpeg/ffprobe）+ MSI（仅 exe，需另备 ffmpeg）
+  - Linux：tar.gz（含 ffmpeg/ffprobe）+ deb（安装时自动依赖 ffmpeg）
 
 ```bash
 git tag v0.1.0 && git push origin v0.1.0
@@ -72,7 +72,7 @@ git tag v0.1.0 && git push origin v0.1.0
 | 依赖 | 说明 |
 |---|---|
 | adb | Android platform-tools，置于 PATH；或设环境变量 `ADB` 指向绝对路径 |
-| ffmpeg / ffprobe | 仅录像测试需要；置于 PATH 或设 `FFMPEG` / `FFPROBE` |
+| ffmpeg / ffprobe | 仅录像测试需要。zip / tar.gz 已随包附带（解压即用，程序自动识别同目录）；deb 安装时自动装；MSI 版需另备置于 PATH 或设 `FFMPEG` / `FFPROBE` |
 | USB 驱动 | Windows 需安装设备 ADB 驱动（通常随 platform-tools 或厂商驱动） |
 
 首次运行在工作目录生成 `media/`（拉回的照片/视频）与 `reports/`（测试报告，txt+json 成对，默认按 UTC 时间戳、可配置按 SN 归档），换台设备重新打开即可。
@@ -95,6 +95,6 @@ git tag v0.1.0 && git push origin v0.1.0
   - [x] CI / Release 流水线（M0 已建：三平台测试 + tag 自动出 zip / MSI / deb / tar.gz）
   - [x] 应用图标（assets/icon.png 窗口图标；icon.ico 留作 MSI 品牌化）
   - [ ] MSI 开始菜单快捷方式（需在 Windows 上用 cargo-wix 定制 main.wxs）
-  - [ ] ffmpeg 分发方式定稿：随包携带（+~100M）或产线预装置于 PATH（当前按预装）
+  - [x] ffmpeg 随包分发：zip/tar.gz 附带 LGPL 静态版（BtbN n8.1，与 exe 同目录自动识别）；deb 声明 apt 依赖；MSI 暂不附带（需 Windows 上定制 wix 模板）
   - [ ] 安装包元数据定稿（license / 维护者信息）
   - [ ] 真机回归（adb + E02 设备）与产线试运行

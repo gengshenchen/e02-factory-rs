@@ -1,6 +1,6 @@
 [package]
 name = "e02-factory-rs"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "E02 工厂测试上位机（跨平台，Rust 重写）"
 authors = ["gengshenchen <karlchen.me@outlook.com>"]
@@ -19,5 +19,5 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # deb 打包元数据（cargo deb 使用）
 [package.metadata.deb]
 maintainer = "gengshenchen <karlchen.me@outlook.com>"
-depends = "$auto"
+depends = "$auto, ffmpeg"
 section = "utils"

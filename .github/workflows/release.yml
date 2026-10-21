@@ -29,12 +29,30 @@ jobs:
       - name: Release 构建
         run: cargo build --release --locked
 
+      # ---- 随包分发：BtbN LGPL 静态版 ffmpeg/ffprobe（n8.1 稳定分支）----
+      - name: 下载静态 ffmpeg
+        if: runner.os == 'Linux'
+        run: |
+          curl -fsSL -o /tmp/ffmpeg.tar.xz \
+            https://github.com/BtbN/ffmpeg-builds/releases/download/latest/ffmpeg-n8.1-latest-linux64-lgpl-8.1.tar.xz
+          tar -xJf /tmp/ffmpeg.tar.xz -C /tmp
+          cp /tmp/ffmpeg-n8.1-latest-linux64-lgpl-8.1/bin/ffmpeg \
+             /tmp/ffmpeg-n8.1-latest-linux64-lgpl-8.1/bin/ffprobe target/release/
+
+      - name: 下载静态 ffmpeg
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri https://github.com/BtbN/ffmpeg-builds/releases/download/latest/ffmpeg-n8.1-latest-win64-lgpl-8.1.zip -OutFile ffmpeg.zip
+          Expand-Archive ffmpeg.zip -DestinationPath ffmpegdl
+          Get-ChildItem ffmpegdl -Recurse -Include ffmpeg.exe,ffprobe.exe | Copy-Item -Destination target/release/
+
       # ---- Linux: tar.gz + deb ----
       - name: 打包 tar.gz
         if: runner.os == 'Linux'
         run: |
           mkdir -p dist
-          tar -czf dist/${{ matrix.artifact }}.tar.gz -C target/release e02-factory-rs
+          tar -czf dist/${{ matrix.artifact }}.tar.gz -C target/release e02-factory-rs ffmpeg ffprobe
 
       - name: 构建 deb 安装包
         if: runner.os == 'Linux'
@@ -48,7 +66,7 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Compress-Archive -Path target/release/e02-factory-rs.exe -DestinationPath dist/${{ matrix.artifact }}.zip
+          Compress-Archive -Path target/release/e02-factory-rs.exe,target/release/ffmpeg.exe,target/release/ffprobe.exe -DestinationPath dist/${{ matrix.artifact }}.zip
 
       - name: 构建 MSI 安装包
         if: runner.os == 'Windows'

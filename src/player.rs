@@ -4,18 +4,45 @@
 //! `ffmpeg` 全程解码成功即证明录像文件有效；后续如需有声平滑播放，
 //! 可升级为 libmpv render API 嵌入（接口保持不变）。
 //!
-//! ffmpeg/ffprobe 路径可用环境变量 `FFMPEG` / `FFPROBE` 覆盖。
+//! ffmpeg/ffprobe 查找顺序：环境变量 `FFMPEG` / `FFPROBE` →
+//! exe 同目录（随包分发形态）→ PATH。
 
 use anyhow::{bail, Context, Result};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// exe 所在目录（随包分发工具的查找位置）。
+fn exe_dir() -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+}
+
 fn ffmpeg_path() -> String {
-    std::env::var("FFMPEG").unwrap_or_else(|_| "ffmpeg".into())
+    resolve_tool(exe_dir().as_deref(), "FFMPEG", "ffmpeg")
 }
 
 fn ffprobe_path() -> String {
-    std::env::var("FFPROBE").unwrap_or_else(|_| "ffprobe".into())
+    resolve_tool(exe_dir().as_deref(), "FFPROBE", "ffprobe")
+}
+
+/// 查找顺序：环境变量 `env_key` → `dir` 下同名可执行 → PATH（裸名字）。
+fn resolve_tool(dir: Option<&Path>, env_key: &str, name: &str) -> String {
+    if let Ok(p) = std::env::var(env_key) {
+        return p;
+    }
+    let plain = if cfg!(windows) {
+        format!("{name}.exe")
+    } else {
+        name.to_string()
+    };
+    if let Some(d) = dir {
+        let bundled = d.join(&plain);
+        if bundled.is_file() {
+            return bundled.to_string_lossy().into_owned();
+        }
+    }
+    plain
 }
 
 /// 用 ffmpeg 以 `fps` 帧率抽取视频帧到 `frames_dir`（PNG，宽度缩放到 `scale_w`）。
@@ -104,6 +131,27 @@ mod tests {
         }
         let st = cmd.arg(path).status();
         st.map(|s| s.success()).unwrap_or(false)
+    }
+
+    #[test]
+    fn bundled_tool_resolution() {
+        // exe 同目录有同名文件 → 用随包的
+        let dir = std::env::temp_dir().join(format!("e02-tool-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("ffmpeg"), b"").unwrap();
+        assert_eq!(
+            resolve_tool(Some(&dir), "E02_UNSET_ENV", "ffmpeg"),
+            dir.join("ffmpeg").display().to_string()
+        );
+        // 目录里没有 → 落回 PATH
+        let empty = std::env::temp_dir().join(format!("e02-tool-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&empty).unwrap();
+        assert_eq!(
+            resolve_tool(Some(&empty), "E02_UNSET_ENV", "ffmpeg"),
+            "ffmpeg"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&empty);
     }
 
     #[test]
