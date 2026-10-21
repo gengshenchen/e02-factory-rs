@@ -149,4 +149,5 @@ WiFi 测试:PASS  驱动 OK；ping 20 包 0% 丢包 avg 23ms
 | 报告中心 | 每测一报告、看历史、今日看板 | "查看报告"→ 报告中心（列表 + 内容浏览）；顶栏"今日 N 台: PASS x / FAIL y"（扫描报告"结果:"行统计）；报告新增整机总判定与单项耗时 |
 | 单 txt | 砍掉 json | txt+json 双格式是预留 MES 对接，暂无对接方 → 只留 txt，统计/历史解析自家 txt（格式自控）；需要 MES 时再恢复 |
 | 数据目录 | MSI/deb 装系统目录后不可写 | `paths::data_dir()`：exe 同目录可写用之，否则退回 %APPDATA% / ~/.local/share |
+| 按键实时回显 | 界面要显示按下什么键 | `exec::stream_lines` 流式逐行读 adb 输出，每检测到新键即 KeysUpdate 点亮弹窗（原 MFC 是命令结束后 Find("5"/"6"/"4") 子串显示"开机键按下"等）；对照 MFC 14 个按钮处理器清点，未移植的仅为死代码（test.mp4 演示播放器/拖拽列表/滑块/串口/WinSock） |
 | MSI 快捷方式 | 安装后找不到程序 | 手写 `wix/main.wxs`：桌面 + 开始菜单快捷方式、图标、版本跟 Cargo.toml；CI 去掉 `wix init` 模板 |

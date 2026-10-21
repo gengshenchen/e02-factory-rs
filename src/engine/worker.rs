@@ -429,7 +429,28 @@ fn keys_flow(
     let cmd = CameraFactory::Keys.device_cmd();
     loop {
         let _ = tx.send(UiEvent::Log(format!("执行 adb shell {cmd}，请依次按键...")));
-        match adb::shell(&cmd) {
+        // V3.1 流式回显：固件监听窗口内每读到一行即增量解析，
+        // 弹窗实时点亮"已按下"（原 MFC 版要等命令退出才显示按下什么键）
+        let mut seen: Vec<u8> = Vec::new();
+        let mut acc = String::new();
+        let tx_live = tx.clone();
+        let stream = adb::shell_stream(&cmd, |line| {
+            acc.push_str(line);
+            acc.push('\n');
+            let got = if keys.strict {
+                protocol::parse_keys_strict(&acc)
+            } else {
+                protocol::parse_keys_codes(&acc)
+            };
+            if got != seen {
+                seen = got.clone();
+                let _ = tx_live.send(UiEvent::KeysUpdate {
+                    detected: got,
+                    awaiting: false,
+                });
+            }
+        });
+        match stream {
             Ok(out) => {
                 let got = if keys.strict {
                     protocol::parse_keys_strict(&out)
@@ -855,6 +876,52 @@ mod tests {
         );
         assert_eq!((vs[0].1, n), (Verdict::Pass, 1));
         std::env::remove_var("KEYS_CNT");
+
+        // —— V3.1 按键流式回显：键码分两波输出（间隔 1s），
+        //     弹窗应在监听窗口内逐波点亮，而非命令退出后一次性更新 ——
+        {
+            let lscript = base.join("adb-keys-live");
+            std::fs::write(
+                &lscript,
+                keys_case("printf '5\\n'; sleep 1; printf '6\\n4\\n'"),
+            )
+            .unwrap();
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&lscript, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            std::env::set_var("ADB", &lscript);
+            let (tx, rx) = mpsc::channel();
+            let (_mtx, mrx) = mpsc::channel();
+            let (m_c, r_c) = (media.clone(), reports.clone());
+            let live_items = vec![TestItem::Keys];
+            let handle = thread::spawn(move || {
+                run_sequence(&live_items, &tx, &mrx, &m_c, &r_c, &Config::default())
+            });
+            let (mut waves, mut verdict) = (0usize, None);
+            while let Ok(ev) = rx.recv_timeout(Duration::from_secs(60)) {
+                match ev {
+                    UiEvent::KeysUpdate {
+                        detected,
+                        awaiting: false,
+                        ..
+                    } => {
+                        if !detected.is_empty() {
+                            waves += 1; // 每检测到新键一波
+                        }
+                    }
+                    UiEvent::Result(r, _) => verdict = Some(r.verdict),
+                    _ => {}
+                }
+            }
+            handle.join().unwrap();
+            assert_eq!(verdict, Some(Verdict::Pass));
+            assert!(
+                waves >= 2,
+                "应至少两波回显（5 先到，6/4 后到），实测 {waves}"
+            );
+            std::env::remove_var("ADB");
+        }
 
         // —— V2.2 WiFi 速率（ping 法）——
         let wscript = base.join("adb-wifi");

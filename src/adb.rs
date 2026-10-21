@@ -33,6 +33,19 @@ pub fn shell(cmd: &str) -> Result<String> {
         .replace('\r', ""))
 }
 
+/// 执行 `adb shell <cmd>` 并流式逐行回调（按键实时回显用），返回完整输出。
+/// 与 [`shell`] 的差别：不因退出码非零报错——按键监听窗口的判定依据是
+/// 输出内容而非退出码；超时/停止语义同 [`exec::output`]。
+pub fn shell_stream(cmd: &str, on_line: impl FnMut(&str)) -> Result<String> {
+    exec::stream_lines(
+        Command::new(adb_path()).arg("shell").arg(cmd),
+        exec::default_timeout(),
+        on_line,
+    )
+    .with_context(|| format!("执行 adb shell {cmd} 失败（adb 是否在 PATH？）"))
+    .map(|out| out.trim().replace('\r', ""))
+}
+
 /// `adb pull <remote> <local>`。
 pub fn pull(remote: &str, local: &Path) -> Result<()> {
     let out = exec::output(

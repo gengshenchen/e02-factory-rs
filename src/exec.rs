@@ -9,6 +9,7 @@
 use std::io::Read;
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 /// 全局默认超时（毫秒）；0 = 不限制。由序列入口（GUI worker / CLI）设置。
@@ -98,6 +99,76 @@ fn read_all<R: Read>(pipe: &mut Option<R>) -> Vec<u8> {
     buf
 }
 
+/// 流式执行（V3.1 按键实时回显）：stdout 每行到达即回调 `on_line`，
+/// 返回完整输出。超时/停止与 [`output`] 同语义（强杀子进程）。
+/// stderr 丢弃（设备命令的判定依据是 stdout 内容而非退出码/错误流）。
+pub fn stream_lines(
+    cmd: &mut Command,
+    timeout: Option<Duration>,
+    mut on_line: impl FnMut(&str),
+) -> std::io::Result<String> {
+    let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::null()).spawn()?;
+    let stdout = child.stdout.take().expect("stdout 已设为 piped");
+    // 读线程只管搬运行；主线程 100ms 轮询回调 + 超时/停止看门狗
+    let (tx, rx) = mpsc::channel::<String>();
+    let reader = std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(stdout).lines() {
+            match line {
+                Ok(l) => {
+                    if tx.send(l).is_err() {
+                        break; // 接收端已放弃（超时/停止已杀进程）
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    let deadline = timeout.map(|t| Instant::now() + t);
+    let mut out = String::new();
+    loop {
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(l) => {
+                on_line(&l);
+                out.push_str(&l);
+                out.push('\n');
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                // 输出读完：收尸后原样返回（退出码不作为错误，调用方按内容判定）
+                child.wait()?;
+                let _ = reader.join();
+                return Ok(out);
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                let stop = if abort_requested() {
+                    Some((
+                        "已手动停止，强制终止".to_string(),
+                        std::io::ErrorKind::Interrupted,
+                    ))
+                } else if deadline.is_some_and(|d| Instant::now() >= d) {
+                    Some((
+                        format!(
+                            "执行超时（{}s）已强制终止",
+                            timeout.map(|t| t.as_secs()).unwrap_or(0)
+                        ),
+                        std::io::ErrorKind::TimedOut,
+                    ))
+                } else {
+                    None
+                };
+                if let Some((reason, kind)) = stop {
+                    let program = cmd.get_program().to_string_lossy().into_owned();
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    // 读线程不 join：孙子进程可能还握着管道写端（kill 只杀直接
+                    // 子进程），join 会阻塞到它退出；JoinHandle 弃置即脱离
+                    return Err(std::io::Error::new(kind, format!("{reason}: {program}")));
+                }
+            }
+        }
+    }
+}
+
 #[cfg(all(unix, test))] // sh 桩仅 unix 测试可用
 mod tests {
     use super::*;
@@ -131,5 +202,37 @@ mod tests {
         cmd.args(["-c", "echo partial; sleep 5"]);
         let r = output(&mut cmd, Some(Duration::from_millis(400)));
         assert!(r.is_err());
+    }
+
+    #[test]
+    fn stream_lines_delivers_incrementally() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // 两行间隔 1s：流式回调应随行到达，而非等进程退出后一次性给出
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "echo 5; sleep 1; echo 6"]);
+        let t0 = Instant::now();
+        let mut arrivals = Vec::new();
+        let out = stream_lines(&mut cmd, Some(Duration::from_secs(10)), |l| {
+            arrivals.push((l.to_string(), t0.elapsed()));
+        })
+        .unwrap();
+        assert_eq!(out.trim(), "5\n6");
+        assert_eq!(arrivals.len(), 2);
+        assert!(
+            arrivals[1].1 < Duration::from_millis(1800),
+            "第二行应流式到达（约 1s），实测 {:?}",
+            arrivals
+        );
+    }
+
+    #[test]
+    fn stream_lines_timeout_kills() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "echo 5; sleep 30"]);
+        let t0 = Instant::now();
+        let r = stream_lines(&mut cmd, Some(Duration::from_millis(500)), |_| {});
+        assert!(r.is_err());
+        assert!(t0.elapsed() < Duration::from_secs(3));
     }
 }
