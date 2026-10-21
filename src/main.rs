@@ -7,6 +7,7 @@ mod app;
 mod cli;
 mod config;
 mod engine;
+mod exec;
 mod player;
 mod protocol;
 mod report;

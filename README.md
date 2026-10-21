@@ -48,7 +48,8 @@ exe 同目录 `config.toml`（缺失用内置默认；GUI "⚙ 设置" 可视化
 - **WiFi 深度**：`driver`（camera-factory 5 驱动通即过）/ `throughput`（追加 ping 网关统计丢包率与 avg RTT，阈值可配）
 - **按键**：必测键集合（4=多功能 5=开机 6=音量）可裁剪；strict 解析只认独立数字行
 - **陀螺仪**：无 camera-factory 命令，默认 `dumpsys sensorservice` 采样两次比数值；固件支持后改 `cmd` 即可
-- **报告**：`report_by_sn = true` 时归档到 `reports/<SN>/`，空 SN 归入 `unknown/`
+- **超时**：`timeouts.item_secs`（单项命令，默认 60s，超时强杀进程判 FAIL 并继续）、`timeouts.manual_secs`（人工判定/按键应答等待，默认 60s，超时自动判不合格），0 = 不限制
+- **报告**：`report_by_sn = true` 时归档到 `reports/<SN>/`，空 SN 归入 `unknown/`；报告逐项覆盖写盘，中途异常退出也保留已完成部分
 
 ## GUI（M2–M5）
 

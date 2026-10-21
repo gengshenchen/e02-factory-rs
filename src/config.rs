@@ -123,6 +123,33 @@ impl Default for GyroCfg {
     }
 }
 
+/// 超时（V2.3 真机反馈：固件命令可能永久阻塞导致序列卡死）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TimeoutsCfg {
+    /// 单项测试命令最长执行时间（秒）；超时强杀进程判 FAIL 并继续；0 = 不限制
+    #[serde(default = "d_item_secs")]
+    pub item_secs: u64,
+    /// 人工判定/按键应答等待（秒），超时自动判失败；0 = 不限制
+    #[serde(default = "d_manual_secs")]
+    pub manual_secs: u64,
+}
+
+fn d_item_secs() -> u64 {
+    60
+}
+fn d_manual_secs() -> u64 {
+    60
+}
+
+impl Default for TimeoutsCfg {
+    fn default() -> Self {
+        Self {
+            item_secs: d_item_secs(),
+            manual_secs: d_manual_secs(),
+        }
+    }
+}
+
 /// 工位档案：启用的测试项（slug 列表，顺序即执行顺序参考）。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Profile {
@@ -142,6 +169,9 @@ pub struct Config {
     pub keys: KeysCfg,
     #[serde(default)]
     pub gyro: GyroCfg,
+    /// 超时（V2.3）
+    #[serde(default)]
+    pub timeouts: TimeoutsCfg,
     /// 报告按 SN 归档到 reports/<SN>/（V2.3）
     #[serde(default)]
     pub report_by_sn: bool,
@@ -179,6 +209,7 @@ impl Default for Config {
             wifi: WifiCfg::default(),
             keys: KeysCfg::default(),
             gyro: GyroCfg::default(),
+            timeouts: TimeoutsCfg::default(),
             report_by_sn: false,
         }
     }
@@ -261,6 +292,7 @@ mod tests {
         assert_eq!(cfg.station, "module");
         assert_eq!(cfg.wifi.depth, WifiDepth::Driver);
         assert_eq!(cfg.keys.required, vec![4, 5, 6]);
+        assert_eq!(cfg.timeouts.item_secs, 60);
         assert_eq!(cfg.active_items().len(), 6);
     }
 

@@ -6,11 +6,12 @@ use crate::config::{Config, GyroCfg, KeysCfg, WifiCfg};
 use crate::engine::events::{UiEvent, UiResponse};
 use crate::engine::runner::{self, RunOutcome};
 use crate::engine::{TestItem, TestResult, Verdict};
+use crate::exec;
 use crate::player;
 use crate::protocol::{self, CameraFactory, DeviceInfo};
 use crate::report;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -44,13 +45,18 @@ pub fn run_sequence(
     let _ = std::fs::create_dir_all(reports_dir);
     let _ = tx.send(UiEvent::Started);
     let (started_wall, started) = (SystemTime::now(), Instant::now());
+    // 单项超时（V2.3）：序列期间子进程统一看门狗，防止固件命令阻塞卡死序列
+    let prev_timeout = exec::default_timeout();
+    exec::set_default_timeout(timeout_opt(cfg.timeouts.item_secs));
 
     let mut device = DeviceInfo::default();
     let mut results: Vec<TestResult> = Vec::new();
+    let stem = report::time_str(started_wall);
     let _ = tx.send(UiEvent::Log(format!(
-        "序列开始，工位 {}，共 {} 项",
+        "序列开始，工位 {}，共 {} 项，单项超时 {}",
         cfg.station,
-        items.len()
+        items.len(),
+        timeout_desc(cfg.timeouts.item_secs)
     )));
     for &item in items {
         let _ = tx.send(UiEvent::Current(item));
@@ -70,21 +76,57 @@ pub fn run_sequence(
         }
         let _ = tx.send(UiEvent::Result(result.clone(), dev));
         results.push(result);
+        // 报告边测边写（V2.3）：文件名固定、逐项覆盖，中途卡死/退出也留有报告
+        let _ = report::write_report_stem(
+            reports_dir,
+            sn_dir(cfg, &device).as_deref(),
+            &meta(cfg, started_wall, started),
+            &device,
+            &results,
+            &stem,
+        );
     }
-    let meta = report::ReportMeta {
+    exec::set_default_timeout(prev_timeout);
+    report::write_report_stem(
+        reports_dir,
+        sn_dir(cfg, &device).as_deref(),
+        &meta(cfg, started_wall, started),
+        &device,
+        &results,
+        &stem,
+    )
+}
+
+/// 秒数 → 超时选项（0 = 不限制）。
+fn timeout_opt(secs: u64) -> Option<Duration> {
+    (secs > 0).then(|| Duration::from_secs(secs))
+}
+
+fn timeout_desc(secs: u64) -> String {
+    if secs == 0 {
+        "关".into()
+    } else {
+        format!("{secs}s")
+    }
+}
+
+fn meta(cfg: &Config, started_wall: SystemTime, started: Instant) -> report::ReportMeta {
+    report::ReportMeta {
         station: cfg.station.clone(),
         started_utc: report::time_str(started_wall),
         elapsed_secs: started.elapsed().as_secs(),
-    };
-    // SN 归档（V2.3）：开启后落到 reports/<SN>/，空 SN 归入 unknown/
-    let sn_dir = cfg.report_by_sn.then(|| {
+    }
+}
+
+/// SN 归档子目录（V2.3）：开启后 reports/<SN>/，空 SN 归入 unknown/
+fn sn_dir(cfg: &Config, device: &DeviceInfo) -> Option<String> {
+    cfg.report_by_sn.then(|| {
         if device.sn.is_empty() {
             "unknown".to_string()
         } else {
             device.sn.clone()
         }
-    });
-    report::write_report(reports_dir, sn_dir.as_deref(), &meta, &device, &results)
+    })
 }
 
 /// 日志/detail 截断（尾部加省略号）。
@@ -107,11 +149,25 @@ fn run_item(
     match item {
         TestItem::Photo => photo_flow(tx, media_dir),
         TestItem::Video => video_flow(tx, media_dir),
-        TestItem::Keys => keys_flow(tx, manual, &cfg.keys),
+        TestItem::Keys => keys_flow(tx, manual, &cfg.keys, cfg.timeouts.manual_secs),
         TestItem::Wifi => wifi_flow(tx, &cfg.wifi),
         TestItem::Gyro => gyro_flow(tx, &cfg.gyro),
-        TestItem::Led => manual_flow(item, "指示灯闪烁是否正常？", tx, manual, Some(3)),
-        TestItem::MicSpeaker => manual_flow(item, "MIC 与喇叭声音是否正常？", tx, manual, None),
+        TestItem::Led => manual_flow(
+            item,
+            "指示灯闪烁是否正常？",
+            tx,
+            manual,
+            Some(3),
+            cfg.timeouts.manual_secs,
+        ),
+        TestItem::MicSpeaker => manual_flow(
+            item,
+            "MIC 与喇叭声音是否正常？",
+            tx,
+            manual,
+            None,
+            cfg.timeouts.manual_secs,
+        ),
         _ => runner::run_auto(item),
     }
 }
@@ -226,6 +282,7 @@ fn manual_flow(
     tx: &Sender<UiEvent>,
     manual: &Receiver<UiResponse>,
     repeat: Option<usize>,
+    manual_secs: u64,
 ) -> RunOutcome {
     let mut r = TestResult::new(item);
     // 人工判定项（指示灯/MIC）必有 camera-factory 命令
@@ -242,7 +299,7 @@ fn manual_flow(
         item,
         question: question.to_string(),
     });
-    match manual.recv() {
+    match recv_manual(manual, manual_secs) {
         Ok(UiResponse::Manual(true)) => r.verdict = Verdict::ManualYes,
         Ok(UiResponse::Manual(false)) => r.verdict = Verdict::ManualNo,
         Ok(_) => {
@@ -250,7 +307,12 @@ fn manual_flow(
             r.verdict = Verdict::Skipped;
             r.detail = "应答类型不匹配".into();
         }
-        Err(_) => {
+        Err(RecvTimeoutError::Timeout) => {
+            // 保守判失败：宁可复测，不静默放过
+            r.verdict = Verdict::ManualNo;
+            r.detail = format!("超时未人工判定（{manual_secs}s），自动判失败");
+        }
+        Err(RecvTimeoutError::Disconnected) => {
             r.verdict = Verdict::Skipped;
             r.detail = "界面已退出，判定中断".into();
         }
@@ -261,13 +323,26 @@ fn manual_flow(
     }
 }
 
+/// 等待 UI 应答；`secs` 0 = 无限等。超时返回 Err(Timeout)。
+fn recv_manual(manual: &Receiver<UiResponse>, secs: u64) -> Result<UiResponse, RecvTimeoutError> {
+    match timeout_opt(secs) {
+        Some(d) => manual.recv_timeout(d),
+        None => manual.recv().map_err(|e| e.into()),
+    }
+}
+
 /// 按键引导流程（V2.1）：弹窗提示按键 → 固件监听窗口内操作员按键 →
 /// 回显已检测到的键，收齐自动 PASS；未收齐由操作员重测/改判。
 /// 必测键集合与解析模式由工位配置裁剪（V2.2）。
 ///
 /// 原程序为无提示静默解析（没按到键时什么都不打印、也不判失败），
 /// 一键全测下无人按键必失败，故改为引导式（V2_PLAN.md §1）。
-fn keys_flow(tx: &Sender<UiEvent>, manual: &Receiver<UiResponse>, keys: &KeysCfg) -> RunOutcome {
+fn keys_flow(
+    tx: &Sender<UiEvent>,
+    manual: &Receiver<UiResponse>,
+    keys: &KeysCfg,
+    manual_secs: u64,
+) -> RunOutcome {
     let mut r = TestResult::new(TestItem::Keys);
     let cmd = CameraFactory::Keys.device_cmd();
     loop {
@@ -303,7 +378,7 @@ fn keys_flow(tx: &Sender<UiEvent>, manual: &Receiver<UiResponse>, keys: &KeysCfg
                     awaiting: true,
                 });
                 let _ = tx.send(UiEvent::Log(format!("未收齐，缺: {}", missing.join("、"))));
-                match manual.recv() {
+                match recv_manual(manual, manual_secs) {
                     Ok(UiResponse::KeysRetry) => {
                         // 立即回发"检测中"，弹窗不闪断；再进入下一轮命令
                         let _ = tx.send(UiEvent::KeysUpdate {
@@ -330,7 +405,12 @@ fn keys_flow(tx: &Sender<UiEvent>, manual: &Receiver<UiResponse>, keys: &KeysCfg
                         });
                         continue;
                     }
-                    Err(_) => {
+                    Err(RecvTimeoutError::Timeout) => {
+                        r.verdict = Verdict::ManualNo;
+                        r.detail = format!("超时未应答（缺 {}）", missing.join("、"));
+                        break;
+                    }
+                    Err(RecvTimeoutError::Disconnected) => {
                         r.verdict = Verdict::Skipped;
                         r.detail = "界面已退出，按键判定中断".into();
                         break;
@@ -338,9 +418,48 @@ fn keys_flow(tx: &Sender<UiEvent>, manual: &Receiver<UiResponse>, keys: &KeysCfg
                 }
             }
             Err(e) => {
-                r.verdict = Verdict::Fail;
-                r.detail = format!("{e:#}");
-                break;
+                let msg = format!("{e:#}");
+                if msg.contains("超时") {
+                    // 固件监听窗口一直阻塞到超时：按"未收齐"处理，交给操作员
+                    let _ = tx.send(UiEvent::KeysUpdate {
+                        detected: Vec::new(),
+                        awaiting: true,
+                    });
+                    let _ = tx.send(UiEvent::Log("按键监听超时，无输出".to_string()));
+                    match recv_manual(manual, manual_secs) {
+                        Ok(UiResponse::KeysRetry) | Ok(UiResponse::Manual(true)) => {
+                            let _ = tx.send(UiEvent::KeysUpdate {
+                                detected: Vec::new(),
+                                awaiting: false,
+                            });
+                            continue;
+                        }
+                        Ok(UiResponse::KeysForce(true)) => {
+                            r.verdict = Verdict::ManualYes;
+                            r.detail = "人工强制通过（监听超时无输出）".into();
+                            break;
+                        }
+                        Ok(_) => {
+                            r.verdict = Verdict::ManualNo;
+                            r.detail = "监听超时，未检测到按键".into();
+                            break;
+                        }
+                        Err(RecvTimeoutError::Timeout) => {
+                            r.verdict = Verdict::ManualNo;
+                            r.detail = format!("监听超时且无人应答（{manual_secs}s）");
+                            break;
+                        }
+                        Err(RecvTimeoutError::Disconnected) => {
+                            r.verdict = Verdict::Skipped;
+                            r.detail = "界面已退出，按键判定中断".into();
+                            break;
+                        }
+                    }
+                } else {
+                    r.verdict = Verdict::Fail;
+                    r.detail = msg;
+                    break;
+                }
             }
         }
     }
@@ -597,7 +716,7 @@ mod tests {
             &reports,
             Config::default(),
             &keys_case("printf '5\\n'"),
-            || UiResponse::KeysForce(false),
+            || Some(UiResponse::KeysForce(false)),
         );
         assert_eq!((vs[0].1, n), (Verdict::ManualNo, 1));
         // 3) 首轮缺键 → 重测 → 第二轮全键码收齐 PASS
@@ -613,7 +732,7 @@ mod tests {
                  echo $n > \"$KEYS_CNT\"; [ \"$n\" -ge 2 ] && printf '5\\n6\\n4\\n' \
                  || printf '5\\n'",
             ),
-            || UiResponse::KeysRetry,
+            || Some(UiResponse::KeysRetry),
         );
         assert_eq!((vs[0].1, n), (Verdict::Pass, 1));
         std::env::remove_var("KEYS_CNT");
@@ -686,13 +805,56 @@ mod tests {
         assert_eq!(vs[0].1, Verdict::Fail);
         std::env::remove_var("GYRO_CNT");
 
+        // —— V2.3 超时 ——
+        let tcfg = Config {
+            timeouts: crate::config::TimeoutsCfg {
+                item_secs: 1,
+                manual_secs: 1,
+            },
+            ..Config::default()
+        };
+        // 1) 命令阻塞超过 item_secs：超时强杀判 FAIL，序列不卡死
+        let (vs, n) = scenario(
+            &base.join("adb-slow"),
+            items(TestItem::Wifi),
+            &media,
+            &reports,
+            tcfg.clone(),
+            "#!/bin/sh\ncase \"$*\" in\n*\"camera-factory 5\"*) sleep 5; printf 'wifi ok\\n';;\n\
+             *) printf 'ok\\n';;\nesac\n",
+            || unreachable!(),
+        );
+        assert_eq!((vs[0].1, n), (Verdict::Fail, 0));
+        // 2) 按键未收齐且无人应答：manual_secs 到点自动判失败
+        let (vs, n) = scenario(
+            &base.join("adb-keys-t"),
+            items(TestItem::Keys),
+            &media,
+            &reports,
+            tcfg.clone(),
+            &keys_case("printf '5\\n'"),
+            || None,
+        );
+        assert_eq!((vs[0].1, n), (Verdict::ManualNo, 1));
+        // 3) 指示灯人工判定无人应答：超时判不合格
+        let (vs, n) = scenario(
+            &base.join("adb-led-t"),
+            items(TestItem::Led),
+            &media,
+            &reports,
+            tcfg,
+            "#!/bin/sh\nprintf 'led\\n'\n",
+            || None,
+        );
+        assert_eq!((vs[0].1, n), (Verdict::ManualNo, 0));
+
         std::env::remove_var("ADB");
         std::env::remove_var("PULL_SRC");
         let _ = std::fs::remove_dir_all(&base);
     }
 
     /// 场景驱动：写入完整假 adb 脚本后跑 `items` 序列；
-    /// 每次收到 awaiting 应答请求时调 `respond` 决定应答。
+    /// 每次收到 awaiting 应答请求时调 `respond`（返回 None = 不应答，模拟无人操作）。
     /// 返回 (逐项判定, awaiting 次数)。
     fn scenario(
         script: &Path,
@@ -701,7 +863,7 @@ mod tests {
         reports: &Path,
         cfg: Config,
         script_text: &str,
-        mut respond: impl FnMut() -> UiResponse,
+        mut respond: impl FnMut() -> Option<UiResponse>,
     ) -> (Vec<(TestItem, Verdict)>, usize) {
         std::fs::write(script, script_text).unwrap();
         {
@@ -720,7 +882,9 @@ mod tests {
             match ev {
                 UiEvent::KeysUpdate { awaiting: true, .. } => {
                     awaiting += 1;
-                    mtx.send(respond()).unwrap();
+                    if let Some(resp) = respond() {
+                        mtx.send(resp).unwrap();
+                    }
                 }
                 UiEvent::Result(res, _) => verdicts.push((res.item, res.verdict)),
                 _ => {}

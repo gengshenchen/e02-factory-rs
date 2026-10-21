@@ -10,6 +10,7 @@ pub fn show(ctx: &egui::Context, app: &mut E02App) {
     };
     let detected = prompt.detected.clone();
     let awaiting = prompt.awaiting;
+    let deadline = prompt.deadline;
     let required = app.config.keys.required.clone();
     egui::Window::new("按键测试")
         .collapsible(false)
@@ -35,6 +36,19 @@ pub fn show(ctx: &egui::Context, app: &mut E02App) {
             }
             ui.add_space(6.0);
             if awaiting {
+                if let Some(dl) = deadline {
+                    let left = dl
+                        .saturating_duration_since(std::time::Instant::now())
+                        .as_secs();
+                    ui.colored_label(
+                        if left <= 10 {
+                            egui::Color32::RED
+                        } else {
+                            egui::Color32::GRAY
+                        },
+                        format!("{left} 秒未应答将自动判定为失败"),
+                    );
+                }
                 ui.colored_label(egui::Color32::RED, "未收齐，请选择：");
                 ui.horizontal(|ui| {
                     if ui.button("重新测试").clicked() {

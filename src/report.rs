@@ -71,21 +71,22 @@ struct JsonReport<'a> {
     results: &'a [TestResult],
 }
 
-/// 写入报告对：`e02-<UTC>.txt` + 同名 `.json`；返回文本路径。
+/// 写入报告对：`e02-<stem>.txt` + 同名 `.json`；返回文本路径。
 /// `sn_subdir`（SN 归档，V2.3）非空时落到 `dir/<sn>/` 子目录。
-pub fn write_report(
+/// stem 由调用方指定——序列内边测边写复用同一文件（V2.3：中途异常退出也保留已完成部分）。
+pub fn write_report_stem(
     dir: &Path,
     sn_subdir: Option<&str>,
     meta: &ReportMeta,
     device: &DeviceInfo,
     results: &[TestResult],
+    stem: &str,
 ) -> Option<PathBuf> {
     let dir = match sn_subdir {
         Some(sn) if !sn.is_empty() => dir.join(sanitize_sn(sn)),
         _ => dir.to_path_buf(),
     };
     std::fs::create_dir_all(&dir).ok()?;
-    let stem = time_str(SystemTime::now());
     let txt = dir.join(format!("e02-{stem}.txt"));
     std::fs::write(&txt, render_text(meta, device, results)).ok()?;
     let json = dir.join(format!("e02-{stem}.json"));
@@ -217,20 +218,41 @@ mod tests {
         let mut r = TestResult::new(TestItem::Wifi);
         r.verdict = Verdict::Pass;
         // 普通目录：txt + json 成对
-        let path = write_report(&dir, None, &meta(), &DeviceInfo::default(), &[r.clone()]).unwrap();
+        let path = write_report_stem(
+            &dir,
+            None,
+            &meta(),
+            &DeviceInfo::default(),
+            &[r.clone()],
+            "t1",
+        )
+        .unwrap();
         assert!(path.exists());
         assert!(path.extension().is_some_and(|e| e == "txt"));
         let json = path.with_extension("json");
         assert!(json.exists(), "JSON 报告应成对存在");
+        // 同 stem 逐项覆盖写（边测边写），不产生新文件
+        assert_eq!(
+            write_report_stem(
+                &dir,
+                None,
+                &meta(),
+                &DeviceInfo::default(),
+                &[r.clone()],
+                "t1"
+            )
+            .unwrap(),
+            path
+        );
         // SN 归档：落到 sn 子目录
         let dev = DeviceInfo {
             sn: "SN123".into(),
             ..Default::default()
         };
-        let p2 = write_report(&dir, Some(&dev.sn), &meta(), &dev, &[r]).unwrap();
+        let p2 = write_report_stem(&dir, Some(&dev.sn), &meta(), &dev, &[r], "t2").unwrap();
         assert!(p2.starts_with(dir.join("SN123")));
         // SN 含路径字符 → 替换为 _（防目录穿越）
-        let p3 = write_report(&dir, Some("../x"), &meta(), &dev, &[]).unwrap();
+        let p3 = write_report_stem(&dir, Some("../x"), &meta(), &dev, &[], "t3").unwrap();
         assert!(p3.starts_with(dir.join(".._x")));
         let _ = std::fs::remove_dir_all(&dir);
     }

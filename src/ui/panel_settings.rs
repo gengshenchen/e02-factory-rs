@@ -123,6 +123,16 @@ pub fn show(ctx: &egui::Context, app: &mut E02App) {
             });
 
             ui.separator();
+            ui.strong("超时");
+            ui.horizontal(|ui| {
+                ui.label("单项命令(s)");
+                ui.add(egui::DragValue::new(&mut app.config.timeouts.item_secs).range(0..=600));
+                ui.label("人工应答(s)");
+                ui.add(egui::DragValue::new(&mut app.config.timeouts.manual_secs).range(0..=600));
+            });
+            ui.small("0 = 不限制；命令超时判 FAIL 并继续，人工超时自动判不合格");
+
+            ui.separator();
             ui.strong("报告");
             ui.checkbox(
                 &mut app.config.report_by_sn,

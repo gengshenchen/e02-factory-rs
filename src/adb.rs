@@ -3,6 +3,7 @@
 //! M1 阶段由 worker 线程调用（阻塞式）；解析函数为纯函数，可单测。
 //! adb CLI 在 Windows / Linux 行为一致，测试机上本就安装。
 
+use crate::exec;
 use anyhow::{bail, Context, Result};
 use std::path::Path;
 use std::process::Command;
@@ -13,12 +14,13 @@ fn adb_path() -> String {
 }
 
 /// 执行 `adb shell <cmd>`，返回去除首尾空白与 `\r` 的 stdout。
+/// 受全局默认超时约束（见 [`exec::set_default_timeout`]）。
 pub fn shell(cmd: &str) -> Result<String> {
-    let out = Command::new(adb_path())
-        .arg("shell")
-        .arg(cmd)
-        .output()
-        .with_context(|| format!("执行 adb shell {cmd} 失败（adb 是否在 PATH？）"))?;
+    let out = exec::output(
+        Command::new(adb_path()).arg("shell").arg(cmd),
+        exec::default_timeout(),
+    )
+    .with_context(|| format!("执行 adb shell {cmd} 失败（adb 是否在 PATH？）"))?;
     if !out.status.success() {
         bail!(
             "adb shell {cmd} 退出码 {:?}: {}",
@@ -33,11 +35,11 @@ pub fn shell(cmd: &str) -> Result<String> {
 
 /// `adb pull <remote> <local>`。
 pub fn pull(remote: &str, local: &Path) -> Result<()> {
-    let out = Command::new(adb_path())
-        .args(["pull", remote])
-        .arg(local)
-        .output()
-        .with_context(|| format!("adb pull {remote} 失败"))?;
+    let out = exec::output(
+        Command::new(adb_path()).args(["pull", remote]).arg(local),
+        exec::default_timeout(),
+    )
+    .with_context(|| format!("adb pull {remote} 失败"))?;
     if !out.status.success() {
         bail!(
             "adb pull {remote}: {}",
@@ -67,10 +69,11 @@ pub fn parse_devices_output(output: &str) -> Vec<String> {
 
 /// 当前在线设备序列号列表。
 pub fn devices() -> Result<Vec<String>> {
-    let out = Command::new(adb_path())
-        .arg("devices")
-        .output()
-        .context("执行 adb devices 失败")?;
+    let out = exec::output(
+        Command::new(adb_path()).arg("devices"),
+        exec::default_timeout(),
+    )
+    .context("执行 adb devices 失败")?;
     Ok(parse_devices_output(&String::from_utf8_lossy(&out.stdout)))
 }
 

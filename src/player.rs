@@ -7,6 +7,7 @@
 //! ffmpeg/ffprobe 查找顺序：环境变量 `FFMPEG` / `FFPROBE` →
 //! exe 同目录（随包分发形态）→ PATH。
 
+use crate::exec;
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -57,15 +58,17 @@ pub fn extract_frames(video: &Path, frames_dir: &Path, fps: u32, scale_w: u32) -
     }
     std::fs::create_dir_all(frames_dir)?;
 
-    let out = Command::new(ffmpeg_path())
-        .args(["-nostdin", "-loglevel", "error", "-y"])
-        .arg("-i")
-        .arg(video)
-        .arg("-vf")
-        .arg(format!("fps={fps},scale={scale_w}:-2"))
-        .arg(frames_dir.join("f%04d.png"))
-        .output()
-        .context("执行 ffmpeg 失败（ffmpeg 是否在 PATH？）")?;
+    let out = exec::output(
+        Command::new(ffmpeg_path())
+            .args(["-nostdin", "-loglevel", "error", "-y"])
+            .arg("-i")
+            .arg(video)
+            .arg("-vf")
+            .arg(format!("fps={fps},scale={scale_w}:-2"))
+            .arg(frames_dir.join("f%04d.png")),
+        exec::default_timeout(),
+    )
+    .context("执行 ffmpeg 失败（ffmpeg 是否在 PATH？）")?;
     if !out.status.success() {
         bail!(
             "ffmpeg 解码失败: {}",
@@ -88,20 +91,22 @@ pub fn extract_frames(video: &Path, frames_dir: &Path, fps: u32, scale_w: u32) -
 
 /// 探测视频是否含音频流（产线顺带校验录音通道）。
 pub fn probe_has_audio(video: &Path) -> Result<bool> {
-    let out = Command::new(ffprobe_path())
-        .args([
-            "-v",
-            "error",
-            "-select_streams",
-            "a",
-            "-show_entries",
-            "stream=index",
-            "-of",
-            "csv=p=0",
-        ])
-        .arg(video)
-        .output()
-        .context("执行 ffprobe 失败")?;
+    let out = exec::output(
+        Command::new(ffprobe_path())
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "a",
+                "-show_entries",
+                "stream=index",
+                "-of",
+                "csv=p=0",
+            ])
+            .arg(video),
+        exec::default_timeout(),
+    )
+    .context("执行 ffprobe 失败")?;
     if !out.status.success() {
         bail!(
             "ffprobe 失败: {}",

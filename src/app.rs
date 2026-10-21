@@ -24,6 +24,8 @@ const PLAYBACK_INTERVAL: Duration = Duration::from_millis(500);
 pub struct ManualAsk {
     pub title: String,
     pub question: String,
+    /// 应答截止时刻（None = 不限时）；到点 worker 自动判失败
+    pub deadline: Option<Instant>,
     reply: Sender<UiResponse>,
 }
 
@@ -39,6 +41,8 @@ pub struct KeysPrompt {
     pub detected: Vec<u8>,
     /// true：未收齐，等待操作员 重测/改判
     pub awaiting: bool,
+    /// 应答截止时刻（None = 不限时）；到点 worker 自动判失败
+    pub deadline: Option<Instant>,
     reply: Sender<UiResponse>,
 }
 
@@ -193,6 +197,12 @@ impl E02App {
         }
     }
 
+    /// 人工应答截止时刻（0 = 不限时，V2.3 超时）。
+    fn manual_deadline(&self) -> Option<Instant> {
+        let secs = self.config.timeouts.manual_secs;
+        (secs > 0).then(|| Instant::now() + Duration::from_secs(secs))
+    }
+
     /// 排空 worker 事件并落到界面状态。
     fn drain_events(&mut self, ctx: &egui::Context) {
         let mut events = Vec::new();
@@ -220,6 +230,9 @@ impl E02App {
                 if r.item == TestItem::Keys {
                     self.keys_prompt = None; // 结果已定，弹窗收起（兜底）
                 }
+                if matches!(r.item, TestItem::Led | TestItem::MicSpeaker) {
+                    self.manual = None; // 已答/超时，弹窗收起（兜底）
+                }
                 if let Some(slot) = self.results.iter_mut().find(|s| s.item == r.item) {
                     *slot = r;
                 }
@@ -229,6 +242,7 @@ impl E02App {
                     self.manual = Some(ManualAsk {
                         title: item.label().to_string(),
                         question,
+                        deadline: self.manual_deadline(),
                         reply,
                     });
                 }
@@ -239,6 +253,7 @@ impl E02App {
                         self.keys_prompt = Some(KeysPrompt {
                             detected,
                             awaiting: true,
+                            deadline: self.manual_deadline(),
                             reply,
                         });
                     } else {

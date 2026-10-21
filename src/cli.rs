@@ -163,6 +163,9 @@ fn test_cmd(
         Err(e) => eprintln!("警告：{e:#}"),
     }
 
+    // 单项超时（V2.3）：与 GUI worker 同一子进程看门狗
+    let t = cfg.timeouts.item_secs;
+    crate::exec::set_default_timeout((t > 0).then(|| std::time::Duration::from_secs(t)));
     let (started_wall, started) = (std::time::SystemTime::now(), std::time::Instant::now());
     let batch = runner::run_batch(&items);
     let (mut pass, mut fail, mut skip) = (0usize, 0usize, 0usize);

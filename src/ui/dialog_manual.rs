@@ -5,6 +5,7 @@
 //! 写回应答 channel，worker 继续执行后续测试项。
 
 use crate::app::E02App;
+use std::time::Instant;
 
 pub fn show(ctx: &egui::Context, app: &mut E02App) {
     let Some(ask) = &app.manual else {
@@ -12,6 +13,7 @@ pub fn show(ctx: &egui::Context, app: &mut E02App) {
     };
     let title = ask.title.clone();
     let question = ask.question.clone();
+    let deadline = ask.deadline;
     egui::Window::new(&title)
         .collapsible(false)
         .resizable(false)
@@ -20,6 +22,17 @@ pub fn show(ctx: &egui::Context, app: &mut E02App) {
             ui.set_min_width(300.0);
             ui.add_space(6.0);
             ui.label(&question);
+            if let Some(dl) = deadline {
+                let left = dl.saturating_duration_since(Instant::now()).as_secs();
+                ui.colored_label(
+                    if left <= 10 {
+                        egui::Color32::RED
+                    } else {
+                        egui::Color32::GRAY
+                    },
+                    format!("{left} 秒未应答将自动判定为不合格"),
+                );
+            }
             ui.add_space(12.0);
             ui.horizontal(|ui| {
                 if ui.button("合格").clicked() {
