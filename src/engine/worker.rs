@@ -43,12 +43,20 @@ pub fn run_sequence(
 
     let mut device = DeviceInfo::default();
     let mut results: Vec<TestResult> = Vec::new();
+    let _ = tx.send(UiEvent::Log(format!("序列开始，共 {} 项", items.len())));
     for &item in items {
         let _ = tx.send(UiEvent::Current(item));
+        let _ = tx.send(UiEvent::Log(format!("── {} 开始", item.label())));
         let RunOutcome {
             result,
             device: dev,
         } = run_item(item, tx, manual, media_dir);
+        let _ = tx.send(UiEvent::Log(format!(
+            "── {}: {} {}",
+            item.label(),
+            result.verdict.label(),
+            clip(&result.detail, 100)
+        )));
         if let Some(d) = &dev {
             device.merge(d.clone());
         }
@@ -56,6 +64,16 @@ pub fn run_sequence(
         results.push(result);
     }
     report::write_report(reports_dir, &device, &results)
+}
+
+/// 日志/detail 截断（尾部加省略号）。
+fn clip(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        s.to_string()
+    } else {
+        let cut: String = s.chars().take(n).collect();
+        format!("{cut}…")
+    }
 }
 
 fn run_item(
@@ -67,6 +85,7 @@ fn run_item(
     match item {
         TestItem::Photo => photo_flow(tx, media_dir),
         TestItem::Video => video_flow(tx, media_dir),
+        TestItem::Keys => keys_flow(tx, manual),
         TestItem::Led => manual_flow(item, "指示灯闪烁是否正常？", tx, manual, Some(3)),
         TestItem::MicSpeaker => manual_flow(item, "MIC 与喇叭声音是否正常？", tx, manual, None),
         _ => runner::run_auto(item),
@@ -79,10 +98,17 @@ fn photo_flow(tx: &Sender<UiEvent>, media_dir: &Path) -> RunOutcome {
     let local = media_dir.join("testjpeg.jpg");
     // 先删旧图，防止上一台设备的图片冒充本轮结果（原程序同逻辑）
     let _ = std::fs::remove_file(&local);
-    let outcome = adb::shell(&CameraFactory::Photo.device_cmd())
+    let cmd = CameraFactory::Photo.device_cmd();
+    let _ = tx.send(UiEvent::Log(format!("执行 adb shell {cmd}")));
+    let outcome = adb::shell(&cmd)
         .map_err(|e| format!("{e:#}"))
         .and_then(|_| {
             thread::sleep(Duration::from_millis(1000)); // 原程序 Sleep(1000)
+            let _ = tx.send(UiEvent::Log(format!(
+                "adb pull {} → {}",
+                protocol::REMOTE_PHOTO,
+                local.display()
+            )));
             adb::pull(protocol::REMOTE_PHOTO, &local).map_err(|e| format!("{e:#}"))
         })
         .and_then(|_| {
@@ -114,10 +140,17 @@ fn video_flow(tx: &Sender<UiEvent>, media_dir: &Path) -> RunOutcome {
     let mut r = TestResult::new(TestItem::Video);
     let local = media_dir.join("testvideo.mp4");
     let _ = std::fs::remove_file(&local);
-    let outcome = adb::shell(&CameraFactory::Video.device_cmd())
+    let cmd = CameraFactory::Video.device_cmd();
+    let _ = tx.send(UiEvent::Log(format!("执行 adb shell {cmd}")));
+    let outcome = adb::shell(&cmd)
         .map_err(|e| format!("{e:#}"))
         .and_then(|_| {
             thread::sleep(Duration::from_millis(900)); // 原程序 Sleep(900)
+            let _ = tx.send(UiEvent::Log(format!(
+                "adb pull {} → {}",
+                protocol::REMOTE_VIDEO,
+                local.display()
+            )));
             adb::pull(protocol::REMOTE_VIDEO, &local).map_err(|e| format!("{e:#}"))
         });
     if let Err(e) = outcome {
@@ -129,6 +162,7 @@ fn video_flow(tx: &Sender<UiEvent>, media_dir: &Path) -> RunOutcome {
         };
     }
     // 解码验证 + 抽帧（原程序仅"能播即过"，这里加严为全程解码成功）
+    let _ = tx.send(UiEvent::Log(format!("ffmpeg 解码 {}", local.display())));
     let frames_dir = media_dir.join("frames");
     match player::extract_frames(&local, &frames_dir, 2, 640) {
         Ok(count) => {
@@ -171,16 +205,10 @@ fn manual_flow(
 ) -> RunOutcome {
     let mut r = TestResult::new(item);
     let cmd = item.factory_cmd().device_cmd();
-    match repeat {
-        // 指示灯：原程序连发 3 次命令
-        Some(n) => {
-            for _ in 0..n {
-                let _ = adb::shell(&cmd);
-            }
-        }
-        None => {
-            let _ = adb::shell(&cmd);
-        }
+    let n = repeat.unwrap_or(1);
+    let _ = tx.send(UiEvent::Log(format!("执行 adb shell {cmd}×{n}")));
+    for _ in 0..n {
+        let _ = adb::shell(&cmd);
     }
     let _ = tx.send(UiEvent::Manual {
         item,
@@ -189,9 +217,108 @@ fn manual_flow(
     match manual.recv() {
         Ok(UiResponse::Manual(true)) => r.verdict = Verdict::ManualYes,
         Ok(UiResponse::Manual(false)) => r.verdict = Verdict::ManualNo,
+        Ok(_) => {
+            // Keys* 应答不会出现在此弹窗，视为应答异常
+            r.verdict = Verdict::Skipped;
+            r.detail = "应答类型不匹配".into();
+        }
         Err(_) => {
             r.verdict = Verdict::Skipped;
             r.detail = "界面已退出，判定中断".into();
+        }
+    }
+    RunOutcome {
+        result: r,
+        device: None,
+    }
+}
+
+/// 按键测试必测键集合（V2.2 起由工位配置裁剪；UI 弹窗同用）。
+pub const KEYS_REQUIRED: [u8; 3] = [4, 5, 6];
+
+/// 按键解析模式：false=兼容原程序（任意位置含数字即命中），
+/// true=严格（只认独立数字行，排除版本号/电压假阳性）。V2.2 起由配置切换。
+const KEYS_STRICT: bool = false;
+
+/// 按键引导流程（V2.1）：弹窗提示按键 → 固件监听窗口内操作员按键 →
+/// 回显已检测到的键，收齐自动 PASS；未收齐由操作员重测/改判。
+///
+/// 原程序为无提示静默解析（没按到键时什么都不打印、也不判失败），
+/// 一键全测下无人按键必失败，故改为引导式（V2_PLAN.md §1）。
+fn keys_flow(tx: &Sender<UiEvent>, manual: &Receiver<UiResponse>) -> RunOutcome {
+    let mut r = TestResult::new(TestItem::Keys);
+    let cmd = CameraFactory::Keys.device_cmd();
+    loop {
+        let _ = tx.send(UiEvent::Log(format!("执行 adb shell {cmd}，请依次按键…")));
+        match adb::shell(&cmd) {
+            Ok(out) => {
+                let got = if KEYS_STRICT {
+                    protocol::parse_keys_strict(&out)
+                } else {
+                    protocol::parse_keys_codes(&out)
+                };
+                let missing: Vec<&'static str> = KEYS_REQUIRED
+                    .iter()
+                    .filter(|c| !got.contains(c))
+                    .map(|&c| protocol::key_name(c))
+                    .collect();
+                let _ = tx.send(UiEvent::Log(format!(
+                    "按键输出: {}",
+                    clip(&runner::one_line(&out), 80)
+                )));
+                if missing.is_empty() {
+                    let _ = tx.send(UiEvent::KeysUpdate {
+                        detected: got,
+                        awaiting: false,
+                    });
+                    r.verdict = Verdict::Pass;
+                    r.detail = "收齐全部按键".into();
+                    break;
+                }
+                let _ = tx.send(UiEvent::KeysUpdate {
+                    detected: got.clone(),
+                    awaiting: true,
+                });
+                let _ = tx.send(UiEvent::Log(format!("未收齐，缺: {}", missing.join("、"))));
+                match manual.recv() {
+                    Ok(UiResponse::KeysRetry) => {
+                        // 立即回发"检测中"，弹窗不闪断；再进入下一轮命令
+                        let _ = tx.send(UiEvent::KeysUpdate {
+                            detected: got.clone(),
+                            awaiting: false,
+                        });
+                        continue;
+                    }
+                    Ok(UiResponse::KeysForce(true)) => {
+                        r.verdict = Verdict::ManualYes;
+                        r.detail = format!("人工强制通过（缺 {}）", missing.join("、"));
+                        break;
+                    }
+                    Ok(UiResponse::KeysForce(false)) | Ok(UiResponse::Manual(false)) => {
+                        r.verdict = Verdict::ManualNo;
+                        r.detail = format!("缺 {}", missing.join("、"));
+                        break;
+                    }
+                    Ok(UiResponse::Manual(true)) => {
+                        // 视作重测（同 KeysRetry）
+                        let _ = tx.send(UiEvent::KeysUpdate {
+                            detected: got.clone(),
+                            awaiting: false,
+                        });
+                        continue;
+                    }
+                    Err(_) => {
+                        r.verdict = Verdict::Skipped;
+                        r.detail = "界面已退出，按键判定中断".into();
+                        break;
+                    }
+                }
+            }
+            Err(e) => {
+                r.verdict = Verdict::Fail;
+                r.detail = format!("{e:#}");
+                break;
+            }
         }
     }
     RunOutcome {
@@ -307,8 +434,78 @@ mod tests {
         assert!(text.contains("sn-address:002"));
         assert!(text.contains("指示灯测试:PASS"));
 
+        // —— V2.1 按键引导：三场景（顺序执行，防 ADB 环境变量竞争）——
+        let kscript = base.join("adb-keys");
+        // 1) 输出全键码：自动收齐 PASS，全程无人工介入
+        let (v, n) = keys_scenario(&kscript, &media, &reports, "printf '5\\n6\\n4\\n'", || {
+            unreachable!("全键码不应触发人工应答")
+        });
+        assert_eq!((v, n), (Verdict::Pass, 0));
+        // 2) 只回 5：未收齐 → 强制改判失败
+        let (v, n) = keys_scenario(&kscript, &media, &reports, "printf '5\\n'", || {
+            UiResponse::KeysForce(false)
+        });
+        assert_eq!((v, n), (Verdict::ManualNo, 1));
+        // 3) 首轮缺键 → 重测 → 第二轮全键码收齐 PASS
+        std::env::set_var("KEYS_CNT", base.join("cnt").display().to_string());
+        let (v, n) = keys_scenario(
+            &kscript,
+            &media,
+            &reports,
+            "n=$(cat \"$KEYS_CNT\" 2>/dev/null || echo 0); n=$((n+1)); echo $n > \"$KEYS_CNT\"; \
+             [ \"$n\" -ge 2 ] && printf '5\\n6\\n4\\n' || printf '5\\n'",
+            || UiResponse::KeysRetry,
+        );
+        assert_eq!((v, n), (Verdict::Pass, 1));
+        std::env::remove_var("KEYS_CNT");
+
         std::env::remove_var("ADB");
         std::env::remove_var("PULL_SRC");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 按键引导场景驱动：`body` 为假 adb 对 camera-factory 15 的输出体；
+    /// 每次收到 awaiting 应答请求时调 `respond` 决定应答。
+    /// 返回 (最终判定, awaiting 次数)。
+    fn keys_scenario(
+        script: &Path,
+        media: &Path,
+        reports: &Path,
+        body: &str,
+        mut respond: impl FnMut() -> UiResponse,
+    ) -> (Verdict, usize) {
+        std::fs::write(
+            script,
+            format!(
+                "#!/bin/sh\ncase \"$*\" in\n*\"camera-factory 15\"*) {body};;\n\
+                 *) printf 'ok\\n';;\nesac\n"
+            ),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::env::set_var("ADB", script);
+
+        let (tx, rx) = mpsc::channel();
+        let (mtx, mrx) = mpsc::channel();
+        let items = vec![TestItem::Keys];
+        let (m, r) = (media.to_path_buf(), reports.to_path_buf());
+        let handle = thread::spawn(move || run_sequence(&items, &tx, &mrx, &m, &r));
+
+        let (mut verdict, mut awaiting) = (Verdict::Pending, 0usize);
+        while let Ok(ev) = rx.recv_timeout(Duration::from_secs(60)) {
+            match ev {
+                UiEvent::KeysUpdate { awaiting: true, .. } => {
+                    awaiting += 1;
+                    mtx.send(respond()).unwrap();
+                }
+                UiEvent::Result(res, _) => verdict = res.verdict,
+                _ => {}
+            }
+        }
+        handle.join().unwrap();
+        (verdict, awaiting)
     }
 }

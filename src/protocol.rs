@@ -132,19 +132,39 @@ pub fn sdcard_ok(output: &str) -> bool {
     output.contains("true")
 }
 
-/// 按键测试：5=录像键，6=拍照键，4=多功能键（沿用原判定字符）。
-pub fn parse_keys(output: &str) -> Vec<&'static str> {
-    let mut keys = Vec::new();
-    for ch in ['5', '6', '4'] {
-        if output.contains(ch) {
-            keys.push(match ch {
-                '5' => "录像按键正常",
-                '6' => "拍照按键正常",
-                _ => "多功能按键正常",
-            });
-        }
+/// 按键码 → 名称（沿用原程序判定：5=开机键，6=音量键，4=多功能键）。
+pub fn key_name(code: u8) -> &'static str {
+    match code {
+        5 => "开机键",
+        6 => "音量键",
+        _ => "多功能键",
     }
-    keys
+}
+
+/// 键码 → 对应数字字符（码 4 → '4'；u8 直转 char 会得到控制字符）。
+fn digit_of(code: u8) -> char {
+    (b'0' + code) as char
+}
+
+/// 按键测试（兼容模式）：输出含字符 4/5/6 即视为检测到，
+/// 与原程序 `Find("5")` 行为一致（可能被版本号/电压数字误判）。
+pub fn parse_keys_codes(output: &str) -> Vec<u8> {
+    [4u8, 5, 6]
+        .into_iter()
+        .filter(|&c| output.contains(digit_of(c)))
+        .collect()
+}
+
+/// 按键测试（严格模式）：只认独立数字行（`^\s*[456]\s*$`），
+/// 避免 "E02-1.0.5"、"Voltage:4.2V" 这类文本假阳性。
+pub fn parse_keys_strict(output: &str) -> Vec<u8> {
+    [4u8, 5, 6]
+        .into_iter()
+        .filter(|&c| {
+            let digit = digit_of(c).to_string();
+            output.lines().any(|l| l.trim() == digit)
+        })
+        .collect()
 }
 
 use anyhow::Context as _;
@@ -192,10 +212,15 @@ mod tests {
         assert!(!wifi_ok("...FAIL..."));
         assert!(sdcard_ok("mount true"));
         assert!(!sdcard_ok("false"));
-        assert_eq!(
-            parse_keys("456"),
-            ["录像按键正常", "拍照按键正常", "多功能按键正常"]
-        );
-        assert!(parse_keys("9").is_empty());
+        assert_eq!(parse_keys_codes("456"), vec![4, 5, 6]);
+        assert!(parse_keys_codes("9").is_empty());
+        // 兼容模式与原程序一致：任意位置含数字即命中（含假阳性场景）
+        assert_eq!(parse_keys_codes("soft-ware:E02-1.0.5"), vec![5]);
+        // 严格模式只认独立数字行，排除版本号/电压数字
+        assert_eq!(parse_keys_strict("5\n6\n4\n"), vec![4, 5, 6]);
+        assert!(parse_keys_strict("soft-ware:E02-1.0.5").is_empty());
+        assert!(parse_keys_strict("Voltage:4.2V").is_empty());
+        assert_eq!(parse_keys_strict(" 6 \r\n"), vec![6]);
+        assert_eq!(key_name(5), "开机键");
     }
 }

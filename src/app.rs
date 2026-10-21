@@ -4,6 +4,7 @@ use crate::engine::events::{UiEvent, UiResponse};
 use crate::engine::worker;
 use crate::engine::{TestItem, TestResult};
 use crate::protocol::DeviceInfo;
+use crate::report;
 use crate::ui;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -29,6 +30,32 @@ impl ManualAsk {
     pub fn answer(&self, yes: bool) {
         let _ = self.reply.send(UiResponse::Manual(yes));
     }
+}
+
+/// 按键引导弹窗状态（worker 经 [`UiEvent::KeysUpdate`] 驱动）。
+pub struct KeysPrompt {
+    /// 已检测到的键码（4=多功能 5=开机 6=音量）
+    pub detected: Vec<u8>,
+    /// true：未收齐，等待操作员 重测/改判
+    pub awaiting: bool,
+    reply: Sender<UiResponse>,
+}
+
+impl KeysPrompt {
+    pub fn retry(&self) {
+        let _ = self.reply.send(UiResponse::KeysRetry);
+    }
+
+    pub fn force(&self, yes: bool) {
+        let _ = self.reply.send(UiResponse::KeysForce(yes));
+    }
+}
+
+/// 序列进度（顶栏进度条数据）。
+pub struct Progress {
+    pub total: usize,
+    pub done: usize,
+    pub started: Instant,
 }
 
 /// 媒体区状态：占位说明 / 拍照图片 / 录像抽帧回放。
@@ -65,6 +92,10 @@ pub struct E02App {
     pub media: MediaState,
     /// 过程日志（尾部若干条）
     pub log: VecDeque<String>,
+    /// 序列进度；空闲时 None
+    progress: Option<Progress>,
+    /// 按键引导弹窗；无按键测试进行时 None
+    pub keys_prompt: Option<KeysPrompt>,
     event_rx: Option<Receiver<UiEvent>>,
     manual_tx: Option<Sender<UiResponse>>,
 }
@@ -72,6 +103,7 @@ pub struct E02App {
 impl E02App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         install_cjk_font(&cc.egui_ctx);
+        apply_style(cc);
         Self {
             device: DeviceInfo::default(),
             results: TestItem::ALL.map(TestResult::new).to_vec(),
@@ -80,6 +112,8 @@ impl E02App {
             manual: None,
             media: MediaState::Note("媒体区：拍照显示图片，录像解码后回放".into()),
             log: VecDeque::new(),
+            progress: None,
+            keys_prompt: None,
             event_rx: None,
             manual_tx: None,
         }
@@ -92,6 +126,12 @@ impl E02App {
         }
         self.busy = true;
         self.current = items.first().copied();
+        self.progress = Some(Progress {
+            total: items.len(),
+            done: 0,
+            started: Instant::now(),
+        });
+        self.keys_prompt = None;
         let (tx, rx) = mpsc::channel();
         let (mtx, mrx) = mpsc::channel();
         self.event_rx = Some(rx);
@@ -107,8 +147,9 @@ impl E02App {
     }
 
     fn push_log(&mut self, line: impl Into<String>) {
-        self.log.push_back(line.into());
-        while self.log.len() > 8 {
+        self.log
+            .push_back(format!("{} {}", report::now_hms(), line.into()));
+        while self.log.len() > 200 {
             self.log.pop_front();
         }
     }
@@ -134,6 +175,12 @@ impl E02App {
                 if let Some(d) = dev {
                     self.device.merge(d);
                 }
+                if let Some(p) = &mut self.progress {
+                    p.done += 1;
+                }
+                if r.item == TestItem::Keys {
+                    self.keys_prompt = None; // 结果已定，弹窗收起（兜底）
+                }
                 if let Some(slot) = self.results.iter_mut().find(|s| s.item == r.item) {
                     *slot = r;
                 }
@@ -145,6 +192,20 @@ impl E02App {
                         question,
                         reply,
                     });
+                }
+            }
+            UiEvent::KeysUpdate { detected, awaiting } => {
+                if let Some(reply) = self.manual_tx.clone() {
+                    if awaiting {
+                        self.keys_prompt = Some(KeysPrompt {
+                            detected,
+                            awaiting: true,
+                            reply,
+                        });
+                    } else {
+                        // 收齐自动通过：弹窗即收
+                        self.keys_prompt = None;
+                    }
                 }
             }
             UiEvent::PhotoReady(path) => match load_texture(ctx, &path) {
@@ -180,11 +241,15 @@ impl E02App {
                     };
                 }
             }
+            UiEvent::Log(s) => self.push_log(s),
             UiEvent::Finished { report } => {
                 self.busy = false;
                 self.current = None;
                 self.event_rx = None;
                 self.manual_tx = None;
+                self.progress = None;
+                self.keys_prompt = None;
+                self.push_log("序列结束");
                 match report {
                     Some(p) => self.push_log(format!("报告: {}", p.display())),
                     None => self.push_log("报告写入失败"),
@@ -219,6 +284,27 @@ impl E02App {
             ctx.request_repaint();
         }
     }
+}
+
+/// V2.1：默认放大显示——像素密度取系统值与 1.25 的较大者（产线屏幕观看距离远），
+/// 正文字号 14→16；Ctrl+滚轮缩放仍可用。
+fn apply_style(cc: &eframe::CreationContext<'_>) {
+    // zoom_factor 与 Ctrl+滚轮缩放同一机制：只抬基线，不锁死
+    let native = cc.egui_ctx.native_pixels_per_point().unwrap_or(1.0);
+    let target = 1.25_f32;
+    if native < target {
+        cc.egui_ctx.set_zoom_factor(target / native);
+    }
+    let mut style = (*cc.egui_ctx.style()).clone();
+    style.text_styles = [
+        (egui::TextStyle::Small, egui::FontId::proportional(13.0)),
+        (egui::TextStyle::Body, egui::FontId::proportional(16.0)),
+        (egui::TextStyle::Button, egui::FontId::proportional(16.0)),
+        (egui::TextStyle::Monospace, egui::FontId::monospace(14.0)),
+        (egui::TextStyle::Heading, egui::FontId::proportional(22.0)),
+    ]
+    .into();
+    cc.egui_ctx.set_style(style);
 }
 
 /// 注册中文字体到 egui，并设为 Proportional 家族首位。
@@ -271,10 +357,28 @@ impl eframe::App for E02App {
         self.tick_video(ctx);
 
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
-            ui.add_space(4.0);
-            ui.heading("E02 工厂测试工具");
-            ui.add_space(2.0);
+            ui.horizontal_centered(|ui| {
+                ui.heading("E02 工厂测试工具");
+                if self.busy {
+                    if let Some(p) = &self.progress {
+                        let frac = p.done as f32 / p.total.max(1) as f32;
+                        let elapsed = p.started.elapsed();
+                        let text = format!(
+                            "{}/{} · {} · {:02}:{:02}",
+                            p.done,
+                            p.total,
+                            self.current
+                                .map(|i| i.label().to_string())
+                                .unwrap_or_default(),
+                            elapsed.as_secs() / 60,
+                            elapsed.as_secs() % 60
+                        );
+                        ui.add(egui::ProgressBar::new(frac).text(text).desired_width(360.0));
+                    }
+                }
+            });
         });
+        // 先注册的在最外沿：状态条贴底，日志面板在状态条上方
         egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 if self.busy {
@@ -295,6 +399,10 @@ impl eframe::App for E02App {
                 });
             });
         });
+        egui::TopBottomPanel::bottom("log_panel")
+            .default_height(140.0)
+            .resizable(true)
+            .show(ctx, |ui| ui::log_panel::show(ui, self));
         egui::SidePanel::left("test_panel")
             .resizable(false)
             .default_width(216.0)
@@ -306,5 +414,7 @@ impl eframe::App for E02App {
         egui::CentralPanel::default().show(ctx, |ui| ui::panel_media::show(ui, self));
         // 人工判定模态窗（指示灯 / MIC·喇叭）
         ui::dialog_manual::show(ctx, self);
+        // 按键引导弹窗（V2.1）
+        ui::dialog_keys::show(ctx, self);
     }
 }

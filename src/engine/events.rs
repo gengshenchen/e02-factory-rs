@@ -18,6 +18,9 @@ pub enum UiEvent {
     Result(crate::engine::TestResult, Option<DeviceInfo>),
     /// 请求人工判定（worker 阻塞等待应答）
     Manual { item: TestItem, question: String },
+    /// 按键引导流程状态：已检测到的键码（4=多功能 5=开机 6=音量）。
+    /// `awaiting` 为真时 worker 阻塞等待 [`UiResponse::KeysRetry`]/[`UiResponse::KeysForce`]。
+    KeysUpdate { detected: Vec<u8>, awaiting: bool },
     /// 拍照图片已拉回
     PhotoReady(PathBuf),
     /// 录像已拉回且解码验证通过
@@ -26,12 +29,18 @@ pub enum UiEvent {
         count: usize,
         has_audio: bool,
     },
+    /// 过程日志（底部日志面板实时滚动）
+    Log(String),
     /// 序列结束（附报告路径）
     Finished { report: Option<PathBuf> },
 }
 
 #[derive(Debug)]
 pub enum UiResponse {
-    /// 人工判定结论
+    /// 人工判定结论（指示灯/MIC；强制改判亦复用）
     Manual(bool),
+    /// 按键引导：重测一轮
+    KeysRetry,
+    /// 按键引导：强制改判（true=通过，false=失败）
+    KeysForce(bool),
 }

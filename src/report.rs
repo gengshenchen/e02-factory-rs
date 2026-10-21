@@ -59,6 +59,16 @@ mod tests {
     }
 }
 
+/// 当前 UTC 时:分:秒（日志时间戳用）。
+pub fn now_hms() -> String {
+    let secs = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let rem = secs.rem_euclid(86400);
+    format!("{:02}:{:02}:{:02}Z", rem / 3600, rem % 3600 / 60, rem % 60)
+}
+
 /// 把报告写入目录，文件名 `e02-YYYYMMDD-HHMMSSZ.txt`；返回路径。
 pub fn write_report(dir: &Path, device: &DeviceInfo, results: &[TestResult]) -> Option<PathBuf> {
     std::fs::create_dir_all(dir).ok()?;

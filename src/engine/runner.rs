@@ -104,13 +104,17 @@ pub fn run_auto(item: TestItem) -> RunOutcome {
         },
         TestItem::Keys => match exec(&CameraFactory::Keys.device_cmd()) {
             Ok(out) => {
-                let keys = protocol::parse_keys(&out);
+                let keys = protocol::parse_keys_codes(&out);
                 if keys.is_empty() {
                     r.verdict = Verdict::Fail;
                     r.detail = format!("未检测到按键，输出: {}", one_line(&out));
                 } else {
                     r.verdict = Verdict::Pass;
-                    r.detail = keys.join("、");
+                    r.detail = keys
+                        .iter()
+                        .map(|&c| protocol::key_name(c))
+                        .collect::<Vec<_>>()
+                        .join("、");
                 }
                 None
             }
@@ -162,7 +166,8 @@ fn bool_verdict(ok: bool) -> Verdict {
 }
 
 /// 多行输出压成单行，便于日志/界面展示。
-fn one_line(s: &str) -> String {
+/// 输出压成单行（日志/detail 展示用）。
+pub fn one_line(s: &str) -> String {
     s.lines().map(str::trim).collect::<Vec<_>>().join(" | ")
 }
 
