@@ -9,9 +9,9 @@ pub fn show(ui: &mut egui::Ui, app: &mut E02App) {
     // 深底下的控件配色（幽灵按钮）
     let w = &mut ui.visuals_mut().widgets;
     w.inactive.bg_fill = Color32::TRANSPARENT;
-    w.inactive.fg_stroke = egui::Stroke::new(1.0, theme::DARK_INK);
+    w.inactive.fg_stroke = theme::hairline(theme::DARK_INK);
     w.hovered.bg_fill = Color32::from_white_alpha(12);
-    w.hovered.fg_stroke = egui::Stroke::new(1.0, Color32::WHITE);
+    w.hovered.fg_stroke = theme::hairline(Color32::WHITE);
 
     ui.horizontal(|ui| {
         ui.label(

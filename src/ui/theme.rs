@@ -72,27 +72,27 @@ pub fn apply(ctx: &Context) {
     v.error_fg_color = BAD;
     v.warn_fg_color = Color32::from_rgb(170, 112, 8);
     v.selection.bg_fill = ACCENT_BG;
-    v.selection.stroke = Stroke::new(1.0, ACCENT);
+    v.selection.stroke = hairline(ACCENT);
     v.popup_shadow = egui::epaint::Shadow::NONE;
     v.window_shadow = egui::epaint::Shadow::NONE;
 
     // 控件状态：白底浅描边，悬停微沉，激活品牌蓝
     let w = &mut v.widgets;
     w.noninteractive.bg_fill = SURFACE;
-    w.noninteractive.fg_stroke = Stroke::new(1.0, INK_2);
-    w.noninteractive.bg_stroke = Stroke::new(1.0, LINE);
+    w.noninteractive.fg_stroke = hairline(INK_2);
+    w.noninteractive.bg_stroke = hairline(LINE);
     w.inactive.bg_fill = SURFACE;
-    w.inactive.fg_stroke = Stroke::new(1.0, INK_2);
-    w.inactive.bg_stroke = Stroke::new(1.0, LINE);
+    w.inactive.fg_stroke = hairline(INK_2);
+    w.inactive.bg_stroke = hairline(LINE);
     w.hovered.bg_fill = Color32::from_rgb(244, 246, 250);
-    w.hovered.fg_stroke = Stroke::new(1.0, INK);
-    w.hovered.bg_stroke = Stroke::new(1.0, Color32::from_rgb(203, 211, 224));
+    w.hovered.fg_stroke = hairline(INK);
+    w.hovered.bg_stroke = hairline(Color32::from_rgb(203, 211, 224));
     w.active.bg_fill = ACCENT;
-    w.active.fg_stroke = Stroke::new(1.0, Color32::WHITE);
-    w.active.bg_stroke = Stroke::new(1.0, ACCENT);
+    w.active.fg_stroke = hairline(Color32::WHITE);
+    w.active.bg_stroke = hairline(ACCENT);
     w.open.bg_fill = SURFACE;
-    w.open.fg_stroke = Stroke::new(1.0, INK);
-    w.open.bg_stroke = Stroke::new(1.0, Color32::from_rgb(203, 211, 224));
+    w.open.fg_stroke = hairline(INK);
+    w.open.bg_stroke = hairline(Color32::from_rgb(203, 211, 224));
 
     // 统一圆角：控件 7，窗口 12
     let r = Rounding::same(7.0);
@@ -105,6 +105,12 @@ pub fn apply(ctx: &Context) {
     style.visuals.menu_rounding = Rounding::same(10.0);
 
     ctx.set_style(style);
+}
+
+/// 1px 发丝描边。宽度字面量显式 f32：1.93+ 编译器对泛型上下文里的
+/// 浮点回退字面量告警（float-literal-f32-fallback），收口到一处。
+pub fn hairline(color: Color32) -> Stroke {
+    Stroke::new(1.0_f32, color)
 }
 
 /// 状态圆点（避免字形符号：直接画圆）。
