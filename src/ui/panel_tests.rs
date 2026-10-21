@@ -29,17 +29,14 @@ pub fn show(ui: &mut egui::Ui, app: &mut E02App) {
 
     let active = app.config.active_items();
     for i in 0..app.results.len() {
-        let (item, verdict, detail) = {
+        let (item, verdict) = {
             let r = &app.results[i];
-            (r.item, r.verdict, r.detail.clone())
+            (r.item, r.verdict)
         };
         let in_profile = active.contains(&item);
         ui.horizontal(|ui| {
             if ui
-                .add_enabled(
-                    !app.busy && in_profile,
-                    egui::Button::new(format!("▶ {}", item.label())),
-                )
+                .add_enabled(!app.busy && in_profile, egui::Button::new(item.label()))
                 .clicked()
             {
                 app.start_run(vec![item]);
@@ -52,8 +49,5 @@ pub fn show(ui: &mut egui::Ui, app: &mut E02App) {
                 }
             });
         });
-        if !detail.is_empty() && in_profile {
-            ui.small(&detail);
-        }
     }
 }

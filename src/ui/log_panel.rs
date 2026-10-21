@@ -1,10 +1,10 @@
-//! 底部过程日志面板：worker 逐步回传，等宽字体自动滚到最新（V2.1）。
+//! 底部日志面板：worker 逐步回传，等宽字体自动滚到最新（V2.1）。
 
 use crate::app::E02App;
 
 pub fn show(ui: &mut egui::Ui, app: &mut E02App) {
     ui.horizontal(|ui| {
-        ui.strong("过程日志");
+        ui.strong("日志");
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui.small_button("清空").clicked() {
                 app.log.clear();

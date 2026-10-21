@@ -101,6 +101,10 @@ pub struct E02App {
     pub config: Config,
     /// 设置窗口开关
     pub settings_open: bool,
+    /// 最近一次报告路径（Finished 时更新，查看报告窗口用）
+    pub last_report: Option<PathBuf>,
+    /// 报告查看窗口开关
+    pub report_open: bool,
     event_rx: Option<Receiver<UiEvent>>,
     manual_tx: Option<Sender<UiResponse>>,
 }
@@ -108,7 +112,6 @@ pub struct E02App {
 impl E02App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         install_cjk_font(&cc.egui_ctx);
-        apply_style(cc);
         // 配置：exe 同目录 config.toml；缺失用内置默认，坏文件降级并提示
         let (cfg, cfg_err) = match Config::load(&config::default_path()) {
             Ok(c) => (c, None),
@@ -129,6 +132,8 @@ impl E02App {
             keys_prompt: None,
             config: cfg,
             settings_open: false,
+            last_report: None,
+            report_open: false,
             event_rx: None,
             manual_tx: None,
         };
@@ -284,6 +289,7 @@ impl E02App {
                 self.progress = None;
                 self.keys_prompt = None;
                 self.push_log("序列结束");
+                self.last_report = report.clone();
                 match report {
                     Some(p) => self.push_log(format!("报告: {}", p.display())),
                     None => self.push_log("报告写入失败"),
@@ -318,27 +324,6 @@ impl E02App {
             ctx.request_repaint();
         }
     }
-}
-
-/// V2.1：默认放大显示——像素密度取系统值与 1.25 的较大者（产线屏幕观看距离远），
-/// 正文字号 14→16；Ctrl+滚轮缩放仍可用。
-fn apply_style(cc: &eframe::CreationContext<'_>) {
-    // zoom_factor 与 Ctrl+滚轮缩放同一机制：只抬基线，不锁死
-    let native = cc.egui_ctx.native_pixels_per_point().unwrap_or(1.0);
-    let target = 1.25_f32;
-    if native < target {
-        cc.egui_ctx.set_zoom_factor(target / native);
-    }
-    let mut style = (*cc.egui_ctx.style()).clone();
-    style.text_styles = [
-        (egui::TextStyle::Small, egui::FontId::proportional(13.0)),
-        (egui::TextStyle::Body, egui::FontId::proportional(16.0)),
-        (egui::TextStyle::Button, egui::FontId::proportional(16.0)),
-        (egui::TextStyle::Monospace, egui::FontId::monospace(14.0)),
-        (egui::TextStyle::Heading, egui::FontId::proportional(22.0)),
-    ]
-    .into();
-    cc.egui_ctx.set_style(style);
 }
 
 /// 注册中文字体到 egui，并设为 Proportional 家族首位。
@@ -399,7 +384,7 @@ impl eframe::App for E02App {
                         let frac = p.done as f32 / p.total.max(1) as f32;
                         let elapsed = p.started.elapsed();
                         let text = format!(
-                            "{}/{} · {} · {:02}:{:02}",
+                            "{}/{}（{}）{:02}:{:02}",
                             p.done,
                             p.total,
                             self.current
@@ -412,8 +397,15 @@ impl eframe::App for E02App {
                     }
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("⚙ 设置").clicked() {
+                    if ui.button("设置").clicked() {
                         self.settings_open = true;
+                    }
+                    if ui
+                        .add_enabled(self.last_report.is_some(), egui::Button::new("查看报告"))
+                        .on_disabled_hover_text("测试完成并生成报告后可用")
+                        .clicked()
+                    {
+                        self.report_open = true;
                     }
                 });
             });
@@ -458,5 +450,7 @@ impl eframe::App for E02App {
         ui::dialog_keys::show(ctx, self);
         // 设置窗口（V2.2）
         ui::panel_settings::show(ctx, self);
+        // 报告查看窗口（V2.3）
+        ui::dialog_report::show(ctx, self);
     }
 }

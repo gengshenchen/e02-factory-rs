@@ -25,7 +25,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut E02App) {
                     "录像回放 {}/{}{}",
                     idx + 1,
                     frames.len(),
-                    if *has_audio { " · 含音频流" } else { "" }
+                    if *has_audio { "（含音频流）" } else { "" }
                 ));
             });
         }

@@ -28,7 +28,7 @@ pub fn show(ctx: &egui::Context, app: &mut E02App) {
                         } else {
                             egui::Color32::GRAY
                         },
-                        if ok { "✔ 已检测" } else { "○ 待按下" },
+                        if ok { "已按下" } else { "待按下" },
                     );
                     ui.label(key_name(code));
                 });
@@ -54,7 +54,7 @@ pub fn show(ctx: &egui::Context, app: &mut E02App) {
                     }
                 });
             } else {
-                ui.label("检测中…");
+                ui.label("检测中...");
             }
         });
 }

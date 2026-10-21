@@ -54,13 +54,13 @@ pub fn run_sequence(
     )));
     for &item in items {
         let _ = tx.send(UiEvent::Current(item));
-        let _ = tx.send(UiEvent::Log(format!("── {} 开始", item.label())));
+        let _ = tx.send(UiEvent::Log(format!("【{}】开始", item.label())));
         let RunOutcome {
             result,
             device: dev,
         } = run_item(item, tx, manual, media_dir, cfg);
         let _ = tx.send(UiEvent::Log(format!(
-            "── {}: {} {}",
+            "【{}】{} {}",
             item.label(),
             result.verdict.label(),
             clip(&result.detail, 100)
@@ -93,7 +93,7 @@ fn clip(s: &str, n: usize) -> String {
         s.to_string()
     } else {
         let cut: String = s.chars().take(n).collect();
-        format!("{cut}…")
+        format!("{cut}...")
     }
 }
 
@@ -129,7 +129,7 @@ fn photo_flow(tx: &Sender<UiEvent>, media_dir: &Path) -> RunOutcome {
         .and_then(|_| {
             thread::sleep(Duration::from_millis(1000)); // 原程序 Sleep(1000)
             let _ = tx.send(UiEvent::Log(format!(
-                "adb pull {} → {}",
+                "adb pull {} -> {}",
                 protocol::REMOTE_PHOTO,
                 local.display()
             )));
@@ -171,7 +171,7 @@ fn video_flow(tx: &Sender<UiEvent>, media_dir: &Path) -> RunOutcome {
         .and_then(|_| {
             thread::sleep(Duration::from_millis(900)); // 原程序 Sleep(900)
             let _ = tx.send(UiEvent::Log(format!(
-                "adb pull {} → {}",
+                "adb pull {} -> {}",
                 protocol::REMOTE_VIDEO,
                 local.display()
             )));
@@ -234,7 +234,7 @@ fn manual_flow(
         .expect("人工判定项必有设备命令")
         .device_cmd();
     let n = repeat.unwrap_or(1);
-    let _ = tx.send(UiEvent::Log(format!("执行 adb shell {cmd}×{n}")));
+    let _ = tx.send(UiEvent::Log(format!("执行 adb shell {cmd} 共 {n} 次")));
     for _ in 0..n {
         let _ = adb::shell(&cmd);
     }
@@ -271,7 +271,7 @@ fn keys_flow(tx: &Sender<UiEvent>, manual: &Receiver<UiResponse>, keys: &KeysCfg
     let mut r = TestResult::new(TestItem::Keys);
     let cmd = CameraFactory::Keys.device_cmd();
     loop {
-        let _ = tx.send(UiEvent::Log(format!("执行 adb shell {cmd}，请依次按键…")));
+        let _ = tx.send(UiEvent::Log(format!("执行 adb shell {cmd}，请依次按键...")));
         match adb::shell(&cmd) {
             Ok(out) => {
                 let got = if keys.strict {
@@ -362,7 +362,7 @@ fn wifi_flow(tx: &Sender<UiEvent>, wifi: &WifiCfg) -> RunOutcome {
 
     let mut r = base.result;
     let t = &wifi.throughput;
-    let _ = tx.send(UiEvent::Log("WiFi 速率：探测默认网关…".to_string()));
+    let _ = tx.send(UiEvent::Log("WiFi 速率：探测默认网关...".to_string()));
     let gw = adb::shell("ip route")
         .ok()
         .and_then(|out| protocol::parse_default_gateway(&out));
@@ -375,14 +375,17 @@ fn wifi_flow(tx: &Sender<UiEvent>, wifi: &WifiCfg) -> RunOutcome {
         };
     };
 
-    let _ = tx.send(UiEvent::Log(format!("ping 网关 {gw} ×{}", t.ping_count)));
+    let _ = tx.send(UiEvent::Log(format!(
+        "ping 网关 {gw} 共 {} 包",
+        t.ping_count
+    )));
     match adb::shell(&format!("ping -c {} -W 2 {gw}", t.ping_count)) {
         Ok(out) => match protocol::parse_ping_stats(&out) {
             Some((loss, avg)) => {
                 let ok = loss <= t.loss_max_pct && avg <= t.rtt_max_ms;
                 r.verdict = if ok { Verdict::Pass } else { Verdict::Fail };
                 r.detail = format!(
-                    "丢包 {loss}% · avg {avg}ms（阈值 {}% / {}ms）",
+                    "丢包 {loss}%，avg {avg}ms（阈值 {}% / {}ms）",
                     t.loss_max_pct, t.rtt_max_ms
                 );
             }

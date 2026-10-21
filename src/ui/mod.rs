@@ -3,6 +3,7 @@
 
 pub mod dialog_keys;
 pub mod dialog_manual;
+pub mod dialog_report;
 pub mod log_panel;
 pub mod panel_device;
 pub mod panel_media;

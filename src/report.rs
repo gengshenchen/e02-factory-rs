@@ -197,7 +197,7 @@ mod tests {
     fn detail_lines_carry_reason() {
         let mut r = TestResult::new(TestItem::Wifi);
         r.verdict = Verdict::Fail;
-        r.detail = "丢包 30% · avg 500ms（阈值 0% / 100ms）".into();
+        r.detail = "丢包 30%，avg 500ms（阈值 0% / 100ms）".into();
         let text = render_text(&meta(), &DeviceInfo::default(), &[r]);
         assert!(text.contains("WiFi 测试:FAIL 丢包 30%"));
     }
