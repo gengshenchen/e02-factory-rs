@@ -28,7 +28,8 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 800.0])
-            .with_min_inner_size([960.0, 600.0]),
+            .with_min_inner_size([960.0, 600.0])
+            .with_icon(load_icon()),
         ..Default::default()
     };
     eframe::run_native(
@@ -36,4 +37,17 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| Ok(Box::new(app::E02App::new(cc)))),
     )
+}
+
+/// 应用图标（assets/icon.png 内嵌，编译期保证存在）。
+fn load_icon() -> egui::IconData {
+    let img =
+        image::load_from_memory(include_bytes!("../assets/icon.png")).expect("内嵌图标解码失败");
+    let rgba = img.to_rgba8();
+    let (w, h) = (rgba.width(), rgba.height());
+    egui::IconData {
+        rgba: rgba.into_raw(),
+        width: w,
+        height: h,
+    }
 }

@@ -53,6 +53,18 @@ e02-factory-rs all --report r.txt  # 全部自动判定项 + 文本报告
 git tag v0.1.0 && git push origin v0.1.0
 ```
 
+## 产线部署
+
+安装包来自 GitHub Releases（tag 构建）。部署到产线电脑后需预装：
+
+| 依赖 | 说明 |
+|---|---|
+| adb | Android platform-tools，置于 PATH；或设环境变量 `ADB` 指向绝对路径 |
+| ffmpeg / ffprobe | 仅录像测试需要；置于 PATH 或设 `FFMPEG` / `FFPROBE` |
+| USB 驱动 | Windows 需安装设备 ADB 驱动（通常随 platform-tools 或厂商驱动） |
+
+首次运行在工作目录生成 `media/`（拉回的照片/视频）与 `reports/`（测试报告），换台设备重新打开即可，报告按 UTC 时间戳归档。
+
 ## 进度
 
 - [x] M0 骨架：窗口 + 中文字体 + 布局
@@ -63,7 +75,8 @@ git tag v0.1.0 && git push origin v0.1.0
 - [x] M5 人工判定 + 一键全测 + 报告
 - [ ] M6 打包完善与产线部署
   - [x] CI / Release 流水线（M0 已建：三平台测试 + tag 自动出 zip / MSI / deb / tar.gz）
-  - [ ] MSI 品牌化（图标 / 开始菜单快捷方式；需在 Windows 上用 cargo-wix 定制 main.wxs）
+  - [x] 应用图标（assets/icon.png 窗口图标；icon.ico 留作 MSI 品牌化）
+  - [ ] MSI 开始菜单快捷方式（需在 Windows 上用 cargo-wix 定制 main.wxs）
   - [ ] ffmpeg 分发方式定稿：随包携带（+~100M）或产线预装置于 PATH（当前按预装）
   - [ ] 安装包元数据定稿（license / 维护者信息）
   - [ ] 真机回归（adb + E02 设备）与产线试运行
