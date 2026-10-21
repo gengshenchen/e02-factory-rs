@@ -76,3 +76,5 @@ jobs:
         with:
           files: dist/*
           generate_release_notes: true
+          # v0.1.0-alpha/beta/rc 后缀自动标记预发布，正式版不受影响
+          prerelease: ${{ contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc') }}
