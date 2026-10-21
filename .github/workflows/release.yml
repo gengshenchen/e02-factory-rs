@@ -72,7 +72,6 @@ jobs:
         if: runner.os == 'Windows'
         run: |
           cargo install cargo-wix --locked
-          cargo wix init
           cargo wix
           Get-ChildItem target/wix/*.msi | Move-Item -Destination dist/
 

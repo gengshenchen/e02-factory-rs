@@ -182,12 +182,12 @@ fn test_cmd(
     if let Some(p) = report_path {
         let meta = report::ReportMeta {
             station: cfg.station.clone(),
-            started_utc: report::time_str(started_wall),
+            started: report::time_str(started_wall),
             elapsed_secs: started.elapsed().as_secs(),
         };
         match std::fs::write(
             &p,
-            report::render_text(&meta, &batch.device, &batch.results),
+            report::render_text(&meta, &batch.device, &batch.results, true),
         ) {
             Ok(()) => println!("报告已写入 {p}"),
             Err(e) => eprintln!("写报告失败: {e}"),

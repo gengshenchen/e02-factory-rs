@@ -32,6 +32,7 @@ pub const BATCH_ORDER: [TestItem; 12] = [
 ];
 
 /// 同步执行测试序列（worker 线程与测试共用）。
+/// 自动项先行、人工项殿后（V3 产线反馈：操作员可在自动项期间离手）。
 /// 返回报告文件路径；写入失败为 None。
 pub fn run_sequence(
     items: &[TestItem],
@@ -41,6 +42,7 @@ pub fn run_sequence(
     reports_dir: &Path,
     cfg: &Config,
 ) -> Option<PathBuf> {
+    exec::clear_abort(); // 新序列不残留上一轮的停止请求
     let _ = std::fs::create_dir_all(media_dir);
     let _ = std::fs::create_dir_all(reports_dir);
     let _ = tx.send(UiEvent::Started);
@@ -49,22 +51,42 @@ pub fn run_sequence(
     let prev_timeout = exec::default_timeout();
     exec::set_default_timeout(timeout_opt(cfg.timeouts.item_secs));
 
+    // 自动项先行、人工项殿后（稳定排序保持组内原顺序）
+    let mut ordered: Vec<TestItem> = items.to_vec();
+    ordered.sort_by_key(|i| i.is_manual());
+    let first_manual = ordered.iter().position(|i| i.is_manual());
+
     let mut device = DeviceInfo::default();
     let mut results: Vec<TestResult> = Vec::new();
     let stem = report::time_str(started_wall);
     let _ = tx.send(UiEvent::Log(format!(
-        "序列开始，工位 {}，共 {} 项，单项超时 {}",
+        "序列开始，工位 {}，共 {} 项（自动 {} + 人工 {}），单项超时 {}",
         cfg.station,
-        items.len(),
+        ordered.len(),
+        ordered.iter().filter(|i| !i.is_manual()).count(),
+        ordered.iter().filter(|i| i.is_manual()).count(),
         timeout_desc(cfg.timeouts.item_secs)
     )));
-    for &item in items {
+    let mut written: Option<PathBuf> = None;
+    for (idx, &item) in ordered.iter().enumerate() {
+        if Some(idx) == first_manual {
+            let _ = tx.send(UiEvent::Log(
+                "自动项完成，进入人工判定项（请到工位操作）".into(),
+            ));
+        }
         let _ = tx.send(UiEvent::Current(item));
         let _ = tx.send(UiEvent::Log(format!("【{}】开始", item.label())));
+        let item_started = Instant::now();
         let RunOutcome {
-            result,
+            mut result,
             device: dev,
         } = run_item(item, tx, manual, media_dir, cfg);
+        result.secs = item_started.elapsed().as_secs();
+        // 停止请求落在当前项：命令被强杀记为 FAIL 的改记跳过，不计失败
+        if exec::abort_requested() && result.verdict == Verdict::Fail {
+            result.verdict = Verdict::Skipped;
+            result.detail = "手动结束测试".into();
+        }
         let _ = tx.send(UiEvent::Log(format!(
             "【{}】{} {}",
             item.label(),
@@ -76,25 +98,65 @@ pub fn run_sequence(
         }
         let _ = tx.send(UiEvent::Result(result.clone(), dev));
         results.push(result);
-        // 报告边测边写（V2.3）：文件名固定、逐项覆盖，中途卡死/退出也留有报告
-        let _ = report::write_report_stem(
+        // 报告边测边写（V2.3）：文件名固定、逐项覆盖，中途卡死/退出也留有报告；
+        // SN 中途解析到后文件名变化，删除旧文件（V3）
+        let _ = write_update(
             reports_dir,
-            sn_dir(cfg, &device).as_deref(),
             &meta(cfg, started_wall, started),
             &device,
             &results,
             &stem,
+            false,
+            &mut written,
         );
+        if exec::abort_requested() {
+            // 剩余项全部记跳过，报告仍完整
+            let rest = &ordered[idx + 1..];
+            for &skip in rest {
+                let mut r = TestResult::new(skip);
+                r.verdict = Verdict::Skipped;
+                r.detail = "手动结束测试".into();
+                results.push(r.clone());
+                let _ = tx.send(UiEvent::Result(r, None));
+            }
+            let _ = tx.send(UiEvent::Log(format!(
+                "手动结束测试，剩余 {} 项跳过",
+                rest.len()
+            )));
+            break;
+        }
     }
     exec::set_default_timeout(prev_timeout);
-    report::write_report_stem(
+    write_update(
         reports_dir,
-        sn_dir(cfg, &device).as_deref(),
         &meta(cfg, started_wall, started),
         &device,
         &results,
         &stem,
+        true,
+        &mut written,
     )
+}
+
+/// 写报告并在文件名变化（SN 解析到）时删除旧文件，返回最终路径。
+#[allow(clippy::too_many_arguments)]
+fn write_update(
+    reports_dir: &Path,
+    meta: &report::ReportMeta,
+    device: &DeviceInfo,
+    results: &[TestResult],
+    stem: &str,
+    finished: bool,
+    written: &mut Option<PathBuf>,
+) -> Option<PathBuf> {
+    let path = report::write_report(reports_dir, meta, device, results, stem, finished);
+    if let (Some(new), Some(old)) = (&path, &*written) {
+        if new != old {
+            let _ = std::fs::remove_file(old);
+        }
+    }
+    *written = path.clone();
+    path
 }
 
 /// 秒数 → 超时选项（0 = 不限制）。
@@ -113,20 +175,9 @@ fn timeout_desc(secs: u64) -> String {
 fn meta(cfg: &Config, started_wall: SystemTime, started: Instant) -> report::ReportMeta {
     report::ReportMeta {
         station: cfg.station.clone(),
-        started_utc: report::time_str(started_wall),
+        started: report::time_str(started_wall),
         elapsed_secs: started.elapsed().as_secs(),
     }
-}
-
-/// SN 归档子目录（V2.3）：开启后 reports/<SN>/，空 SN 归入 unknown/
-fn sn_dir(cfg: &Config, device: &DeviceInfo) -> Option<String> {
-    cfg.report_by_sn.then(|| {
-        if device.sn.is_empty() {
-            "unknown".to_string()
-        } else {
-            device.sn.clone()
-        }
-    })
 }
 
 /// 日志/detail 截断（尾部加省略号）。
@@ -307,14 +358,18 @@ fn manual_flow(
             r.verdict = Verdict::Skipped;
             r.detail = "应答类型不匹配".into();
         }
-        Err(RecvTimeoutError::Timeout) => {
+        Err(WaitEnd::Timeout) => {
             // 保守判失败：宁可复测，不静默放过
             r.verdict = Verdict::ManualNo;
             r.detail = format!("超时未人工判定（{manual_secs}s），自动判失败");
         }
-        Err(RecvTimeoutError::Disconnected) => {
+        Err(WaitEnd::Disconnected) => {
             r.verdict = Verdict::Skipped;
             r.detail = "界面已退出，判定中断".into();
+        }
+        Err(WaitEnd::Aborted) => {
+            r.verdict = Verdict::Skipped;
+            r.detail = "手动结束测试".into();
         }
     }
     RunOutcome {
@@ -323,11 +378,38 @@ fn manual_flow(
     }
 }
 
-/// 等待 UI 应答；`secs` 0 = 无限等。超时返回 Err(Timeout)。
-fn recv_manual(manual: &Receiver<UiResponse>, secs: u64) -> Result<UiResponse, RecvTimeoutError> {
-    match timeout_opt(secs) {
-        Some(d) => manual.recv_timeout(d),
-        None => manual.recv().map_err(|e| e.into()),
+/// 等待结果的终止原因（人工应答等待用）。
+enum WaitEnd {
+    Timeout,
+    Disconnected,
+    /// 操作员按了停止测试
+    Aborted,
+}
+
+/// 等待 UI 应答；`secs` 0 = 无限等。等待期间以 250ms 切片轮询停止请求，
+/// 保证"停止测试"能在人工等待阶段立即生效。
+fn recv_manual(manual: &Receiver<UiResponse>, secs: u64) -> Result<UiResponse, WaitEnd> {
+    let deadline = timeout_opt(secs).map(|d| Instant::now() + d);
+    loop {
+        let slice = deadline
+            .map(|d| d.saturating_duration_since(Instant::now()))
+            .unwrap_or(Duration::from_millis(250))
+            .min(Duration::from_millis(250));
+        if slice.is_zero() {
+            return Err(WaitEnd::Timeout);
+        }
+        match manual.recv_timeout(slice) {
+            Ok(r) => return Ok(r),
+            Err(RecvTimeoutError::Timeout) => {
+                if exec::abort_requested() {
+                    return Err(WaitEnd::Aborted);
+                }
+                if deadline.is_some_and(|d| Instant::now() >= d) {
+                    return Err(WaitEnd::Timeout);
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => return Err(WaitEnd::Disconnected),
+        }
     }
 }
 
@@ -405,14 +487,19 @@ fn keys_flow(
                         });
                         continue;
                     }
-                    Err(RecvTimeoutError::Timeout) => {
+                    Err(WaitEnd::Timeout) => {
                         r.verdict = Verdict::ManualNo;
                         r.detail = format!("超时未应答（缺 {}）", missing.join("、"));
                         break;
                     }
-                    Err(RecvTimeoutError::Disconnected) => {
+                    Err(WaitEnd::Disconnected) => {
                         r.verdict = Verdict::Skipped;
                         r.detail = "界面已退出，按键判定中断".into();
+                        break;
+                    }
+                    Err(WaitEnd::Aborted) => {
+                        r.verdict = Verdict::Skipped;
+                        r.detail = "手动结束测试".into();
                         break;
                     }
                 }
@@ -444,14 +531,19 @@ fn keys_flow(
                             r.detail = "监听超时，未检测到按键".into();
                             break;
                         }
-                        Err(RecvTimeoutError::Timeout) => {
+                        Err(WaitEnd::Timeout) => {
                             r.verdict = Verdict::ManualNo;
                             r.detail = format!("监听超时且无人应答（{manual_secs}s）");
                             break;
                         }
-                        Err(RecvTimeoutError::Disconnected) => {
+                        Err(WaitEnd::Disconnected) => {
                             r.verdict = Verdict::Skipped;
                             r.detail = "界面已退出，按键判定中断".into();
+                            break;
+                        }
+                        Err(WaitEnd::Aborted) => {
+                            r.verdict = Verdict::Skipped;
+                            r.detail = "手动结束测试".into();
                             break;
                         }
                     }
@@ -580,6 +672,11 @@ mod tests {
     /// 单个测试函数串行执行，避免并发测试竞争 ADB/PULL_SRC 环境变量。
     #[test]
     fn worker_sequence_flows() {
+        // 与 exec 测试互斥：停止标志为全局静态，并行会互相干扰
+        let _lock = crate::exec::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        exec::clear_abort();
         let base = std::env::temp_dir().join(format!("e02-worker-{}", std::process::id()));
         let media = base.join("media");
         let reports = base.join("reports");
@@ -627,6 +724,7 @@ mod tests {
 
         let (tx, rx) = mpsc::channel();
         let (mtx, mrx) = mpsc::channel();
+        // 传入顺序人工项（Led）在前：执行时应自动项先行、人工殿后（V3）
         let items = vec![
             TestItem::DeviceInfo,
             TestItem::Led,
@@ -635,15 +733,13 @@ mod tests {
         ];
         let media_c = media.clone();
         let reports_c = reports.clone();
-        let cfg = Config {
-            report_by_sn: true, // V2.3：主流程端到端顺带验证 SN 归档
-            ..Config::default()
-        };
+        let cfg = Config::default();
         let handle =
             thread::spawn(move || run_sequence(&items, &tx, &mrx, &media_c, &reports_c, &cfg));
 
         let (mut manual_asked, mut photo_ready, mut video_ready) = (0, 0, 0);
         let mut verdicts: Vec<(TestItem, Verdict)> = Vec::new();
+        let mut order: Vec<TestItem> = Vec::new(); // 执行顺序（V3：自动先行）
         while let Ok(ev) = rx.recv_timeout(Duration::from_secs(120)) {
             match ev {
                 UiEvent::Manual { .. } => {
@@ -658,7 +754,10 @@ mod tests {
                     assert!(count >= 3, "2 秒 2fps 应至少 3 帧");
                     assert!(has_audio);
                 }
-                UiEvent::Result(r, _) => verdicts.push((r.item, r.verdict)),
+                UiEvent::Result(r, _) => {
+                    order.push(r.item);
+                    verdicts.push((r.item, r.verdict));
+                }
                 _ => {}
             }
         }
@@ -667,6 +766,16 @@ mod tests {
         assert_eq!(manual_asked, 1);
         assert_eq!(photo_ready, 1);
         assert_eq!(video_ready, 1);
+        // 自动项先行、人工项殿后
+        assert_eq!(
+            order,
+            vec![
+                TestItem::DeviceInfo,
+                TestItem::Photo,
+                TestItem::Video,
+                TestItem::Led
+            ]
+        );
         let get = |item: TestItem| {
             verdicts
                 .iter()
@@ -680,13 +789,23 @@ mod tests {
         assert_eq!(get(TestItem::Video), Verdict::Pass);
 
         let text = std::fs::read_to_string(&report).unwrap();
+        assert!(text.contains("结果: PASS"));
         assert!(text.contains("sn-address:002"));
         assert!(text.contains("指示灯测试:PASS"));
         assert!(text.contains("工位: complete"));
         assert!(text.contains("汇总: 4 项，PASS 4，FAIL 0，跳过 0"));
-        // SN 归档 + JSON 成对
-        assert!(report.starts_with(reports.join("002")));
-        assert!(report.with_extension("json").exists());
+        // SN 进文件名（V3）；SN 未知期间的旧文件应已删除
+        assert!(report
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .ends_with("-002.txt"));
+        let txts = std::fs::read_dir(&reports)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains("-002"))
+            .count();
+        assert_eq!(txts, 1, "同一序列 SN 变化只留最终文件");
 
         // —— V2.1 按键引导：三场景（顺序执行，防 ADB 环境变量竞争）——
         let kscript = base.join("adb-keys");
@@ -847,6 +966,56 @@ mod tests {
             || None,
         );
         assert_eq!((vs[0].1, n), (Verdict::ManualNo, 0));
+
+        // —— V3 手动停止：慢速命令执行中途请求停止 ——
+        exec::clear_abort();
+        let sscript = base.join("adb-stop");
+        std::fs::write(
+            &sscript,
+            "#!/bin/sh\ncase \"$*\" in\n*\"camera-factory 5\"*) sleep 30; printf 'wifi ok\\n';;\n\
+             *\"camera-factory 8\"*) sleep 30;;\n\
+             *) printf 'ok\\n';;\nesac\n",
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&sscript, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::env::set_var("ADB", &sscript);
+        let stop_items = vec![TestItem::Wifi, TestItem::SdCard];
+        let (tx, rx) = mpsc::channel();
+        let (_mtx, mrx) = mpsc::channel();
+        let (m_c, r_c) = (media.clone(), reports.clone());
+        let t0 = Instant::now();
+        let handle = thread::spawn(move || {
+            run_sequence(&stop_items, &tx, &mrx, &m_c, &r_c, &Config::default())
+        });
+        let mut stop_verdicts = Vec::new();
+        while let Ok(ev) = rx.recv_timeout(Duration::from_secs(30)) {
+            if matches!(ev, UiEvent::Current(_)) {
+                exec::request_abort(); // 收到第一项 Current 即模拟操作员按停止
+            }
+            if let UiEvent::Result(r, _) = ev {
+                stop_verdicts.push((r.item, r.verdict));
+            }
+        }
+        let stop_report = handle.join().unwrap().expect("停止后仍应产出报告");
+        assert!(
+            t0.elapsed() < Duration::from_secs(15),
+            "停止应立即生效，不应等满 30s 命令"
+        );
+        // 当前项命令被强杀（FAIL → 跳过），剩余项记跳过
+        assert_eq!(
+            stop_verdicts,
+            vec![
+                (TestItem::Wifi, Verdict::Skipped),
+                (TestItem::SdCard, Verdict::Skipped)
+            ]
+        );
+        let text = std::fs::read_to_string(&stop_report).unwrap();
+        assert!(text.contains("手动结束测试"));
+        assert!(text.contains("结果: 跳过"));
+        exec::clear_abort();
 
         std::env::remove_var("ADB");
         std::env::remove_var("PULL_SRC");

@@ -105,10 +105,20 @@ pub struct E02App {
     pub config: Config,
     /// 设置窗口开关
     pub settings_open: bool,
-    /// 最近一次报告路径（Finished 时更新，查看报告窗口用）
+    /// 最近一次报告路径（Finished 时更新，报告中心默认选中用）
     pub last_report: Option<PathBuf>,
-    /// 报告查看窗口开关
+    /// 报告中心窗口开关
     pub report_open: bool,
+    /// 报告目录（数据目录下 reports/，V3）
+    pub reports_dir: PathBuf,
+    /// 今日统计（V3 报告中心）
+    pub today: Option<report::DayStats>,
+    /// 报告中心：历史列表（新→旧）
+    pub report_list: Vec<PathBuf>,
+    /// 报告中心：当前选中
+    pub report_sel: Option<PathBuf>,
+    /// 报告中心：选中文件内容缓存（路径, 文本）
+    report_text: Option<(PathBuf, String)>,
     event_rx: Option<Receiver<UiEvent>>,
     manual_tx: Option<Sender<UiResponse>>,
 }
@@ -138,6 +148,11 @@ impl E02App {
             settings_open: false,
             last_report: None,
             report_open: false,
+            reports_dir: crate::paths::data_dir().join("reports"),
+            today: None,
+            report_list: Vec::new(),
+            report_sel: None,
+            report_text: None,
             event_rx: None,
             manual_tx: None,
         };
@@ -145,10 +160,12 @@ impl E02App {
             app.push_log(msg);
         }
         app.push_log(format!(
-            "工位: {}（启用 {} 项）",
+            "工位: {}（启用 {} 项），数据目录 {}",
             app.config.station,
-            app.config.active_items().len()
+            app.config.active_items().len(),
+            crate::paths::data_dir().display()
         ));
+        app.refresh_stats();
         app
     }
 
@@ -178,15 +195,55 @@ impl E02App {
         let (mtx, mrx) = mpsc::channel();
         self.event_rx = Some(rx);
         self.manual_tx = Some(mtx);
-        let media = PathBuf::from("media");
-        let reports = PathBuf::from("reports");
+        let media = crate::paths::data_dir().join("media");
+        let reports = self.reports_dir.clone();
         let n = items.len();
         let cfg = self.config.clone();
         thread::spawn(move || {
             let report = worker::run_sequence(&items, &tx, &mrx, &media, &reports, &cfg);
             let _ = tx.send(UiEvent::Finished { report });
         });
-        self.push_log(format!("开始测试，共 {n} 项"));
+        self.push_log(format!("开始测试，共 {n} 项（自动项先行，人工项弹窗判定）"));
+    }
+
+    /// 操作员请求停止：杀掉当前命令、剩余项记跳过（worker 侧配合）。
+    pub fn request_stop(&mut self) {
+        crate::exec::request_abort();
+        self.push_log("已请求停止，等待当前命令退出...");
+    }
+
+    /// 重扫今日统计（启动与每轮结束后调用）。
+    pub fn refresh_stats(&mut self) {
+        self.today = Some(report::scan_stats(&self.reports_dir, &report::today_str()));
+    }
+
+    /// 重扫报告历史列表（报告中心打开/刷新/一轮结束调用）。
+    pub fn refresh_reports(&mut self) {
+        self.report_list = report::list_reports(&self.reports_dir, 300);
+        self.report_sel = if self
+            .report_sel
+            .as_ref()
+            .is_some_and(|p| self.report_list.contains(p))
+        {
+            self.report_sel.clone()
+        } else {
+            self.last_report
+                .clone()
+                .filter(|p| self.report_list.contains(p))
+                .or_else(|| self.report_list.first().cloned())
+        };
+        self.report_text = None; // 选中可能变化，缓存失效
+    }
+
+    /// 读取当前选中报告内容（带缓存，报告中心用）。
+    pub fn report_content(&mut self) -> Option<&str> {
+        let want = self.report_sel.clone()?;
+        if self.report_text.as_ref().is_some_and(|(p, _)| *p == want) {
+            return self.report_text.as_ref().map(|(_, t)| t.as_str());
+        }
+        let text = std::fs::read_to_string(&want).unwrap_or_else(|e| format!("报告读取失败: {e}"));
+        self.report_text = Some((want, text));
+        self.report_text.as_ref().map(|(_, t)| t.as_str())
     }
 
     pub fn push_log(&mut self, line: impl Into<String>) {
@@ -239,6 +296,7 @@ impl E02App {
             }
             UiEvent::Manual { item, question } => {
                 if let Some(reply) = self.manual_tx.clone() {
+                    attention(ctx); // 及时弹窗（V3）：任务栏闪烁提醒操作员
                     self.manual = Some(ManualAsk {
                         title: item.label().to_string(),
                         question,
@@ -250,6 +308,7 @@ impl E02App {
             UiEvent::KeysUpdate { detected, awaiting } => {
                 if let Some(reply) = self.manual_tx.clone() {
                     if awaiting {
+                        attention(ctx);
                         self.keys_prompt = Some(KeysPrompt {
                             detected,
                             awaiting: true,
@@ -303,12 +362,15 @@ impl E02App {
                 self.manual_tx = None;
                 self.progress = None;
                 self.keys_prompt = None;
+                self.manual = None;
                 self.push_log("序列结束");
                 self.last_report = report.clone();
                 match report {
                     Some(p) => self.push_log(format!("报告: {}", p.display())),
                     None => self.push_log("报告写入失败"),
                 }
+                self.refresh_stats();
+                self.refresh_reports();
             }
         }
     }
@@ -394,6 +456,20 @@ impl eframe::App for E02App {
             ui.horizontal_centered(|ui| {
                 ui.heading("E02 工厂测试工具");
                 ui.label(format!("工位: {}", self.config.station));
+                // 今日看板（V3 报告中心）
+                if let Some(t) = &self.today {
+                    let text = format!("今日 {} 台: PASS {} / FAIL {}", t.total, t.pass, t.fail);
+                    ui.colored_label(
+                        if t.fail > 0 {
+                            egui::Color32::RED
+                        } else if t.total > 0 {
+                            egui::Color32::GREEN
+                        } else {
+                            egui::Color32::GRAY
+                        },
+                        text,
+                    );
+                }
                 if self.busy {
                     if let Some(p) = &self.progress {
                         let frac = p.done as f32 / p.total.max(1) as f32;
@@ -408,18 +484,27 @@ impl eframe::App for E02App {
                             elapsed.as_secs() / 60,
                             elapsed.as_secs() % 60
                         );
-                        ui.add(egui::ProgressBar::new(frac).text(text).desired_width(360.0));
+                        ui.add(egui::ProgressBar::new(frac).text(text).desired_width(320.0));
                     }
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if self.busy
+                        && ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new("停止测试").color(egui::Color32::WHITE),
+                                )
+                                .fill(egui::Color32::from_rgb(190, 50, 50)),
+                            )
+                            .clicked()
+                    {
+                        self.request_stop();
+                    }
                     if ui.button("设置").clicked() {
                         self.settings_open = true;
                     }
-                    if ui
-                        .add_enabled(self.last_report.is_some(), egui::Button::new("查看报告"))
-                        .on_disabled_hover_text("测试完成并生成报告后可用")
-                        .clicked()
-                    {
+                    if ui.button("查看报告").clicked() {
+                        self.refresh_reports();
                         self.report_open = true;
                     }
                 });
@@ -465,7 +550,14 @@ impl eframe::App for E02App {
         ui::dialog_keys::show(ctx, self);
         // 设置窗口（V2.2）
         ui::panel_settings::show(ctx, self);
-        // 报告查看窗口（V2.3）
+        // 报告中心（V3：历史浏览 + 今日统计）
         ui::dialog_report::show(ctx, self);
     }
+}
+
+/// 请求窗口管理器关注本窗口（任务栏闪烁），人工弹窗及时可见（V3）。
+fn attention(ctx: &egui::Context) {
+    ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
+        egui::UserAttentionType::Critical,
+    ));
 }

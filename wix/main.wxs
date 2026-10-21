@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="windows-1252"?>
+<!--
+  MSI 安装定义（V3 产线反馈：安装后找不到程序、无快捷方式）。
+  cargo wix 直接使用本文件（不再用 init 默认模板）：
+  - 安装到 Program Files\E02 Factory Test
+  - 桌面 + 开始菜单快捷方式（指向主程序，工作目录=安装目录）
+  - 版本号取 Cargo.toml（!(wix.CARGO_PKG_VERSION)，由 cargo-wix 注入）
+  文案保持 ASCII：MSI 代码页 1252 放不下中文。
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product Id="*" Name="E02 Factory Test" Language="1033"
+           Version="!(wix.CARGO_PKG_VERSION)"
+           UpgradeCode="1387DAB1-BECF-4AF3-AAB7-0F0BEEA0D417"
+           Manufacturer="gengshenchen">
+    <Package Description="E02 factory test tool (adb orchestration GUI)"
+             Comments="https://github.com/gengshenchen/e02-factory-rs"
+             InstallerVersion="450" Compressed="yes" InstallScope="perMachine"
+             Platform="x64" />
+    <MajorUpgrade DowngradeErrorMessage="A newer version of E02 Factory Test is already installed."
+                  AllowSameVersionUpgrades="yes" />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Icon Id="AppIcon" SourceFile="assets\icon.ico" />
+    <Property Id="ARPPRODUCTICON" Value="AppIcon" />
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFiles64Folder">
+        <Directory Id="INSTALLDIR" Name="E02 Factory Test">
+          <Component Id="MainExecutable" Guid="B381AAF2-E577-49AF-8894-F7543C1DFD7D" Win64="yes">
+            <File Id="ExeFile" Source="target\release\e02-factory-rs.exe" KeyPath="yes" />
+          </Component>
+        </Directory>
+      </Directory>
+      <Directory Id="DesktopFolder" Name="Desktop">
+        <Component Id="DesktopShortcut" Guid="6452F51A-AD5E-4875-A3A2-A4400781F786" Win64="yes">
+          <Shortcut Id="DesktopShortcutEntry" Name="E02 Factory Test"
+                    Target="[INSTALLDIR]e02-factory-rs.exe"
+                    WorkingDirectory="INSTALLDIR" Icon="AppIcon" />
+          <RegistryValue Root="HKLM" Key="Software\E02FactoryTest" Name="desktopShortcut"
+                         Type="integer" Value="1" KeyPath="yes" />
+        </Component>
+      </Directory>
+      <Directory Id="ProgramMenuFolder" Name="Programs">
+        <Component Id="StartMenuShortcut" Guid="C206EADE-4582-4D73-A06A-A6AFF5008B96" Win64="yes">
+          <Shortcut Id="StartMenuShortcutEntry" Name="E02 Factory Test"
+                    Target="[INSTALLDIR]e02-factory-rs.exe"
+                    WorkingDirectory="INSTALLDIR" Icon="AppIcon" />
+          <RemoveFolder Id="RemoveStartMenuDir" On="uninstall" />
+          <RegistryValue Root="HKLM" Key="Software\E02FactoryTest" Name="startMenuShortcut"
+                         Type="integer" Value="1" KeyPath="yes" />
+        </Component>
+      </Directory>
+    </Directory>
+
+    <Feature Id="Main" Title="E02 Factory Test" Level="1">
+      <ComponentRef Id="MainExecutable" />
+      <ComponentRef Id="DesktopShortcut" />
+      <ComponentRef Id="StartMenuShortcut" />
+    </Feature>
+  </Product>
+</Wix>

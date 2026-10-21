@@ -8,6 +8,7 @@ mod cli;
 mod config;
 mod engine;
 mod exec;
+mod paths;
 mod player;
 mod protocol;
 mod report;

@@ -8,11 +8,33 @@
 
 use std::io::Read;
 use std::process::{Command, Output, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// 全局默认超时（毫秒）；0 = 不限制。由序列入口（GUI worker / CLI）设置。
 static DEFAULT_MS: AtomicU64 = AtomicU64::new(0);
+
+/// 全局停止请求（V3 产线反馈：测试过程要能打断）。
+/// GUI 停止按钮置位；`run_sequence` 入口清零，开始下一轮前不残留。
+static ABORT: AtomicBool = AtomicBool::new(false);
+
+/// 请求停止：正在执行的子进程立即强杀，worker 循环把剩余项记跳过。
+pub fn request_abort() {
+    ABORT.store(true, Ordering::Relaxed);
+}
+
+pub fn abort_requested() -> bool {
+    ABORT.load(Ordering::Relaxed)
+}
+
+pub fn clear_abort() {
+    ABORT.store(false, Ordering::Relaxed);
+}
+
+/// exec 与 worker 测试共用此锁串行执行：停止标志是全局静态，
+/// 并行测试会互相干扰（一方置停止位，另一方子进程被误杀）。
+#[cfg(test)]
+pub(crate) static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub fn set_default_timeout(d: Option<Duration>) {
     DEFAULT_MS.store(
@@ -29,6 +51,7 @@ pub fn default_timeout() -> Option<Duration> {
 }
 
 /// 执行命令并收集输出；超时强杀子进程，返回 `ErrorKind::TimedOut` 错误。
+/// 停止请求（[`request_abort`]）同样立即强杀，返回 `ErrorKind::Interrupted`。
 pub fn output(cmd: &mut Command, timeout: Option<Duration>) -> std::io::Result<Output> {
     let Some(timeout) = timeout else {
         return cmd.output();
@@ -43,14 +66,24 @@ pub fn output(cmd: &mut Command, timeout: Option<Duration>) -> std::io::Result<O
                 stderr: read_all(&mut child.stderr),
             });
         }
-        if Instant::now() >= deadline {
+        let stop = if abort_requested() {
+            Some((
+                "已手动停止，强制终止".to_string(),
+                std::io::ErrorKind::Interrupted,
+            ))
+        } else if Instant::now() >= deadline {
+            Some((
+                format!("执行超时（{}s）已强制终止", timeout.as_secs()),
+                std::io::ErrorKind::TimedOut,
+            ))
+        } else {
+            None
+        };
+        if let Some((reason, kind)) = stop {
             let program = cmd.get_program().to_string_lossy().into_owned();
             let _ = child.kill();
             let _ = child.wait();
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                format!("执行超时（{}s）已强制终止: {program}", timeout.as_secs()),
-            ));
+            return Err(std::io::Error::new(kind, format!("{reason}: {program}")));
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -70,6 +103,7 @@ mod tests {
 
     #[test]
     fn kills_on_timeout() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut cmd = Command::new("sh");
         cmd.args(["-c", "sleep 5"]);
         let t = Instant::now();
@@ -80,6 +114,7 @@ mod tests {
 
     #[test]
     fn no_timeout_runs_to_completion() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut cmd = Command::new("sh");
         cmd.args(["-c", "echo hi"]);
         let out = output(&mut cmd, None).unwrap();
@@ -89,6 +124,7 @@ mod tests {
 
     #[test]
     fn timeout_output_is_captured() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // 超时前已写入管道的输出仍可读到
         let mut cmd = Command::new("sh");
         cmd.args(["-c", "echo partial; sleep 5"]);

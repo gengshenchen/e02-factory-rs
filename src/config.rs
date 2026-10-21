@@ -172,9 +172,6 @@ pub struct Config {
     /// 超时（V2.3）
     #[serde(default)]
     pub timeouts: TimeoutsCfg,
-    /// 报告按 SN 归档到 reports/<SN>/（V2.3）
-    #[serde(default)]
-    pub report_by_sn: bool,
 }
 
 fn d_station() -> String {
@@ -210,17 +207,15 @@ impl Default for Config {
             keys: KeysCfg::default(),
             gyro: GyroCfg::default(),
             timeouts: TimeoutsCfg::default(),
-            report_by_sn: false,
         }
     }
 }
 
-/// 默认配置文件路径：exe 同目录 `config.toml`（取不到 exe 路径退回当前目录）。
+/// 默认配置文件路径：数据目录 `config.toml`。
+/// 数据目录 = exe 同目录（可写时，绿色包习惯）否则系统应用数据目录
+/// （MSI/deb 安装场景，见 [`crate::paths`]）。
 pub fn default_path() -> PathBuf {
-    std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.join("config.toml")))
-        .unwrap_or_else(|| PathBuf::from("config.toml"))
+    crate::paths::data_dir().join("config.toml")
 }
 
 impl Config {

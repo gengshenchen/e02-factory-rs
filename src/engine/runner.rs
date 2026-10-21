@@ -23,23 +23,27 @@ pub struct BatchOutcome {
 pub fn run_auto(item: TestItem) -> RunOutcome {
     let mut r = TestResult::new(item);
     let device = match item {
-        TestItem::DeviceInfo => match exec(&CameraFactory::DeviceInfo.device_cmd())
-            .and_then(|out| protocol::parse_device_info(&out).map_err(|e| format!("{e:#}")))
-        {
-            Ok(info) => {
-                r.verdict = Verdict::Pass;
-                r.detail = format!("sn={} wifi={} sw={}", info.sn, info.wifi_mac, info.t32_ver);
-                Some(info)
+        TestItem::DeviceInfo => {
+            match exec(&CameraFactory::DeviceInfo.device_cmd()).and_then(|out| {
+                protocol::parse_device_info(&out)
+                    .map_err(|e| format!("{e:#}（原始输出: {}）", one_line(&out)))
+            }) {
+                Ok(info) => {
+                    r.verdict = Verdict::Pass;
+                    r.detail = format!("sn={} wifi={} sw={}", info.sn, info.wifi_mac, info.t32_ver);
+                    Some(info)
+                }
+                Err(e) => {
+                    r.verdict = Verdict::Fail;
+                    r.detail = e;
+                    None
+                }
             }
-            Err(e) => {
-                r.verdict = Verdict::Fail;
-                r.detail = e;
-                None
-            }
-        },
-        TestItem::BtMac => match exec(&CameraFactory::BtMac.device_cmd())
-            .and_then(|out| protocol::parse_device_info(&out).map_err(|e| format!("{e:#}")))
-        {
+        }
+        TestItem::BtMac => match exec(&CameraFactory::BtMac.device_cmd()).and_then(|out| {
+            protocol::parse_device_info(&out)
+                .map_err(|e| format!("{e:#}（原始输出: {}）", one_line(&out)))
+        }) {
             Ok(info) if !info.bt_mac.is_empty() => {
                 r.verdict = Verdict::Pass;
                 r.detail = info.bt_mac.clone();

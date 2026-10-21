@@ -130,6 +130,12 @@ impl TestItem {
             TestItem::Gyro => None,
         }
     }
+
+    /// 人工参与项（V3）：需要操作员看/听/按键——指示灯、MIC/喇叭、按键。
+    /// 序列执行时自动项先行、这些殿后，操作员可在自动项期间离手。
+    pub fn is_manual(self) -> bool {
+        matches!(self, TestItem::Led | TestItem::MicSpeaker | TestItem::Keys)
+    }
 }
 
 /// 一条测试结果。
@@ -139,6 +145,8 @@ pub struct TestResult {
     pub verdict: Verdict,
     /// 附加信息：电压值、失败原因等
     pub detail: String,
+    /// 本项耗时（秒，报告用；0 = 未计时）
+    pub secs: u64,
 }
 
 impl TestResult {
@@ -147,6 +155,7 @@ impl TestResult {
             item,
             verdict: Verdict::Pending,
             detail: String::new(),
+            secs: 0,
         }
     }
 }
@@ -185,5 +194,18 @@ mod tests {
         assert!(Verdict::ManualYes.is_pass());
         assert!(!Verdict::ManualNo.is_pass());
         assert!(!Verdict::Pending.is_pass());
+    }
+
+    #[test]
+    fn manual_items_are_the_three_operator_items() {
+        let manual: Vec<TestItem> = TestItem::ALL
+            .iter()
+            .copied()
+            .filter(|i| i.is_manual())
+            .collect();
+        assert_eq!(
+            manual,
+            vec![TestItem::Led, TestItem::MicSpeaker, TestItem::Keys]
+        );
     }
 }
