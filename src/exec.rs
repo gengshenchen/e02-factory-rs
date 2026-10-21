@@ -33,7 +33,8 @@ pub fn clear_abort() {
 
 /// exec 与 worker 测试共用此锁串行执行：停止标志是全局静态，
 /// 并行测试会互相干扰（一方置停止位，另一方子进程被误杀）。
-#[cfg(test)]
+/// 两个测试模块都是 unix-only（假 adb 桩），此锁同样 unix-only。
+#[cfg(all(unix, test))]
 pub(crate) static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub fn set_default_timeout(d: Option<Duration>) {
