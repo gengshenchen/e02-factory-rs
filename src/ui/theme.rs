@@ -125,9 +125,11 @@ pub fn hairline(color: Color32) -> Stroke {
     Stroke::new(1.0_f32, color)
 }
 
-/// 状态圆点（避免字形符号：直接画圆）。
+/// 状态圆点（避免字形符号：直接画圆）。按正文行高分配高度、圆画中心，
+/// Min 对齐的水平行里保持与文字光学居中。
 pub fn dot(ui: &mut egui::Ui, color: Color32) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+    let h = ui.text_style_height(&egui::TextStyle::Body).max(12.0);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, h), egui::Sense::hover());
     ui.painter().circle_filled(rect.center(), 4.0, color);
 }
 

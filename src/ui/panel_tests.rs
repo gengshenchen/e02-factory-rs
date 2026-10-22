@@ -107,13 +107,16 @@ fn row(
         .inner_margin(egui::Margin::symmetric(8.0, 7.0))
         .stroke(Stroke::NONE)
         .show(ui, |ui| {
-            ui.horizontal_centered(|ui| {
+            // 坑：水平布局 + 垂直 Center（horizontal_centered / right_to_left(Center)）
+            // 会把每个子项的 frame 撑满剩余可用高度——侧面板高度无界，第一行
+            // 就会吞掉整栏。单行布局用 Align::Min（视觉无差），圆点靠自身行高居中。
+            ui.horizontal(|ui| {
                 theme::dot(ui, dot_color);
                 ui.add_space(7.0);
                 let name = egui::RichText::new(item.label());
                 let name = if strong { name.strong() } else { name };
                 ui.label(name.color(label_color));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
                     ui.label(
                         egui::RichText::new(status_text)
                             .small()

@@ -163,3 +163,37 @@ WiFi 测试:PASS  驱动 OK；ping 20 包 0% 丢包 avg 23ms
 工程备忘：egui `SidePanel` 的 `PanelState` 会跨帧/跨启动记忆面板**实际渲染宽度**，
 自定义 Frame 随内容收缩会把宽度"锁"在窄值上——用 `exact_width` 钉死 +
 内容 `set_min_width(available)` 撑满。
+
+## V3.3（UI 换装 Claude 设计规范，2026-10-22）
+
+依据 [awesome-design-md](https://github.com/VoltAgent/awesome-design-md) 的
+`design-md/claude/DESIGN.md` 重做 `ui/theme.rs` 令牌（用户指定）：
+
+| 原令牌（冷色） | 新令牌（Claude 暖色系） |
+|---|---|
+| BG 冷灰 242,244,247 | CANVAS 暖米 #faf9f5（一切浅色面的底，禁纯白/冷灰） |
+| SURFACE 纯白 | 面板/窗口/控件一律坐落 CANVAS；内容卡 CARD #efe9de 深一档 |
+| ACCENT 蓝 32,94,210 | PRIMARY 珊瑚 #cc785c（唯一品牌色，只给主按钮/链接/进行中；按下 PRIMARY_ACTIVE 深档） |
+| ACCENT_BG 浅蓝选中 | SELECTED 奶油强 #e8e0d2（选中/进行中行底） |
+| DARK 蓝黑 22,26,34 | DARK 暖黑 #181715（媒体井/日志"产品面板"），抬升面 DARK_ELEVATED #252320（日志按钮=button-secondary-on-dark） |
+| LINE 冷灰 | HAIRLINE #e6dfd8（发丝线=抬升一级，非墨线） |
+| OK 深绿 | OK #5db872（状态点）+ OK_STRONG 深档（绿底白字按钮/小字文字，保对比度） |
+| — | TEAL #5db8a6 暖黑上的状态强调（日志"正在测试"）；WARN 琥珀 #d4a017 |
+
+其余落实的规范要点：深度靠色块不靠阴影（全系统零阴影）；控件 8px/窗口 12px 圆角；
+文本选中=珊瑚 15% 叠画布；进行中行"强调靠底色不靠字色"（文字保持墨色）；
+今日徽章=badge-pill（CARD 底 INK 字）。
+
+### V3.3.1 修复：测试项行消失（真机反馈"功能测试显示项目没有了"）
+
+V3.2 重写行组件时用了 `ui.horizontal_centered` + `with_layout(right_to_left(
+Align::Center))`。egui 水平布局 + 垂直 Center 对齐时，**每个子 widget 的
+frame 会撑满剩余可用高度**（`Layout::next_frame_ignore_wrap`：`is_horizontal()
+&& vertical_align()==Center` → `frame_size.y = max(available_rect.height())`）。
+侧面板高度无界（一直延伸到面板底），第一行就把整栏剩余高度吃掉（450px），
+后 11 行全被顶出裁剪区——界面只剩一行。V3.1 用普通 `ui.horizontal`
+（Align::Min，不填充）所以没这问题；此前没发现是因为当时的截图核对被桌面上
+其他窗口污染。修复：行内一律 `Align::Min`（单行布局视觉无差），`theme::dot`
+按正文行高分配高度、圆画中心保持光学居中。**判别法**：TopBottomPanel/Window
+有 sizing pass（Center 自动降级 Min）不受影响；SidePanel 内容、ScrollArea
+内容无界，禁用 Center 对齐的水平行。
