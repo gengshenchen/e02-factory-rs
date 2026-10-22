@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 const CJK_FONT: &[u8] = include_bytes!("../assets/fonts/DroidSansFallbackFull.ttf");
 
 /// 视频回放帧率（worker 抽帧同为 2fps）。
-const PLAYBACK_INTERVAL: Duration = Duration::from_millis(500);
+const PLAYBACK_INTERVAL: Duration = Duration::from_millis(200);
 
 /// 人工判定待应答请求（UI 弹窗收集应答后经 reply 传回 worker）。
 pub struct ManualAsk {
@@ -76,8 +76,6 @@ pub enum MediaState {
         idx: usize,
         last: Instant,
         has_audio: bool,
-        /// 播完一轮后定帧，停止重绘省 CPU
-        done: bool,
     },
 }
 
@@ -121,6 +119,9 @@ pub struct E02App {
     report_text: Option<(PathBuf, String)>,
     event_rx: Option<Receiver<UiEvent>>,
     manual_tx: Option<Sender<UiResponse>>,
+    /// 录像回放声音（V3.6）：OutputStream 须保活，Sink 可替换曲目
+    audio_out: Option<(rodio::OutputStream, rodio::OutputStreamHandle)>,
+    audio_sink: Option<rodio::Sink>,
 }
 
 impl E02App {
@@ -156,6 +157,8 @@ impl E02App {
             report_text: None,
             event_rx: None,
             manual_tx: None,
+            audio_out: None,
+            audio_sink: None,
         };
         if let Some(msg) = cfg_err {
             app.push_log(msg);
@@ -208,9 +211,50 @@ impl E02App {
     }
 
     /// 操作员请求停止：杀掉当前命令、剩余项记跳过（worker 侧配合）。
+    /// 弹窗立即收起给"已停"反馈（worker 侧 Result/Finished 事件再兜底），
+    /// 回放声音同步停止。
     pub fn request_stop(&mut self) {
         crate::exec::request_abort();
+        self.keys_prompt = None;
+        self.manual = None;
+        self.stop_audio();
         self.push_log("已请求停止，等待当前命令退出...");
+    }
+
+    /// 播放录像音轨（V3.6）。OutputStream 首次播放时创建并保活。
+    fn play_audio(&mut self, wav: &Path) {
+        let handle = match &self.audio_out {
+            Some((_, h)) => h.clone(),
+            None => match rodio::OutputStream::try_default() {
+                Ok((stream, handle)) => {
+                    self.audio_out = Some((stream, handle.clone()));
+                    handle
+                }
+                Err(e) => {
+                    self.push_log(format!("音频设备不可用（静音回放）: {e}"));
+                    return;
+                }
+            },
+        };
+        match rodio::Decoder::new(std::io::BufReader::new(
+            std::fs::File::open(wav).expect("音轨文件刚抽出来"),
+        )) {
+            Ok(source) => match rodio::Sink::try_new(&handle) {
+                Ok(sink) => {
+                    sink.append(source);
+                    self.audio_sink = Some(sink);
+                }
+                Err(e) => self.push_log(format!("音频播放失败（静音回放）: {e}")),
+            },
+            Err(e) => self.push_log(format!("音轨解码失败（静音回放）: {e}")),
+        }
+    }
+
+    /// 停止回放声音（不销毁输出流，下段录像复用）。
+    fn stop_audio(&mut self) {
+        if let Some(sink) = self.audio_sink.take() {
+            sink.stop();
+        }
     }
 
     /// 重扫今日统计（启动与每轮结束后调用）。
@@ -248,8 +292,10 @@ impl E02App {
     }
 
     pub fn push_log(&mut self, line: impl Into<String>) {
+        // 控制字符（\r、ANSI 转义等）在内嵌 CJK 字体里是豆腐块，滤掉（V3.6）
+        let clean: String = line.into().chars().filter(|c| !c.is_control()).collect();
         self.log
-            .push_back(format!("{} {}", report::now_hms(), line.into()));
+            .push_back(format!("{} {}", report::now_hms(), clean));
         while self.log.len() > 200 {
             self.log.pop_front();
         }
@@ -333,28 +379,45 @@ impl E02App {
                 frames_dir,
                 count,
                 has_audio,
+                audio,
             } => {
+                // 按目录实际文件名排序加载（V3.6：ffmpeg 图序从 f0001 起，
+                // 旧代码按 f0000 起猜名必然落空，媒体区永远空——真机
+                // "录像没有回显"的根因）
+                let mut names: Vec<PathBuf> = match std::fs::read_dir(&frames_dir) {
+                    Ok(rd) => rd
+                        .flatten()
+                        .map(|e| e.path())
+                        .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("png")))
+                        .collect(),
+                    Err(_) => Vec::new(),
+                };
+                names.sort();
                 let mut frames = Vec::new();
                 let mut sizes = Vec::new();
-                for i in 0..count {
-                    match load_texture(ctx, &frames_dir.join(format!("f{i:04}.png"))) {
+                for path in names {
+                    match load_texture(ctx, &path) {
                         Ok((t, s)) => {
                             frames.push(t);
                             sizes.push(s);
                         }
-                        Err(_) => break,
+                        Err(_) => continue,
                     }
                 }
                 if frames.is_empty() {
-                    self.push_log("视频帧加载失败");
+                    self.push_log(format!("视频帧加载失败（期望 {count} 帧）"));
                 } else {
+                    // 新录像先停上一段的声音，再按需播放本段音轨
+                    self.stop_audio();
+                    if let Some(wav) = audio {
+                        self.play_audio(&wav);
+                    }
                     self.media = MediaState::Video {
                         frames,
                         sizes,
                         idx: 0,
                         last: Instant::now(),
                         has_audio,
-                        done: false,
                     };
                 }
             }
@@ -379,29 +442,17 @@ impl E02App {
         }
     }
 
-    /// 视频回放推进：2fps 前进，播完一轮定帧。
+    /// 视频回放推进：按抽取帧率循环播放（V3.6 改循环，操作员判定期间
+    /// 画面反复滚动，不再播一轮定住）。
     fn tick_video(&mut self, ctx: &egui::Context) {
-        let playing = if let MediaState::Video {
-            frames,
-            idx,
-            last,
-            done,
-            ..
+        if let MediaState::Video {
+            frames, idx, last, ..
         } = &mut self.media
         {
-            if !*done && last.elapsed() >= PLAYBACK_INTERVAL {
-                if *idx + 1 >= frames.len() {
-                    *done = true;
-                } else {
-                    *idx += 1;
-                }
+            if last.elapsed() >= PLAYBACK_INTERVAL {
+                *idx = (*idx + 1) % frames.len().max(1);
                 *last = Instant::now();
             }
-            !*done
-        } else {
-            false
-        };
-        if playing {
             ctx.request_repaint();
         }
     }

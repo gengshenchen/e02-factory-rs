@@ -12,6 +12,22 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
+/// 子进程输出解码：优先严格 UTF-8，失败则按 GBK 回退
+/// （产线固件部分输出为 GBK，lossy 转码会出现乱码，V3.6）。
+pub fn decode_out(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(s) => s.to_string(),
+        Err(_) => {
+            let (s, _, had_errors) = encoding_rs::GBK.decode(bytes);
+            if had_errors {
+                String::from_utf8_lossy(bytes).into_owned()
+            } else {
+                s.into_owned()
+            }
+        }
+    }
+}
+
 /// 全局默认超时（毫秒）；0 = 不限制。由序列入口（GUI worker / CLI）设置。
 static DEFAULT_MS: AtomicU64 = AtomicU64::new(0);
 
@@ -54,11 +70,11 @@ pub fn default_timeout() -> Option<Duration> {
 
 /// 执行命令并收集输出；超时强杀子进程，返回 `ErrorKind::TimedOut` 错误。
 /// 停止请求（[`request_abort`]）同样立即强杀，返回 `ErrorKind::Interrupted`。
+///
+/// 无论是否设了超时都走看门狗轮询（V3.6）：此前"0=不限制"直接
+/// `cmd.output()` 阻塞，停止请求在无超时配置下永远不生效。
 pub fn output(cmd: &mut Command, timeout: Option<Duration>) -> std::io::Result<Output> {
-    let Some(timeout) = timeout else {
-        return cmd.output();
-    };
-    let deadline = Instant::now() + timeout;
+    let deadline = timeout.map(|t| Instant::now() + t);
     let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
     loop {
         if let Some(status) = child.try_wait()? {
@@ -73,9 +89,12 @@ pub fn output(cmd: &mut Command, timeout: Option<Duration>) -> std::io::Result<O
                 "已手动停止，强制终止".to_string(),
                 std::io::ErrorKind::Interrupted,
             ))
-        } else if Instant::now() >= deadline {
+        } else if deadline.is_some_and(|d| Instant::now() >= d) {
             Some((
-                format!("执行超时（{}s）已强制终止", timeout.as_secs()),
+                format!(
+                    "执行超时（{}s）已强制终止",
+                    timeout.map(|t| t.as_secs()).unwrap_or(0)
+                ),
                 std::io::ErrorKind::TimedOut,
             ))
         } else {
@@ -109,14 +128,22 @@ pub fn stream_lines(
 ) -> std::io::Result<String> {
     let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::null()).spawn()?;
     let stdout = child.stdout.take().expect("stdout 已设为 piped");
-    // 读线程只管搬运行；主线程 100ms 轮询回调 + 超时/停止看门狗
+    // 读线程只管搬运行；主线程 100ms 轮询回调 + 超时/停止看门狗。
+    // 按字节读行再解码（V3.6）：BufRead::lines 遇非法 UTF-8 会报错断流，
+    // 固件 GBK 输出会被拦腰截断。
     let (tx, rx) = mpsc::channel::<String>();
     let reader = std::thread::spawn(move || {
-        use std::io::BufRead;
-        for line in std::io::BufReader::new(stdout).lines() {
-            match line {
-                Ok(l) => {
-                    if tx.send(l).is_err() {
+        use std::io::{BufRead, BufReader};
+        let mut reader = BufReader::new(stdout);
+        let mut buf = Vec::new();
+        loop {
+            buf.clear();
+            match reader.read_until(b'\n', &mut buf) {
+                Ok(0) => break, // EOF
+                Ok(_) => {
+                    let line = decode_out(&buf);
+                    let line = line.trim_end_matches(['\n', '\r']);
+                    if tx.send(line.to_string()).is_err() {
                         break; // 接收端已放弃（超时/停止已杀进程）
                     }
                 }

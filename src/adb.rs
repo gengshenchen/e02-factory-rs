@@ -25,12 +25,10 @@ pub fn shell(cmd: &str) -> Result<String> {
         bail!(
             "adb shell {cmd} 退出码 {:?}: {}",
             out.status.code(),
-            String::from_utf8_lossy(&out.stderr).trim()
+            exec::decode_out(&out.stderr).trim()
         );
     }
-    Ok(String::from_utf8_lossy(&out.stdout)
-        .trim()
-        .replace('\r', ""))
+    Ok(exec::decode_out(&out.stdout).trim().replace('\r', ""))
 }
 
 /// 执行 `adb shell <cmd>` 并流式逐行回调（按键实时回显用），返回完整输出。
@@ -56,7 +54,7 @@ pub fn pull(remote: &str, local: &Path) -> Result<()> {
     if !out.status.success() {
         bail!(
             "adb pull {remote}: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
+            exec::decode_out(&out.stderr).trim()
         );
     }
     Ok(())
@@ -87,7 +85,7 @@ pub fn devices() -> Result<Vec<String>> {
         exec::default_timeout(),
     )
     .context("执行 adb devices 失败")?;
-    Ok(parse_devices_output(&String::from_utf8_lossy(&out.stdout)))
+    Ok(parse_devices_output(&exec::decode_out(&out.stdout)))
 }
 
 #[cfg(test)]

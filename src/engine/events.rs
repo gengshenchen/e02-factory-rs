@@ -24,11 +24,12 @@ pub enum UiEvent {
     KeysUpdate { detected: Vec<u8>, awaiting: bool },
     /// 拍照图片已拉回
     PhotoReady(PathBuf),
-    /// 录像已拉回且解码验证通过
+    /// 录像已拉回且解码验证通过（audio 为抽出的音轨 wav，None=无声/抽取失败）
     VideoReady {
         frames_dir: PathBuf,
         count: usize,
         has_audio: bool,
+        audio: Option<PathBuf>,
     },
     /// 过程日志（底部日志面板实时滚动）
     Log(String),

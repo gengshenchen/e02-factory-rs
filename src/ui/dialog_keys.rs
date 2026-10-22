@@ -14,10 +14,12 @@ pub fn show(ctx: &egui::Context, app: &mut E02App) {
     let awaiting = prompt.awaiting;
     let deadline = prompt.deadline;
     let required = app.config.keys.required.clone();
+    // 居中初始位（V3.6）：锚定窗不可拖动，改 default_pos + 标题栏拖动
+    let center = ctx.screen_rect().center();
     egui::Window::new("按键测试")
         .collapsible(false)
         .resizable(false)
-        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .default_pos(center - egui::vec2(190.0, 200.0))
         .show(ctx, |ui| {
             ui.set_min_width(360.0);
             ui.label(

@@ -15,6 +15,10 @@ toml = "0.8"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# 固件输出为 GBK 编码时的回退解码（真机日志乱码，V3.6）
+encoding_rs = "0.8"
+# 录像回放声音（V3.6）：ffmpeg 抽成 wav 后本地播放
+rodio = { version = "0.20", default-features = false, features = ["wav"] }
 
 # deb 打包元数据（cargo deb 使用）
 [package.metadata.deb]

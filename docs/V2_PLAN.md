@@ -249,3 +249,15 @@ frame 会撑满剩余可用高度**（`Layout::next_frame_ignore_wrap`：`is_hor
 `TestItem::factory_cmd`、`UiEvent::Manual.item`、`CameraFactory::Led` 随重构失去
 调用方一并删除（CameraFactory 枚举注释保留 9/11 号位的去向记录）。
 按键严格模式与陀螺仪数值解析（旧固件格式）一并下线，解析只剩 `key N` 一种。
+
+## V3.6（第六轮真机反馈：弹窗/日志/停止/顺序/回放，2026-10-22）
+
+| # | 反馈 | 根因与落实 |
+|---|---|---|
+| 1 | 弹窗要居中且可拖动 | 四个窗口（人工判定/按键/设置/报告中心）原用 `.anchor(Align2)` 锚定——锚定窗不可拖动。改为 `default_pos(screen.center() - 半宽高)` 初始居中 + 标题栏拖动（default_pos 仅首次出现生效，拖过即记忆） |
+| 2 | 日志乱码且复制不了 | 乱码双因：固件输出 GBK，`from_utf8_lossy` 变乱码（新增 `exec::decode_out`：严格 UTF-8 失败→GBK 回退，shell/pull/devices/流式共用；流式 `BufRead::lines` 遇非法 UTF-8 还会断流，改按字节读行再解码）；`\r` 等控制字符在内嵌 CJK 字体是豆腐块（push_log 过滤控制字符）。复制：日志标题行加"复制日志"按钮（整段进剪贴板），逐行保留 egui 原生选中复制 |
+| 3 | 按键测试停止不了 | 挖出一个暗坑：`exec::output` 在"0=不限制"超时配置下直接 `cmd.output()` 阻塞，停止请求永远不生效——改为无论有无超时都走看门狗轮询（停止/超时都即时强杀）。另补两个回归测试锁定按键两阶段（监听中/等待应答）停止均在 15s 内 Skipped（Linux 实证通过）；request_stop 现在立即收起弹窗并停回放声音给即时反馈。若真机仍复现请确认跑的是新构建（V3.4.1 有旧截图教训） |
+| 4 | 测试顺序要更合理 | BATCH_ORDER 重排：自动 设备信息（核SN）→蓝牙→WiFi→SD卡（录像前确认存储）→电池→陀螺仪；人工 录像（长动作先启动）→拍照→指示灯→麦克风→按键（收尾）。测试锁定该顺序断言 |
+| 5 | 录像没有回显/播放 | 根因：ffmpeg 图片序列从 `f0001.png` 起编号，UI 按 `f0000` 起猜名加载必空——改为 read_dir 实际文件名排序加载。回放升级：抽帧 2fps→5fps（640 宽）、200ms 步进**循环播放**（判定期间画面反复滚动）；新增音轨回放——ffmpeg 抽 wav（pcm_s16le）+ rodio 播放（无音轨/无音频设备时静音回放不阻断），操作员可听声音判"有无声音" |
+
+新增依赖：encoding_rs（GBK 回退）、rodio wav（Linux CI 需装 libasound2-dev，已加 apt 步）。

@@ -16,11 +16,13 @@ pub fn show(ctx: &egui::Context, app: &mut E02App) {
     let title = ask.title.clone();
     let question = ask.question.clone();
     let deadline = ask.deadline;
+    // 居中初始位（V3.6）：不用 anchor——锚定窗不可拖动；
+    // default_pos 只在首次出现生效，操作员可随后拖到顺手位置
+    let center = ctx.screen_rect().center();
     egui::Window::new(&title)
         .collapsible(false)
         .resizable(false)
-        // 右上角落位：录像/拍照人工判定时媒体区回放不被弹窗遮挡（V3.5）
-        .anchor(egui::Align2::RIGHT_TOP, [-24.0, 96.0])
+        .default_pos(center - egui::vec2(210.0, 110.0))
         .show(ctx, |ui| {
             ui.set_min_width(380.0);
             ui.add_space(4.0);

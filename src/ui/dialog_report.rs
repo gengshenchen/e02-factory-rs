@@ -11,11 +11,13 @@ pub fn show(ctx: &egui::Context, app: &mut E02App) {
     }
     let mut open = true;
     let mut open_failed = false;
+    // 居中初始位（V3.6）：锚定窗不可拖动
+    let center = ctx.screen_rect().center();
     egui::Window::new("报告中心")
         .open(&mut open)
         .collapsible(false)
         .default_size([860.0, 560.0])
-        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .default_pos(center - egui::vec2(430.0, 280.0))
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
                 if let Some(t) = &app.today {

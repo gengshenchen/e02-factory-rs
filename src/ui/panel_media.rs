@@ -24,10 +24,14 @@ pub fn show(ui: &mut egui::Ui, app: &mut E02App) {
             ui.with_layout(egui::Layout::bottom_up(egui::Align::RIGHT), |ui| {
                 ui.label(
                     egui::RichText::new(format!(
-                        "录像回放 {}/{}{}",
+                        "录像循环回放 {}/{}{}",
                         idx + 1,
                         frames.len(),
-                        if *has_audio { "（含音频流）" } else { "" }
+                        if *has_audio {
+                            "（含音频流）"
+                        } else {
+                            "（无音频流）"
+                        }
                     ))
                     .small()
                     .color(theme::ON_DARK_SOFT),

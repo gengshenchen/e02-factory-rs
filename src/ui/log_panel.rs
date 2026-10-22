@@ -37,6 +37,11 @@ pub fn show(ui: &mut egui::Ui, app: &mut E02App) {
             if ui.small_button("清空").clicked() {
                 app.log.clear();
             }
+            if ui.small_button("复制日志").clicked() {
+                let text = app.log.iter().cloned().collect::<Vec<_>>().join("\n");
+                ui.ctx().copy_text(text);
+                app.push_log("日志已复制到剪贴板");
+            }
         });
     });
     ui.add_space(6.0);

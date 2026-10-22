@@ -15,20 +15,23 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
-/// 一键全测顺序，对应原程序 OnBnClickedButton14 的调用顺序
-/// （V3.5：充电项下线，充电并入电池；陀螺仪追加在末尾）。
+/// 一键全测执行顺序（V3.6 重排，按产线操作流）：
+/// 自动项——设备信息（核 SN）→ 蓝牙 MAC → WiFi → SD 卡（录像前先确认存储）
+/// → 电池 → 陀螺仪；人工项——录像（长动作先启动、回放判定）→ 拍照 →
+/// 指示灯 → 麦克风 → 按键（操作员收尾）。run_sequence 内仍会按
+/// is_manual 稳定排序：自动项先行，人工项按此相对顺序殿后。
 pub const BATCH_ORDER: [TestItem; 11] = [
-    TestItem::Photo,
     TestItem::DeviceInfo,
     TestItem::BtMac,
     TestItem::Wifi,
-    TestItem::Battery,
     TestItem::SdCard,
+    TestItem::Battery,
+    TestItem::Gyro,
     TestItem::Video,
-    TestItem::Keys,
+    TestItem::Photo,
     TestItem::Led,
     TestItem::MicSpeaker,
-    TestItem::Gyro,
+    TestItem::Keys,
 ];
 
 /// 同步执行测试序列（worker 线程与测试共用）。
@@ -361,7 +364,7 @@ fn video_flow(
     }
     let _ = tx.send(UiEvent::Log(format!("ffmpeg 解码 {}", local.display())));
     let frames_dir = media_dir.join("frames");
-    let count = match player::extract_frames(&local, &frames_dir, 2, 640) {
+    let count = match player::extract_frames(&local, &frames_dir, 5, 640) {
         Ok(c) => c,
         Err(e) => {
             r.verdict = Verdict::Fail;
@@ -373,10 +376,25 @@ fn video_flow(
         }
     };
     let has_audio = player::probe_has_audio(&local).unwrap_or(false);
+    // 抽音轨供本地播放（V3.6：操作员要听到录像声音才能判定）
+    let wav = media_dir.join("audio.wav");
+    let audio = if has_audio {
+        match player::extract_audio(&local, &wav) {
+            Ok(true) => Some(wav),
+            Ok(false) => None,
+            Err(e) => {
+                let _ = tx.send(UiEvent::Log(format!("抽音轨失败（继续）: {e:#}")));
+                None
+            }
+        }
+    } else {
+        None
+    };
     let _ = tx.send(UiEvent::VideoReady {
         frames_dir,
         count,
         has_audio,
+        audio,
     });
     // 3) 人工确认：媒体区回放（对应原程序 Sleep(2500) 观察窗），
     //    弹窗落在右上面板区，不遮挡画面
@@ -856,7 +874,7 @@ mod tests {
                     count, has_audio, ..
                 } => {
                     video_ready += 1;
-                    assert!(count >= 3, "2 秒 2fps 应至少 3 帧");
+                    assert!(count >= 8, "2 秒 5fps 应至少 8 帧，实际 {count}");
                     assert!(has_audio);
                 }
                 UiEvent::Result(r, _) => {
@@ -872,7 +890,8 @@ mod tests {
         assert_eq!(manual_asked, 3);
         assert_eq!(photo_ready, 1);
         assert_eq!(video_ready, 1);
-        // 自动项先行、人工项殿后（人工组内保持传入顺序 Led→Photo→Video）
+        // 自动项先行、人工项殿后（稳定排序保持传入相对顺序；
+        // 生产入口 batch_items 走 BATCH_ORDER，见下方顺序断言）
         assert_eq!(
             order,
             vec![
@@ -880,6 +899,32 @@ mod tests {
                 TestItem::Led,
                 TestItem::Photo,
                 TestItem::Video
+            ]
+        );
+        // BATCH_ORDER（V3.6 生产顺序）：自动 信息→蓝牙→WiFi→SD→电池→陀螺仪，
+        // 人工 录像→拍照→指示灯→麦克风→按键
+        let batch: Vec<TestItem> = BATCH_ORDER.to_vec();
+        let manual: Vec<TestItem> = batch.iter().copied().filter(|i| i.is_manual()).collect();
+        assert_eq!(
+            manual,
+            vec![
+                TestItem::Video,
+                TestItem::Photo,
+                TestItem::Led,
+                TestItem::MicSpeaker,
+                TestItem::Keys
+            ]
+        );
+        let auto: Vec<TestItem> = batch.iter().copied().filter(|i| !i.is_manual()).collect();
+        assert_eq!(
+            auto,
+            vec![
+                TestItem::DeviceInfo,
+                TestItem::BtMac,
+                TestItem::Wifi,
+                TestItem::SdCard,
+                TestItem::Battery,
+                TestItem::Gyro
             ]
         );
         let get = |item: TestItem| {
@@ -1179,6 +1224,86 @@ mod tests {
         let text = std::fs::read_to_string(&stop_report).unwrap();
         assert!(text.contains("手动结束测试"));
         assert!(text.contains("结果: 跳过"));
+        exec::clear_abort();
+
+        // —— V3.6 按键停止：监听阶段（adb 阻塞中）与等待应答阶段 ——
+        // 1) 监听中停止：固件监听窗口阻塞 30s，中途按停止应立即退出
+        exec::clear_abort();
+        let kstop = base.join("adb-keys-stop");
+        std::fs::write(
+            &kstop,
+            "#!/bin/sh\ncase \"$*\" in\n*\"camera-factory 15\"*) printf 'key 4\\n'; sleep 30;;\n\
+             *) printf 'ok\\n';;\nesac\n",
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&kstop, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::env::set_var("ADB", &kstop);
+        let (tx, rx) = mpsc::channel();
+        let (_mtx, mrx) = mpsc::channel();
+        let (m_c, r_c) = (media.clone(), reports.clone());
+        let t0 = Instant::now();
+        let ks_items = vec![TestItem::Keys];
+        let handle = thread::spawn(move || {
+            run_sequence(&ks_items, &tx, &mrx, &m_c, &r_c, &Config::default())
+        });
+        let mut ks_verdicts = Vec::new();
+        while let Ok(ev) = rx.recv_timeout(Duration::from_secs(30)) {
+            if matches!(
+                ev,
+                UiEvent::KeysUpdate {
+                    awaiting: false,
+                    ..
+                }
+            ) {
+                exec::request_abort(); // 弹窗已开、监听进行中：模拟按停止
+            }
+            if let UiEvent::Result(r, _) = ev {
+                ks_verdicts.push((r.item, r.verdict));
+            }
+        }
+        handle.join().unwrap();
+        assert!(
+            t0.elapsed() < Duration::from_secs(15),
+            "监听中停止应立即生效，实测 {:?}",
+            t0.elapsed()
+        );
+        assert_eq!(ks_verdicts, vec![(TestItem::Keys, Verdict::Skipped)]);
+        exec::clear_abort();
+
+        // 2) 等待应答阶段停止：未收齐弹窗悬着，操作员不点改判而直接按停止
+        std::fs::write(
+            &kstop,
+            "#!/bin/sh\ncase \"$*\" in\n*\"camera-factory 15\"*) printf 'key 4\\n';;\n\
+             *) printf 'ok\\n';;\nesac\n",
+        )
+        .unwrap();
+        let (tx, rx) = mpsc::channel();
+        let (_mtx, mrx) = mpsc::channel();
+        let (m_c, r_c) = (media.clone(), reports.clone());
+        let t0 = Instant::now();
+        let ks_items = vec![TestItem::Keys];
+        let handle = thread::spawn(move || {
+            run_sequence(&ks_items, &tx, &mrx, &m_c, &r_c, &Config::default())
+        });
+        let mut ks_verdicts = Vec::new();
+        while let Ok(ev) = rx.recv_timeout(Duration::from_secs(30)) {
+            if matches!(ev, UiEvent::KeysUpdate { awaiting: true, .. }) {
+                exec::request_abort(); // 不应答，直接停止
+            }
+            if let UiEvent::Result(r, _) = ev {
+                ks_verdicts.push((r.item, r.verdict));
+            }
+        }
+        handle.join().unwrap();
+        assert!(
+            t0.elapsed() < Duration::from_secs(15),
+            "等待应答时停止应立即生效，实测 {:?}",
+            t0.elapsed()
+        );
+        assert_eq!(ks_verdicts, vec![(TestItem::Keys, Verdict::Skipped)]);
         exec::clear_abort();
 
         std::env::remove_var("ADB");

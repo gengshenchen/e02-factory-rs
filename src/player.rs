@@ -116,6 +116,37 @@ pub fn probe_has_audio(video: &Path) -> Result<bool> {
     Ok(!String::from_utf8_lossy(&out.stdout).trim().is_empty())
 }
 
+/// 抽取视频音轨为 wav（V3.6：录像回放时本地播放声音，供人工判定有无声音）。
+/// 视频无音轨时返回 Ok(false)（调用方先 probe_has_audio 亦可）。
+pub fn extract_audio(video: &Path, wav: &Path) -> Result<bool> {
+    if let Some(dir) = wav.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let _ = std::fs::remove_file(wav);
+    let out = exec::output(
+        Command::new(ffmpeg_path())
+            .args(["-nostdin", "-loglevel", "error", "-y"])
+            .arg("-i")
+            .arg(video)
+            .arg("-vn")
+            .arg("-acodec")
+            .arg("pcm_s16le")
+            .arg(wav),
+        exec::default_timeout(),
+    )
+    .context("执行 ffmpeg 失败")?;
+    if !out.status.success() {
+        // 无音轨：ffmpeg 报错属预期，不算测试失败
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if stderr.contains("does not contain any stream") || stderr.contains("Output file is empty")
+        {
+            return Ok(false);
+        }
+        bail!("ffmpeg 抽音轨失败: {}", stderr.trim());
+    }
+    Ok(wav.is_file())
+}
+
 #[cfg(all(unix, test))] // ffmpeg 预装于 ubuntu/macos CI；Windows CI 跳过
 mod tests {
     use super::*;

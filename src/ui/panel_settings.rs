@@ -13,11 +13,13 @@ pub fn show(ctx: &egui::Context, app: &mut E02App) {
     }
     let mut open = true;
     let mut save_msg: Option<String> = None;
+    // 居中初始位（V3.6）：锚定窗不可拖动
+    let center = ctx.screen_rect().center();
     egui::Window::new("设置")
         .open(&mut open)
         .collapsible(false)
         .resizable(false)
-        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .default_pos(center - egui::vec2(230.0, 300.0))
         .show(ctx, |ui| {
             ui.set_min_width(420.0);
 
