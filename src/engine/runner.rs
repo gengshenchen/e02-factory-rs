@@ -120,8 +120,9 @@ pub fn run_auto(item: TestItem) -> RunOutcome {
         }
         TestItem::Gyro => match exec(&CameraFactory::Gyro.device_cmd()) {
             Ok(out) => {
-                // camera-factory 17（V3.5 固件自检指令）：返回值含 FAIL 判失败
-                r.verdict = bool_verdict(protocol::output_ok(&out));
+                // camera-factory 17（V3.5）：固件回读 gyroscope-test:true/false，
+                // 严格等 true——false 输出不含 FAIL 字样，通用判定会误过
+                r.verdict = bool_verdict(protocol::gyro_ok(&out));
                 r.detail = one_line(&out);
                 None
             }

@@ -261,3 +261,15 @@ frame 会撑满剩余可用高度**（`Layout::next_frame_ignore_wrap`：`is_hor
 | 5 | 录像没有回显/播放 | 根因：ffmpeg 图片序列从 `f0001.png` 起编号，UI 按 `f0000` 起猜名加载必空——改为 read_dir 实际文件名排序加载。回放升级：抽帧 2fps→5fps（640 宽）、200ms 步进**循环播放**（判定期间画面反复滚动）；新增音轨回放——ffmpeg 抽 wav（pcm_s16le）+ rodio 播放（无音轨/无音频设备时静音回放不阻断），操作员可听声音判"有无声音" |
 
 新增依赖：encoding_rs（GBK 回退）、rodio wav（Linux CI 需装 libasound2-dev，已加 apt 步）。
+
+## V3.6.1（真机日志复盘：麦克风卡死 + 电池/陀螺仪误判，2026-10-22）
+
+真机 RS 日志对照 T33 旧 MFC 日志定位三处：
+
+| 现象 | 根因 | 修复 |
+|---|---|---|
+| 麦克风点"合格"后无响应 | 当前固件（v2.4.2）的 13/14 回环进程**不再自动退出**（T33 旧固件约 2s 自退：`Loopback m/b on` → `1` → 回提示符）；worker 阻塞等命令退出，人工应答躺在队列里无人消费 | mic_flow 重构：`adb::spawn_shell` 启动即转人工等待（读线程转发"Loopback on"到日志），应答/超时/停止即 kill 本地 adb 会话结束回环——两种固件行为都兼容；新增"13/14 挂住 sleep 30"回归测试锁定流程不被阻塞 |
+| 电池 `Bat vol:4.390` 判 FAIL | parse_battery 关键词只认 voltage/current/压/流，未覆盖 vol/cur 短写 | 关键词放宽为 contains vol/cur/压/流（覆盖 `Bat vol:`、`Vol:,cur:`、全写） |
+| 陀螺仪 `gyroscope-test:false` 判 PASS | 只按"输出含 FAIL"通用判定；固件自检失败时回读 `:false` 而无 FAIL 字样 | 新增 `gyro_ok`：严格等 `gyroscope-test:true`，拿不到 true 即失败 |
+
+MFC 源码佐证：老版 MIC 按钮即 `adb shell camera-factory 13` + MessageBox（等待命令完成后再弹窗）；T33 新版日志显示 13 有"停校准→回环"两段语义且 2s 自退——当前固件行为已变，上位机不能把"命令退出"当流程节点。

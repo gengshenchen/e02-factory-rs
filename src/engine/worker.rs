@@ -473,7 +473,14 @@ fn dialog_flow(
 }
 
 /// 麦克风流程（V3.5）：主麦 camera-factory 13、副麦 camera-factory 14，
-/// 各自弹窗先行、命令执行后由操作员听回放判定，两段全部合格才通过。
+/// 各自弹窗先行，操作员听设备端实时回环判定，两段全部合格才通过。
+///
+/// V3.6 关键改动：不再等 13/14 命令退出。T33 旧固件约 2s 自退
+/// （`Loopback m/b on` → `1` → 回提示符）；当前固件（v2.4.2 实测）回环
+/// 进程存活期间才有声音、**不会自己退出**——阻塞等待会把整条流程卡死，
+/// 操作员点"合格"也无人消费（真机反馈"点击合格后无响应"的根因）。
+/// 现在启动即转入人工等待，应答后 kill 本地 adb 会话结束回环，
+/// 两种固件行为都兼容。
 fn mic_flow(tx: &Sender<UiEvent>, manual: &Receiver<UiResponse>, manual_secs: u64) -> RunOutcome {
     let mut r = TestResult::new(TestItem::MicSpeaker);
     let phases: [(&str, CameraFactory, &str); 2] = [
@@ -491,13 +498,15 @@ fn mic_flow(tx: &Sender<UiEvent>, manual: &Receiver<UiResponse>, manual_secs: u6
     let mut marks: Vec<(&str, bool)> = Vec::new();
     for (name, factory, question) in phases {
         send_manual(tx, &format!("{name}判定"), question);
-        let cmd = factory.device_cmd();
-        let _ = tx.send(UiEvent::Log(format!("执行 adb shell {cmd}，请听回放")));
+        let mut loopback = start_loopback(tx, &factory.device_cmd());
         // 输出不作自动判定，人工听感为准
-        let _ = adb::shell(&cmd);
         match wait_answer(manual, manual_secs) {
-            Ok(ok) => marks.push((name, ok)),
+            Ok(ok) => {
+                stop_loopback(&mut loopback);
+                marks.push((name, ok));
+            }
             Err((v, d)) => {
+                stop_loopback(&mut loopback);
                 r.verdict = v;
                 r.detail = format!("{name}: {d}");
                 return RunOutcome {
@@ -536,6 +545,51 @@ enum WaitEnd {
     Disconnected,
     /// 操作员按了停止测试
     Aborted,
+}
+
+/// 启动回环命令并转发输出行到日志（读线程随管道 EOF 自然退出；
+/// T33 旧固件 2s 自退时线程即结束，新固件常驻到应答后 kill）。
+fn start_loopback(tx: &Sender<UiEvent>, cmd: &str) -> Option<std::process::Child> {
+    let _ = tx.send(UiEvent::Log(format!(
+        "执行 adb shell {cmd}（设备实时回环，请对麦克风说话）"
+    )));
+    match adb::spawn_shell(cmd) {
+        Ok(mut child) => {
+            if let Some(stdout) = child.stdout.take() {
+                let tx_live = tx.clone();
+                thread::spawn(move || {
+                    use std::io::{BufRead, BufReader};
+                    for line in BufReader::new(stdout).lines() {
+                        match line {
+                            Ok(l) => {
+                                let l = crate::exec::decode_out(l.as_bytes());
+                                let l = l.trim_end_matches(['\n', '\r']).to_string();
+                                let _ = tx_live.send(UiEvent::Log(format!("回环: {l}")));
+                            }
+                            // 非法 UTF-8 行：BufRead::lines 报错即断流，
+                            // 与主流程无关（听感判定），静默结束
+                            Err(_) => break,
+                        }
+                    }
+                });
+            }
+            Some(child)
+        }
+        Err(e) => {
+            let _ = tx.send(UiEvent::Log(format!(
+                "{cmd} 启动失败（继续人工判定）: {e:#}"
+            )));
+            None
+        }
+    }
+}
+
+/// 结束回环：杀本地 adb 会话（设备侧随会话断开停止回环）。
+fn stop_loopback(child: &mut Option<std::process::Child>) {
+    if let Some(mut c) = child.take() {
+        let _ = c.kill();
+        let _ = c.wait();
+    }
 }
 
 /// 等待 UI 应答；`secs` 0 = 无限等。等待期间以 250ms 切片轮询停止请求，
@@ -1103,6 +1157,53 @@ mod tests {
         );
         assert_eq!((vs[0].1, n), (Verdict::ManualYes, 0));
 
+        // —— V3.6 麦克风回环不退出（当前固件实测：13/14 常驻不回提示符）——
+        // 真机曾因此卡死：worker 阻塞等命令退出，"合格"应答无人消费。
+        // 现在：启动即转人工等待，应答即杀本地会话，全程不等 sleep 30。
+        {
+            let mscript = base.join("adb-mic-live");
+            std::fs::write(
+                &mscript,
+                "#!/bin/sh\ncase \"$*\" in\n\
+                 *\"camera-factory 13\"*) printf 'Loopback m on\\n'; sleep 30;;\n\
+                 *\"camera-factory 14\"*) printf 'Loopback b on\\n'; sleep 30;;\n\
+                 *) printf 'ok\\n';;\nesac\n",
+            )
+            .unwrap();
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&mscript, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            std::env::set_var("ADB", &mscript);
+            let (tx, rx) = mpsc::channel();
+            let (mtx, mrx) = mpsc::channel();
+            let (m_c, r_c) = (media.clone(), reports.clone());
+            let mic_items = vec![TestItem::MicSpeaker];
+            let t0 = Instant::now();
+            let handle = thread::spawn(move || {
+                run_sequence(&mic_items, &tx, &mrx, &m_c, &r_c, &Config::default())
+            });
+            let (mut asked, mut verdict) = (0usize, None);
+            while let Ok(ev) = rx.recv_timeout(Duration::from_secs(30)) {
+                match ev {
+                    UiEvent::Manual { .. } => {
+                        asked += 1;
+                        mtx.send(UiResponse::Manual(true)).unwrap();
+                    }
+                    UiEvent::Result(r, _) => verdict = Some(r.verdict),
+                    _ => {}
+                }
+            }
+            handle.join().unwrap();
+            assert_eq!(asked, 2, "主麦/副麦两段判定都应弹出");
+            assert_eq!(verdict, Some(Verdict::ManualYes));
+            assert!(
+                t0.elapsed() < Duration::from_secs(15),
+                "回环命令挂住不应阻塞流程，实测 {:?}",
+                t0.elapsed()
+            );
+        }
+
         // —— V2.2 陀螺仪（V3.5 改 camera-factory 17，返回值判定）——
         let gscript = base.join("adb-gyro");
         let gitems = items(TestItem::Gyro);
@@ -1114,7 +1215,7 @@ mod tests {
             &reports,
             Config::default(),
             "#!/bin/sh\ncase \"$*\" in\n\
-             *\"camera-factory 17\"*) printf 'gyro ok\\n';;\n\
+             *\"camera-factory 17\"*) printf 'gyroscope-test:true\\n';;\n\
              *) printf 'ok\\n';;\nesac\n",
             || unreachable!(),
         );
@@ -1127,7 +1228,7 @@ mod tests {
             &reports,
             Config::default(),
             "#!/bin/sh\ncase \"$*\" in\n\
-             *\"camera-factory 17\"*) printf 'gyro FAIL\\n';;\n\
+             *\"camera-factory 17\"*) printf 'gyroscope-test:false\\n';;\n\
              *) printf 'ok\\n';;\nesac\n",
             || unreachable!(),
         );

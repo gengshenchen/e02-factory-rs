@@ -107,26 +107,31 @@ pub fn parse_device_info(output: &str) -> Result<DeviceInfo> {
 }
 
 /// 电池测试（camera-factory 12，V3.5）：收集输出中含 电压/电流 关键词的行，
-/// 供界面展示与判定（行存在即通过）。真机新固件同时返回电压与电流。
+/// 供界面展示与判定（行存在即通过）。覆盖真机已见格式：`Bat vol:4.390`、
+/// `Vol:4.326,cur:0.235`、`voltage:`/`current:`（V3.6 真机日志补 vol/cur 短写）。
 pub fn parse_battery(output: &str) -> String {
     output
         .lines()
         .map(str::trim)
         .filter(|l| {
             let low = l.to_lowercase();
-            low.contains("voltage")
-                || low.contains("current")
-                || l.contains('压')
-                || l.contains('流')
+            low.contains("vol") || low.contains("cur") || l.contains('压') || l.contains('流')
         })
         .collect::<Vec<_>>()
         .join(" | ")
 }
 
 /// 设备命令返回值判定约定（V3.5）：输出含 `FAIL` 即失败，否则通过。
-/// WiFi/录像/拍照/陀螺仪共用。
+/// WiFi/录像/拍照共用。
 pub fn output_ok(output: &str) -> bool {
     !output.contains("FAIL")
+}
+
+/// 陀螺仪自检（camera-factory 17）：固件明确回读 `gyroscope-test:true/false`
+/// （V3.6 真机日志：失败时无 FAIL 字样、只有 `gyroscope-test:false`，
+/// 按正结果严格判定，拿不到 true 即失败）。
+pub fn gyro_ok(output: &str) -> bool {
+    output.contains("gyroscope-test:true")
 }
 
 /// SD 卡测试：输出含 `true` 即成功。
@@ -274,7 +279,9 @@ mod tests {
 
     #[test]
     fn battery_wifi_sdcard_keys() {
-        // 电池：电压/电流行收集展示（新固件格式；旧 "Battery voltage:" 前缀同样命中）
+        // 电池：电压/电流行收集展示（真机 V3.6 实测格式 + 旧前缀写法）
+        assert_eq!(parse_battery("Bat vol:4.390"), "Bat vol:4.390");
+        assert_eq!(parse_battery("Vol:4.326,cur:0.235"), "Vol:4.326,cur:0.235");
         assert_eq!(
             parse_battery("Battery voltage: 88%"),
             "Battery voltage: 88%"
@@ -286,6 +293,10 @@ mod tests {
         assert_eq!(parse_battery("nope"), "");
         assert!(output_ok("ok"));
         assert!(!output_ok("...FAIL..."));
+        // 陀螺仪：严格等 true（false 不含 FAIL，通用判定会误过）
+        assert!(gyro_ok("qmi8658 slave = 0x6a\ngyroscope-test:true"));
+        assert!(!gyro_ok("qmi8658 slave = 0x6a\ngyroscope-test:false"));
+        assert!(!gyro_ok("no result line"));
         assert!(sdcard_ok("mount true"));
         assert!(!sdcard_ok("false"));
         // 按键：固件回读 `key N`（V3.5），按词匹配
