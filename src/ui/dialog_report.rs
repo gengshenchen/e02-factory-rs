@@ -40,10 +40,10 @@ pub fn show(ctx: &egui::Context, app: &mut E02App) {
                     egui::ScrollArea::vertical().show(ui, |ui| {
                         ui.spacing_mut().item_spacing.y = 2.0;
                         if app.report_list.is_empty() {
-                            ui.label(egui::RichText::new("报告目录暂无报告").color(theme::INK_3));
+                            ui.label(egui::RichText::new("报告目录暂无报告").color(theme::MUTED));
                             ui.small(
                                 egui::RichText::new(app.reports_dir.display().to_string())
-                                    .color(theme::INK_3),
+                                    .color(theme::MUTED),
                             );
                             return;
                         }
@@ -57,7 +57,7 @@ pub fn show(ctx: &egui::Context, app: &mut E02App) {
                             let selected = sel.as_ref() == Some(&p);
                             let resp = egui::Frame::default()
                                 .fill(if selected {
-                                    theme::ACCENT_BG
+                                    theme::SELECTED
                                 } else {
                                     Color32::TRANSPARENT
                                 })
@@ -69,7 +69,7 @@ pub fn show(ctx: &egui::Context, app: &mut E02App) {
                                     ui.label(name.color(if selected {
                                         theme::INK
                                     } else {
-                                        theme::INK_2
+                                        theme::BODY
                                     }));
                                 })
                                 .response
@@ -89,19 +89,19 @@ pub fn show(ctx: &egui::Context, app: &mut E02App) {
                     });
                 });
             egui::CentralPanel::default()
-                .frame(egui::Frame::default().fill(theme::SURFACE))
+                .frame(egui::Frame::default().fill(theme::CANVAS))
                 .show_inside(ui, |ui| match app.report_content() {
                     Some(text) => {
                         egui::ScrollArea::vertical()
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
-                                ui.label(egui::RichText::new(text).monospace().color(theme::INK_2));
+                                ui.label(egui::RichText::new(text).monospace().color(theme::BODY));
                             });
                     }
                     None => {
                         ui.centered_and_justified(|ui| {
                             ui.label(
-                                egui::RichText::new("选择左侧报告查看内容").color(theme::INK_3),
+                                egui::RichText::new("选择左侧报告查看内容").color(theme::MUTED),
                             );
                         });
                     }

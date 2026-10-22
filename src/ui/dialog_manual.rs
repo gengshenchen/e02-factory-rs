@@ -34,7 +34,7 @@ pub fn show(ctx: &egui::Context, app: &mut E02App) {
                 } else {
                     countdown
                 };
-                ui.label(countdown.color(if left <= 10 { theme::BAD } else { theme::INK_3 }));
+                ui.label(countdown.color(if left <= 10 { theme::BAD } else { theme::MUTED }));
             }
             ui.add_space(14.0);
             ui.horizontal(|ui| {
@@ -44,7 +44,7 @@ pub fn show(ctx: &egui::Context, app: &mut E02App) {
                         .strong()
                         .size(16.0),
                 )
-                .fill(theme::OK)
+                .fill(theme::OK_STRONG)
                 .stroke(egui::Stroke::NONE)
                 .min_size(egui::vec2(150.0, 44.0));
                 if ui.add(ok).clicked() {

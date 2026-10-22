@@ -29,17 +29,17 @@ pub fn show(ctx: &egui::Context, app: &mut E02App) {
             for &code in required.iter() {
                 let ok = detected.contains(&code);
                 ui.horizontal(|ui| {
-                    theme::dot(ui, if ok { theme::OK } else { theme::LINE });
+                    theme::dot(ui, if ok { theme::OK } else { theme::HAIRLINE });
                     ui.add_space(7.0);
                     let name = egui::RichText::new(key_name(code));
                     let name = if ok { name.strong() } else { name };
-                    ui.label(name.color(if ok { theme::INK } else { theme::INK_2 }));
+                    ui.label(name.color(if ok { theme::INK } else { theme::BODY }));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(
                             egui::RichText::new(if ok { "已按下" } else { "待按下" })
                                 .small()
                                 .strong()
-                                .color(if ok { theme::OK } else { theme::INK_3 }),
+                                .color(if ok { theme::OK_STRONG } else { theme::MUTED }),
                         );
                     });
                 });
@@ -55,7 +55,7 @@ pub fn show(ctx: &egui::Context, app: &mut E02App) {
                     } else {
                         countdown
                     };
-                    ui.label(countdown.color(if left <= 10 { theme::BAD } else { theme::INK_3 }));
+                    ui.label(countdown.color(if left <= 10 { theme::BAD } else { theme::MUTED }));
                 }
                 ui.label(
                     egui::RichText::new("未收齐按键，请选择：")
@@ -81,7 +81,7 @@ pub fn show(ctx: &egui::Context, app: &mut E02App) {
                     }
                 });
             } else {
-                ui.label(egui::RichText::new("检测中...").small().color(theme::INK_3));
+                ui.label(egui::RichText::new("检测中...").small().color(theme::MUTED));
             }
         });
 }

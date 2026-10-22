@@ -7,7 +7,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut E02App) {
     match &app.media {
         MediaState::Note(note) => {
             ui.centered_and_justified(|ui| {
-                ui.label(egui::RichText::new(note.as_str()).color(theme::DARK_INK));
+                ui.label(egui::RichText::new(note.as_str()).color(theme::ON_DARK));
             });
         }
         MediaState::Photo { texture, size } => {
@@ -30,7 +30,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut E02App) {
                         if *has_audio { "（含音频流）" } else { "" }
                     ))
                     .small()
-                    .color(theme::DARK_INK_2),
+                    .color(theme::ON_DARK_SOFT),
                 );
             });
         }

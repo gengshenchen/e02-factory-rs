@@ -1,17 +1,17 @@
 //! 左侧测试面板（V3.2 重排）：主按钮一键全测 + 自动/人工分组。
 //!
-//! 行即按钮：整行可点，圆点表状态，进行中行品牌蓝高亮，未启用项置灰。
+//! 行即按钮：整行可点，圆点表状态，进行中行奶油底+珊瑚强调，未启用项置灰。
 
 use crate::app::E02App;
 use crate::engine::{TestItem, Verdict};
 use crate::ui::theme;
 use egui::{Color32, Rounding, Sense, Stroke};
 
-/// 判定语义色（绿通过 / 红失败 / 灰未测）。
+/// 判定语义色（绿通过 / 红失败 / 灰未测；绿取深档保小字对比度）。
 pub fn verdict_color(verdict: Verdict) -> Color32 {
     match verdict {
-        Verdict::Pending | Verdict::Skipped => theme::INK_3,
-        Verdict::Pass | Verdict::ManualYes => theme::OK,
+        Verdict::Pending | Verdict::Skipped => theme::MUTED,
+        Verdict::Pass | Verdict::ManualYes => theme::OK_STRONG,
         Verdict::Fail | Verdict::ManualNo => theme::BAD,
     }
 }
@@ -68,7 +68,7 @@ fn section(ui: &mut egui::Ui, text: &str) {
         egui::RichText::new(text)
             .small()
             .strong()
-            .color(theme::INK_3),
+            .color(theme::MUTED),
     );
     ui.add_space(4.0);
 }
@@ -83,22 +83,23 @@ fn row(
     running: bool,
 ) {
     let (dot_color, label_color, strong) = if !enabled {
-        (theme::LINE, theme::INK_3, false)
+        (theme::HAIRLINE, theme::MUTED, false)
     } else if running {
-        (theme::ACCENT, theme::ACCENT, true)
+        // 进行中：奶油底 + 珊瑚圆点，文字保持墨色（强调靠底色不靠字色）
+        (theme::PRIMARY, theme::INK, true)
     } else {
         (verdict_color(verdict), theme::INK, false)
     };
     let (status_text, status_color) = if !enabled {
-        ("未启用".to_string(), theme::INK_3)
+        ("未启用".to_string(), theme::MUTED)
     } else if running {
-        ("进行中".to_string(), theme::ACCENT)
+        ("进行中".to_string(), theme::PRIMARY_ACTIVE)
     } else {
         (verdict.label().to_string(), verdict_color(verdict))
     };
     let resp = egui::Frame::default()
         .fill(if running {
-            theme::ACCENT_BG
+            theme::SELECTED
         } else {
             Color32::TRANSPARENT
         })

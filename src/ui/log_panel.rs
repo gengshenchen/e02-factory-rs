@@ -6,18 +6,20 @@ use crate::ui::theme;
 use egui::Color32;
 
 pub fn show(ui: &mut egui::Ui, app: &mut E02App) {
-    // 深底下的控件配色（幽灵按钮）
+    // 深底上的次级按钮形态：抬升面底色 + 奶油白字（button-secondary-on-dark）
     let w = &mut ui.visuals_mut().widgets;
-    w.inactive.bg_fill = Color32::TRANSPARENT;
-    w.inactive.fg_stroke = theme::hairline(theme::DARK_INK);
-    w.hovered.bg_fill = Color32::from_white_alpha(12);
+    w.inactive.bg_fill = theme::DARK_ELEVATED;
+    w.inactive.fg_stroke = theme::hairline(theme::ON_DARK);
+    w.inactive.bg_stroke = egui::Stroke::NONE;
+    w.hovered.bg_fill = Color32::from_white_alpha(14);
     w.hovered.fg_stroke = theme::hairline(Color32::WHITE);
+    w.hovered.bg_stroke = egui::Stroke::NONE;
 
     ui.horizontal(|ui| {
         ui.label(
             egui::RichText::new("过程日志")
                 .strong()
-                .color(theme::DARK_INK),
+                .color(theme::ON_DARK),
         );
         if app.busy {
             ui.spinner();
@@ -26,10 +28,10 @@ pub fn show(ui: &mut egui::Ui, app: &mut E02App) {
                     "正在测试：{}",
                     app.current.map(|i| i.label()).unwrap_or_default()
                 ))
-                .color(theme::ACCENT_ON_DARK),
+                .color(theme::TEAL),
             );
         } else {
-            ui.label(egui::RichText::new("就绪").color(theme::DARK_INK_2));
+            ui.label(egui::RichText::new("就绪").color(theme::ON_DARK_SOFT));
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui.small_button("清空").clicked() {
@@ -50,7 +52,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut E02App) {
                     ui.label(
                         egui::RichText::new(line.as_str())
                             .monospace()
-                            .color(theme::DARK_INK),
+                            .color(theme::ON_DARK),
                     );
                 }
             },

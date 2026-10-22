@@ -40,14 +40,14 @@ pub fn show(ui: &mut egui::Ui, app: &E02App) {
         .filter(|r| !matches!(r.verdict, Verdict::Pending | Verdict::Skipped))
         .collect();
     if done.is_empty() {
-        theme::badge(ui, "等待测试", theme::INK_3, theme::BG);
+        theme::badge(ui, "等待测试", theme::MUTED, theme::SOFT);
     } else {
         let fail = done.iter().filter(|r| !r.verdict.is_pass()).count();
         if fail == 0 {
             theme::badge(
                 ui,
                 &format!("已测 {} 项，全部通过", done.len()),
-                theme::OK,
+                theme::OK_STRONG,
                 theme::OK_BG,
             );
         } else {
@@ -64,12 +64,12 @@ pub fn show(ui: &mut egui::Ui, app: &E02App) {
 /// 一行字段：左侧灰色小标签，右侧等宽值（原程序只读 Edit 的等价物，
 /// 升级为点击复制）。
 fn field(ui: &mut egui::Ui, name: &str, value: &str) {
-    ui.label(egui::RichText::new(name).small().color(theme::INK_3));
+    ui.label(egui::RichText::new(name).small().color(theme::MUTED));
     let empty = value.is_empty();
     let text = if empty { "-" } else { value };
     let resp = ui.add(
         egui::Label::new(egui::RichText::new(text).monospace().color(if empty {
-            theme::INK_3
+            theme::MUTED
         } else {
             theme::INK
         }))

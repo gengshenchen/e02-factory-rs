@@ -456,7 +456,7 @@ impl eframe::App for E02App {
         egui::TopBottomPanel::top("top_bar")
             .frame(
                 egui::Frame::default()
-                    .fill(ui::theme::SURFACE)
+                    .fill(ui::theme::CANVAS)
                     .inner_margin(egui::Margin::symmetric(16.0, 10.0)),
             )
             .show(ctx, |ui| {
@@ -471,7 +471,7 @@ impl eframe::App for E02App {
                     ui.label(
                         egui::RichText::new(format!("工位 {}", self.config.station))
                             .small()
-                            .color(ui::theme::INK_3),
+                            .color(ui::theme::MUTED),
                     );
                     // 今日看板（V3 报告中心）
                     if let Some(t) = &self.today {
@@ -497,7 +497,7 @@ impl eframe::App for E02App {
                                 egui::ProgressBar::new(frac)
                                     .text(text)
                                     .desired_width(300.0)
-                                    .fill(ui::theme::ACCENT),
+                                    .fill(ui::theme::PRIMARY),
                             );
                         }
                     }
@@ -532,7 +532,7 @@ impl eframe::App for E02App {
             .exact_width(236.0)
             .frame(
                 egui::Frame::default()
-                    .fill(ui::theme::SURFACE)
+                    .fill(ui::theme::CANVAS)
                     .inner_margin(egui::Margin::symmetric(14.0, 12.0)),
             )
             .show(ctx, |ui| ui::panel_tests::show(ui, self));
@@ -541,7 +541,7 @@ impl eframe::App for E02App {
             .exact_width(320.0)
             .frame(
                 egui::Frame::default()
-                    .fill(ui::theme::SURFACE)
+                    .fill(ui::theme::CANVAS)
                     .inner_margin(egui::Margin::symmetric(14.0, 12.0)),
             )
             .show(ctx, |ui| ui::panel_device::show(ui, self));
