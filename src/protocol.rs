@@ -8,6 +8,8 @@ use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 
 /// `adb shell camera-factory N` 的子命令号。
+/// 11 充电已下线（V3.5 产线指令：充电并入电池项）；9 指示灯改纯人工判定
+/// 不再发指令；14 副麦、17 陀螺仪、19 时间校准为固件新指令。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum CameraFactory {
@@ -16,12 +18,15 @@ pub enum CameraFactory {
     DeviceInfo = 3,
     Wifi = 5,
     SdCard = 8,
-    Led = 9,
     BtMac = 10,
-    Charger = 11,
     Battery = 12,
     MicSpeaker = 13,
+    /// 副麦
+    MicSecondary = 14,
     Keys = 15,
+    Gyro = 17,
+    /// 时间校准（配合宿主机 date -s 下发时间后执行）
+    TimeSync = 19,
 }
 
 impl CameraFactory {
@@ -101,29 +106,26 @@ pub fn parse_device_info(output: &str) -> Result<DeviceInfo> {
     Ok(info)
 }
 
-/// 充电测试：找到含 `Voltage` 的行（原逻辑 `Find("Voltage")`）。
-pub fn parse_charger(output: &str) -> Result<String> {
-    output
-        .lines()
-        .map(str::trim)
-        .find(|l| l.contains("Voltage"))
-        .map(str::to_string)
-        .with_context(|| format!("未找到 Voltage 字段: {output:?}"))
-}
-
-/// 电池测试：`Battery voltage:` 后的百分数。
+/// 电池测试（camera-factory 12，V3.5）：收集输出中含 电压/电流 关键词的行，
+/// 供界面展示与判定（行存在即通过）。真机新固件同时返回电压与电流。
 pub fn parse_battery(output: &str) -> String {
     output
         .lines()
         .map(str::trim)
-        .find_map(|l| l.strip_prefix("Battery voltage:"))
-        .map(str::trim)
-        .unwrap_or_default()
-        .to_string()
+        .filter(|l| {
+            let low = l.to_lowercase();
+            low.contains("voltage")
+                || low.contains("current")
+                || l.contains('压')
+                || l.contains('流')
+        })
+        .collect::<Vec<_>>()
+        .join(" | ")
 }
 
-/// WiFi 测试：原逻辑为"输出不含 FAIL 即通过"。
-pub fn wifi_ok(output: &str) -> bool {
+/// 设备命令返回值判定约定（V3.5）：输出含 `FAIL` 即失败，否则通过。
+/// WiFi/录像/拍照/陀螺仪共用。
+pub fn output_ok(output: &str) -> bool {
     !output.contains("FAIL")
 }
 
@@ -132,42 +134,28 @@ pub fn sdcard_ok(output: &str) -> bool {
     output.contains("true")
 }
 
-/// 按键码 → 名称（沿用原程序判定：5=开机键，6=音量键，4=多功能键）。
+/// 键码 → 名称（V3.5 固件回读格式 `key N`：4=多功能键，5=开机键/-，6=音量+）。
 pub fn key_name(code: u8) -> &'static str {
     match code {
         5 => "开机键",
-        6 => "音量键",
+        6 => "音量+",
         _ => "多功能键",
     }
 }
 
-/// 键码 → 对应数字字符（码 4 → '4'；u8 直转 char 会得到控制字符）。
-fn digit_of(code: u8) -> char {
-    (b'0' + code) as char
-}
-
-/// 按键测试（兼容模式）：输出含字符 4/5/6 即视为检测到，
-/// 与原程序 `Find("5")` 行为一致（可能被版本号/电压数字误判）。
+/// 按键测试：解析设备输出中的 `key N` 标记（V3.5 固件回读格式，
+/// 大小写不敏感，按词匹配——`key 45`、`keyboard 4` 均不误判）。
 pub fn parse_keys_codes(output: &str) -> Vec<u8> {
-    [4u8, 5, 6]
-        .into_iter()
-        .filter(|&c| output.contains(digit_of(c)))
-        .collect()
-}
-
-/// 按键测试（严格模式）：只认独立数字行（`^\s*[456]\s*$`），
-/// 避免 "E02-1.0.5"、"Voltage:4.2V" 这类文本假阳性。
-pub fn parse_keys_strict(output: &str) -> Vec<u8> {
+    let low = output.to_lowercase();
+    let toks: Vec<&str> = low.split_whitespace().collect();
     [4u8, 5, 6]
         .into_iter()
         .filter(|&c| {
-            let digit = digit_of(c).to_string();
-            output.lines().any(|l| l.trim() == digit)
+            let digit = c.to_string();
+            toks.windows(2).any(|w| w[0] == "key" && w[1] == digit)
         })
         .collect()
 }
-
-use anyhow::Context as _;
 
 /// 解析 `ip route` 的默认网关（WiFi 速率测试用）。
 /// 样例：`default via 192.168.1.1 dev wlan0  proto static`
@@ -253,6 +241,12 @@ mod tests {
     fn device_cmd_format() {
         assert_eq!(CameraFactory::Video.device_cmd(), "camera-factory 1");
         assert_eq!(CameraFactory::Keys.device_cmd(), "camera-factory 15");
+        assert_eq!(
+            CameraFactory::MicSecondary.device_cmd(),
+            "camera-factory 14"
+        );
+        assert_eq!(CameraFactory::Gyro.device_cmd(), "camera-factory 17");
+        assert_eq!(CameraFactory::TimeSync.device_cmd(), "camera-factory 19");
     }
 
     #[test]
@@ -279,23 +273,31 @@ mod tests {
     }
 
     #[test]
-    fn charger_battery_wifi_sdcard_keys() {
-        assert!(parse_charger("Voltage: 3.9V").is_ok());
-        assert!(parse_charger("nope").is_err());
-        assert_eq!(parse_battery("Battery voltage: 88%"), "88%");
-        assert!(wifi_ok("ok"));
-        assert!(!wifi_ok("...FAIL..."));
+    fn battery_wifi_sdcard_keys() {
+        // 电池：电压/电流行收集展示（新固件格式；旧 "Battery voltage:" 前缀同样命中）
+        assert_eq!(
+            parse_battery("Battery voltage: 88%"),
+            "Battery voltage: 88%"
+        );
+        assert_eq!(
+            parse_battery("voltage: 4.12V\ncurrent: 356mA"),
+            "voltage: 4.12V | current: 356mA"
+        );
+        assert_eq!(parse_battery("nope"), "");
+        assert!(output_ok("ok"));
+        assert!(!output_ok("...FAIL..."));
         assert!(sdcard_ok("mount true"));
         assert!(!sdcard_ok("false"));
-        assert_eq!(parse_keys_codes("456"), vec![4, 5, 6]);
-        assert!(parse_keys_codes("9").is_empty());
-        // 兼容模式与原程序一致：任意位置含数字即命中（含假阳性场景）
-        assert_eq!(parse_keys_codes("soft-ware:E02-1.0.5"), vec![5]);
-        // 严格模式只认独立数字行，排除版本号/电压数字
-        assert_eq!(parse_keys_strict("5\n6\n4\n"), vec![4, 5, 6]);
-        assert!(parse_keys_strict("soft-ware:E02-1.0.5").is_empty());
-        assert!(parse_keys_strict("Voltage:4.2V").is_empty());
-        assert_eq!(parse_keys_strict(" 6 \r\n"), vec![6]);
+        // 按键：固件回读 `key N`（V3.5），按词匹配
+        assert_eq!(parse_keys_codes("key 4\nkey 5\nkey 6"), vec![4, 5, 6]);
+        assert_eq!(parse_keys_codes("Key 5"), vec![5]);
+        assert_eq!(parse_keys_codes("key 5 key 6"), vec![5, 6]);
+        // 不误判：粘连数字、相近单词、版本号
+        assert!(parse_keys_codes("key 45").is_empty());
+        assert!(parse_keys_codes("keyboard 4").is_empty());
+        assert!(parse_keys_codes("soft-ware:E02-1.0.5").is_empty());
         assert_eq!(key_name(5), "开机键");
+        assert_eq!(key_name(6), "音量+");
+        assert_eq!(key_name(4), "多功能键");
     }
 }

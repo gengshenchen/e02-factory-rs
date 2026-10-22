@@ -62,7 +62,7 @@ pub fn run_auto(item: TestItem) -> RunOutcome {
         },
         TestItem::Wifi => match exec(&CameraFactory::Wifi.device_cmd()) {
             Ok(out) => {
-                r.verdict = bool_verdict(protocol::wifi_ok(&out));
+                r.verdict = bool_verdict(protocol::output_ok(&out));
                 r.detail = one_line(&out);
                 None
             }
@@ -76,33 +76,22 @@ pub fn run_auto(item: TestItem) -> RunOutcome {
             }
             Err(e) => fail(&mut r, e),
         },
-        TestItem::Charger => match exec(&CameraFactory::Charger.device_cmd()) {
-            Ok(out) => {
-                match protocol::parse_charger(&out) {
-                    Ok(line) => {
-                        r.verdict = Verdict::Pass;
-                        r.detail = one_line(&line);
-                    }
-                    Err(_) => {
-                        r.verdict = Verdict::Fail;
-                        r.detail = one_line(&out);
-                    }
-                }
-                None
-            }
-            Err(e) => fail(&mut r, e),
-        },
         TestItem::Battery => match exec(&CameraFactory::Battery.device_cmd()) {
             Ok(out) => {
-                let pct = protocol::parse_battery(&out);
-                if pct.is_empty() {
+                // V3.5：收集电压/电流行展示（充电项已并入）；无相关字段判失败
+                let detail = protocol::parse_battery(&out);
+                if detail.is_empty() {
                     r.verdict = Verdict::Fail;
-                    r.detail = one_line(&out);
+                    r.detail = format!("未解析到电压/电流数据，输出: {}", one_line(&out));
+                    None
                 } else {
                     r.verdict = Verdict::Pass;
-                    r.detail = format!("电池电压 {pct}");
+                    r.detail = detail.clone();
+                    Some(DeviceInfo {
+                        battery: detail,
+                        ..DeviceInfo::default()
+                    })
                 }
-                None
             }
             Err(e) => fail(&mut r, e),
         },
@@ -126,17 +115,18 @@ pub fn run_auto(item: TestItem) -> RunOutcome {
         },
         TestItem::Led | TestItem::MicSpeaker | TestItem::Video | TestItem::Photo => {
             r.verdict = Verdict::Skipped;
-            r.detail = match item {
-                TestItem::Led | TestItem::MicSpeaker => "需人工判定（GUI M5 接入）".into(),
-                _ => "媒体展示项（M3/M4 接入）".into(),
-            };
+            r.detail = "需人工判定（GUI 接入）".into();
             None
         }
-        TestItem::Gyro => {
-            r.verdict = Verdict::Skipped;
-            r.detail = "陀螺仪需配置命令（GUI/配置接入）".into();
-            None
-        }
+        TestItem::Gyro => match exec(&CameraFactory::Gyro.device_cmd()) {
+            Ok(out) => {
+                // camera-factory 17（V3.5 固件自检指令）：返回值含 FAIL 判失败
+                r.verdict = bool_verdict(protocol::output_ok(&out));
+                r.detail = one_line(&out);
+                None
+            }
+            Err(e) => fail(&mut r, e),
+        },
     };
     RunOutcome { result: r, device }
 }

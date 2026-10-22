@@ -19,7 +19,8 @@ pub fn show(ctx: &egui::Context, app: &mut E02App) {
     egui::Window::new(&title)
         .collapsible(false)
         .resizable(false)
-        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        // 右上角落位：录像/拍照人工判定时媒体区回放不被弹窗遮挡（V3.5）
+        .anchor(egui::Align2::RIGHT_TOP, [-24.0, 96.0])
         .show(ctx, |ui| {
             ui.set_min_width(380.0);
             ui.add_space(4.0);

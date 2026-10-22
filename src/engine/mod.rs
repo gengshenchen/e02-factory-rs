@@ -5,8 +5,6 @@ pub mod events;
 pub mod runner;
 pub mod worker;
 
-use crate::protocol::CameraFactory;
-
 /// 单个测试项的判定结果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum Verdict {
@@ -50,7 +48,7 @@ impl Verdict {
     }
 }
 
-/// 测试项：与 camera-factory 子命令对应的 11 项 + 陀螺仪（V2.2，shell 命令实现）。
+/// 测试项：与 camera-factory 子命令对应（V3.5：充电并入电池、陀螺仪走 17）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
 pub enum TestItem {
     Video,
@@ -60,7 +58,6 @@ pub enum TestItem {
     SdCard,
     Led,
     BtMac,
-    Charger,
     Battery,
     MicSpeaker,
     Keys,
@@ -69,7 +66,7 @@ pub enum TestItem {
 
 impl TestItem {
     /// 侧栏顺序对应原对话框按钮排列 + 陀螺仪。
-    pub const ALL: [TestItem; 12] = [
+    pub const ALL: [TestItem; 11] = [
         TestItem::Video,
         TestItem::Photo,
         TestItem::DeviceInfo,
@@ -77,7 +74,6 @@ impl TestItem {
         TestItem::SdCard,
         TestItem::Led,
         TestItem::BtMac,
-        TestItem::Charger,
         TestItem::Battery,
         TestItem::MicSpeaker,
         TestItem::Keys,
@@ -93,9 +89,8 @@ impl TestItem {
             TestItem::SdCard => "SD 卡测试",
             TestItem::Led => "指示灯测试",
             TestItem::BtMac => "蓝牙 MAC",
-            TestItem::Charger => "充电测试",
             TestItem::Battery => "电池测试",
-            TestItem::MicSpeaker => "MIC/喇叭",
+            TestItem::MicSpeaker => "麦克风测试",
             TestItem::Keys => "按键测试",
             TestItem::Gyro => "陀螺仪测试",
         }
@@ -111,7 +106,6 @@ impl TestItem {
             TestItem::SdCard => "sdcard",
             TestItem::Led => "led",
             TestItem::BtMac => "btmac",
-            TestItem::Charger => "charger",
             TestItem::Battery => "battery",
             TestItem::MicSpeaker => "mic",
             TestItem::Keys => "keys",
@@ -123,28 +117,19 @@ impl TestItem {
         TestItem::ALL.iter().find(|i| i.slug() == s).copied()
     }
 
-    /// 对应的设备侧 camera-factory 命令；陀螺仪无对应子命令（走配置的 shell 命令）。
-    pub fn factory_cmd(self) -> Option<CameraFactory> {
-        match self {
-            TestItem::Video => Some(CameraFactory::Video),
-            TestItem::Photo => Some(CameraFactory::Photo),
-            TestItem::DeviceInfo => Some(CameraFactory::DeviceInfo),
-            TestItem::Wifi => Some(CameraFactory::Wifi),
-            TestItem::SdCard => Some(CameraFactory::SdCard),
-            TestItem::Led => Some(CameraFactory::Led),
-            TestItem::BtMac => Some(CameraFactory::BtMac),
-            TestItem::Charger => Some(CameraFactory::Charger),
-            TestItem::Battery => Some(CameraFactory::Battery),
-            TestItem::MicSpeaker => Some(CameraFactory::MicSpeaker),
-            TestItem::Keys => Some(CameraFactory::Keys),
-            TestItem::Gyro => None,
-        }
-    }
-
-    /// 人工参与项（V3）：需要操作员看/听/按键——指示灯、MIC/喇叭、按键。
+    /// 人工参与项（V3.5）：需要操作员看/听/按键——录像与拍照由设备返回值
+    /// 先自动判定，成功后拉回媒体由人工确认画面/声音质量，故同属人工项。
     /// 序列执行时自动项先行、这些殿后，操作员可在自动项期间离手。
+    /// （命令号映射见 protocol::CameraFactory；指示灯已改纯人工判定不发指令。）
     pub fn is_manual(self) -> bool {
-        matches!(self, TestItem::Led | TestItem::MicSpeaker | TestItem::Keys)
+        matches!(
+            self,
+            TestItem::Video
+                | TestItem::Photo
+                | TestItem::Led
+                | TestItem::MicSpeaker
+                | TestItem::Keys
+        )
     }
 }
 
@@ -175,20 +160,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn all_items_have_distinct_labels_and_cmds() {
+    fn all_items_have_distinct_labels_and_slugs() {
         let mut labels: Vec<_> = TestItem::ALL.map(|i| i.label()).to_vec();
         labels.sort_unstable();
         labels.dedup();
         assert_eq!(labels.len(), TestItem::ALL.len());
 
-        let mut cmds: Vec<_> = TestItem::ALL
-            .iter()
-            .filter_map(|i| i.factory_cmd().map(|c| c as u8))
-            .collect();
-        cmds.sort_unstable();
-        cmds.dedup();
-        // 陀螺仪无 camera-factory 命令，映射数 = 项数 - 1
-        assert_eq!(cmds.len(), TestItem::ALL.len() - 1);
+        let mut slugs: Vec<_> = TestItem::ALL.map(|i| i.slug()).to_vec();
+        slugs.sort_unstable();
+        slugs.dedup();
+        assert_eq!(slugs.len(), TestItem::ALL.len());
     }
 
     #[test]
@@ -207,7 +188,7 @@ mod tests {
     }
 
     #[test]
-    fn manual_items_are_the_three_operator_items() {
+    fn manual_items_are_the_five_operator_items() {
         let manual: Vec<TestItem> = TestItem::ALL
             .iter()
             .copied()
@@ -215,7 +196,13 @@ mod tests {
             .collect();
         assert_eq!(
             manual,
-            vec![TestItem::Led, TestItem::MicSpeaker, TestItem::Keys]
+            vec![
+                TestItem::Video,
+                TestItem::Photo,
+                TestItem::Led,
+                TestItem::MicSpeaker,
+                TestItem::Keys
+            ]
         );
     }
 }

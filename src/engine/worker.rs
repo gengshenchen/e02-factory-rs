@@ -2,7 +2,7 @@
 //! 经 [`UiEvent`] 回传状态；人工判定阻塞等待 [`UiResponse`]。
 
 use crate::adb;
-use crate::config::{Config, GyroCfg, KeysCfg, WifiCfg};
+use crate::config::{Config, KeysCfg, WifiCfg};
 use crate::engine::events::{UiEvent, UiResponse};
 use crate::engine::runner::{self, RunOutcome};
 use crate::engine::{TestItem, TestResult, Verdict};
@@ -15,13 +15,13 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
-/// 一键全测顺序，对应原程序 OnBnClickedButton14 的调用顺序（陀螺仪追加在末尾）。
-pub const BATCH_ORDER: [TestItem; 12] = [
+/// 一键全测顺序，对应原程序 OnBnClickedButton14 的调用顺序
+/// （V3.5：充电项下线，充电并入电池；陀螺仪追加在末尾）。
+pub const BATCH_ORDER: [TestItem; 11] = [
     TestItem::Photo,
     TestItem::DeviceInfo,
     TestItem::BtMac,
     TestItem::Wifi,
-    TestItem::Charger,
     TestItem::Battery,
     TestItem::SdCard,
     TestItem::Video,
@@ -50,6 +50,8 @@ pub fn run_sequence(
     // 单项超时（V2.3）：序列期间子进程统一看门狗，防止固件命令阻塞卡死序列
     let prev_timeout = exec::default_timeout();
     exec::set_default_timeout(timeout_opt(cfg.timeouts.item_secs));
+    // 序列前置（V3.5 #8）：宿主机时间写入设备再执行固件校时指令
+    sync_time(tx);
 
     // 自动项先行、人工项殿后（稳定排序保持组内原顺序）
     let mut ordered: Vec<TestItem> = items.to_vec();
@@ -193,93 +195,70 @@ fn run_item(
     cfg: &Config,
 ) -> RunOutcome {
     match item {
-        TestItem::Photo => photo_flow(tx, media_dir),
-        TestItem::Video => video_flow(tx, media_dir),
+        TestItem::Photo => photo_flow(tx, manual, media_dir, cfg.timeouts.manual_secs),
+        TestItem::Video => video_flow(tx, manual, media_dir, cfg.timeouts.manual_secs),
         TestItem::Keys => keys_flow(tx, manual, &cfg.keys, cfg.timeouts.manual_secs),
         TestItem::Wifi => wifi_flow(tx, &cfg.wifi),
-        TestItem::Gyro => gyro_flow(tx, &cfg.gyro),
-        TestItem::Led => manual_flow(
+        TestItem::Led => dialog_flow(
             item,
-            "指示灯闪烁是否正常？",
+            "指示灯显示是否正常？",
             tx,
             manual,
-            Some(3),
             cfg.timeouts.manual_secs,
         ),
-        TestItem::MicSpeaker => manual_flow(
-            item,
-            "MIC 与喇叭声音是否正常？",
-            tx,
-            manual,
-            None,
-            cfg.timeouts.manual_secs,
-        ),
+        TestItem::MicSpeaker => mic_flow(tx, manual, cfg.timeouts.manual_secs),
         _ => runner::run_auto(item),
     }
 }
 
-/// 拍照流程：拍摄 → 拉回 → UI 显示（对应原 OnBnClickedButtonCamera）。
-fn photo_flow(tx: &Sender<UiEvent>, media_dir: &Path) -> RunOutcome {
+/// 序列前置：宿主机当前时间写入设备并执行固件校时（V3.5 #8）。
+/// `adb shell date -s "YYYY-MM-DD HH:MM"` 后执行 `camera-factory 19`；
+/// 失败只记日志不阻断（时间同步为辅助步骤，测试照常进行）。
+fn sync_time(tx: &Sender<UiEvent>) {
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
+    let _ = tx.send(UiEvent::Log(format!("同步设备时间: date -s \"{now}\"")));
+    for (cmd, what) in [
+        (format!("date -s \"{now}\""), "时间写入"),
+        (CameraFactory::TimeSync.device_cmd(), "固件校时"),
+    ] {
+        match adb::shell(&cmd) {
+            Ok(out) => {
+                let _ = tx.send(UiEvent::Log(format!(
+                    "{what}: {}",
+                    clip(&runner::one_line(&out), 60)
+                )));
+            }
+            Err(e) => {
+                let _ = tx.send(UiEvent::Log(format!("{what}失败（继续测试）: {e:#}")));
+            }
+        }
+    }
+}
+
+/// 拍照流程（V3.5）：设备返回值判定 → 拉回显示 → 人工确认图像质量。
+fn photo_flow(
+    tx: &Sender<UiEvent>,
+    manual: &Receiver<UiResponse>,
+    media_dir: &Path,
+    manual_secs: u64,
+) -> RunOutcome {
     let mut r = TestResult::new(TestItem::Photo);
     let local = media_dir.join("testjpeg.jpg");
     // 先删旧图，防止上一台设备的图片冒充本轮结果（原程序同逻辑）
     let _ = std::fs::remove_file(&local);
+    // 1) 设备返回值判定：输出含 FAIL 即失败，不拉回
     let cmd = CameraFactory::Photo.device_cmd();
     let _ = tx.send(UiEvent::Log(format!("执行 adb shell {cmd}")));
-    let outcome = adb::shell(&cmd)
+    let judged = adb::shell(&cmd)
         .map_err(|e| format!("{e:#}"))
-        .and_then(|_| {
-            thread::sleep(Duration::from_millis(1000)); // 原程序 Sleep(1000)
-            let _ = tx.send(UiEvent::Log(format!(
-                "adb pull {} -> {}",
-                protocol::REMOTE_PHOTO,
-                local.display()
-            )));
-            adb::pull(protocol::REMOTE_PHOTO, &local).map_err(|e| format!("{e:#}"))
-        })
-        .and_then(|_| {
-            if local.exists() {
-                Ok(())
+        .and_then(|out| {
+            if protocol::output_ok(&out) {
+                Ok(out)
             } else {
-                Err("adb pull 成功但本地文件不存在".to_string())
+                Err(format!("设备返回失败: {}", runner::one_line(&out)))
             }
         });
-    match outcome {
-        Ok(()) => {
-            let _ = tx.send(UiEvent::PhotoReady(local));
-            r.verdict = Verdict::Pass;
-            r.detail = "图片已拉回".into();
-        }
-        Err(e) => {
-            r.verdict = Verdict::Fail;
-            r.detail = e;
-        }
-    }
-    RunOutcome {
-        result: r,
-        device: None,
-    }
-}
-
-/// 录像流程：录制 → 拉回 → ffmpeg 解码验证 → 抽帧回放（对应原 OnBnClickedButtonVedio）。
-fn video_flow(tx: &Sender<UiEvent>, media_dir: &Path) -> RunOutcome {
-    let mut r = TestResult::new(TestItem::Video);
-    let local = media_dir.join("testvideo.mp4");
-    let _ = std::fs::remove_file(&local);
-    let cmd = CameraFactory::Video.device_cmd();
-    let _ = tx.send(UiEvent::Log(format!("执行 adb shell {cmd}")));
-    let outcome = adb::shell(&cmd)
-        .map_err(|e| format!("{e:#}"))
-        .and_then(|_| {
-            thread::sleep(Duration::from_millis(900)); // 原程序 Sleep(900)
-            let _ = tx.send(UiEvent::Log(format!(
-                "adb pull {} -> {}",
-                protocol::REMOTE_VIDEO,
-                local.display()
-            )));
-            adb::pull(protocol::REMOTE_VIDEO, &local).map_err(|e| format!("{e:#}"))
-        });
-    if let Err(e) = outcome {
+    if let Err(e) = judged {
         r.verdict = Verdict::Fail;
         r.detail = e;
         return RunOutcome {
@@ -287,32 +266,45 @@ fn video_flow(tx: &Sender<UiEvent>, media_dir: &Path) -> RunOutcome {
             device: None,
         };
     }
-    // 解码验证 + 抽帧（原程序仅"能播即过"，这里加严为全程解码成功）
-    let _ = tx.send(UiEvent::Log(format!("ffmpeg 解码 {}", local.display())));
-    let frames_dir = media_dir.join("frames");
-    match player::extract_frames(&local, &frames_dir, 2, 640) {
-        Ok(count) => {
-            let has_audio = player::probe_has_audio(&local).unwrap_or(false);
-            let _ = tx.send(UiEvent::VideoReady {
-                frames_dir,
-                count,
-                has_audio,
-            });
-            // 回放观察窗口（对应原程序 Sleep(2500)）
-            thread::sleep(Duration::from_millis(2500));
-            r.verdict = Verdict::Pass;
-            r.detail = format!(
-                "解码 {count} 帧，{}",
-                if has_audio {
-                    "含音频流"
-                } else {
-                    "无音频流"
-                }
-            );
+    // 2) 拉回并显示
+    thread::sleep(Duration::from_millis(1000)); // 原程序 Sleep(1000)
+    let _ = tx.send(UiEvent::Log(format!(
+        "adb pull {} -> {}",
+        protocol::REMOTE_PHOTO,
+        local.display()
+    )));
+    let pulled = adb::pull(protocol::REMOTE_PHOTO, &local)
+        .map_err(|e| format!("{e:#}"))
+        .and_then(|_| {
+            if local.exists() {
+                Ok(())
+            } else {
+                Err("adb pull 成功但本地文件不存在".to_string())
+            }
+        });
+    if let Err(e) = pulled {
+        r.verdict = Verdict::Fail;
+        r.detail = e;
+        return RunOutcome {
+            result: r,
+            device: None,
+        };
+    }
+    let _ = tx.send(UiEvent::PhotoReady(local));
+    // 3) 人工确认图像质量（清晰/色彩/条纹）
+    send_manual(tx, "拍照测试", "拍照图像是否清晰、色彩正常？");
+    match wait_answer(manual, manual_secs) {
+        Ok(true) => {
+            r.verdict = Verdict::ManualYes;
+            r.detail = "图像已拉回，人工确认合格".into();
         }
-        Err(e) => {
-            r.verdict = Verdict::Fail;
-            r.detail = format!("视频解码失败: {e:#}");
+        Ok(false) => {
+            r.verdict = Verdict::ManualNo;
+            r.detail = "图像已拉回，人工判定不合格".into();
+        }
+        Err((v, d)) => {
+            r.verdict = v;
+            r.detail = d;
         }
     }
     RunOutcome {
@@ -321,55 +313,199 @@ fn video_flow(tx: &Sender<UiEvent>, media_dir: &Path) -> RunOutcome {
     }
 }
 
-/// 人工判定流程：先弹窗再驱动设备（V3.2：原顺序先跑完命令才弹窗，
-/// 操作员盯着空界面干等）→ 弹窗询问 → 阻塞等待应答（原 MessageBox 语义）。
-fn manual_flow(
+/// 录像流程（V3.5）：设备返回值判定 → 拉回解码抽帧回放 → 人工确认
+/// 画面清晰/条纹/声音（对应原 OnBnClickedButtonVedio + PlayVideo）。
+fn video_flow(
+    tx: &Sender<UiEvent>,
+    manual: &Receiver<UiResponse>,
+    media_dir: &Path,
+    manual_secs: u64,
+) -> RunOutcome {
+    let mut r = TestResult::new(TestItem::Video);
+    let local = media_dir.join("testvideo.mp4");
+    let _ = std::fs::remove_file(&local);
+    // 1) 设备返回值判定：输出含 FAIL 即失败，不拉回
+    let cmd = CameraFactory::Video.device_cmd();
+    let _ = tx.send(UiEvent::Log(format!("执行 adb shell {cmd}")));
+    let judged = adb::shell(&cmd)
+        .map_err(|e| format!("{e:#}"))
+        .and_then(|out| {
+            if protocol::output_ok(&out) {
+                Ok(out)
+            } else {
+                Err(format!("设备返回失败: {}", runner::one_line(&out)))
+            }
+        });
+    if let Err(e) = judged {
+        r.verdict = Verdict::Fail;
+        r.detail = e;
+        return RunOutcome {
+            result: r,
+            device: None,
+        };
+    }
+    // 2) 拉回 + 解码抽帧（原程序仅"能播即过"，这里加严为全程解码成功）
+    thread::sleep(Duration::from_millis(900)); // 原程序 Sleep(900)
+    let _ = tx.send(UiEvent::Log(format!(
+        "adb pull {} -> {}",
+        protocol::REMOTE_VIDEO,
+        local.display()
+    )));
+    if let Err(e) = adb::pull(protocol::REMOTE_VIDEO, &local).map_err(|e| format!("{e:#}")) {
+        r.verdict = Verdict::Fail;
+        r.detail = e;
+        return RunOutcome {
+            result: r,
+            device: None,
+        };
+    }
+    let _ = tx.send(UiEvent::Log(format!("ffmpeg 解码 {}", local.display())));
+    let frames_dir = media_dir.join("frames");
+    let count = match player::extract_frames(&local, &frames_dir, 2, 640) {
+        Ok(c) => c,
+        Err(e) => {
+            r.verdict = Verdict::Fail;
+            r.detail = format!("视频解码失败: {e:#}");
+            return RunOutcome {
+                result: r,
+                device: None,
+            };
+        }
+    };
+    let has_audio = player::probe_has_audio(&local).unwrap_or(false);
+    let _ = tx.send(UiEvent::VideoReady {
+        frames_dir,
+        count,
+        has_audio,
+    });
+    // 3) 人工确认：媒体区回放（对应原程序 Sleep(2500) 观察窗），
+    //    弹窗落在右上面板区，不遮挡画面
+    thread::sleep(Duration::from_millis(2500));
+    send_manual(tx, "录像测试", "录像画面是否清晰？有无条纹？声音是否正常？");
+    let audio_note = if has_audio {
+        "含音频流"
+    } else {
+        "无音频流"
+    };
+    match wait_answer(manual, manual_secs) {
+        Ok(true) => {
+            r.verdict = Verdict::ManualYes;
+            r.detail = format!("解码 {count} 帧，{audio_note}，人工确认合格");
+        }
+        Ok(false) => {
+            r.verdict = Verdict::ManualNo;
+            r.detail = format!("解码 {count} 帧，{audio_note}，人工判定不合格");
+        }
+        Err((v, d)) => {
+            r.verdict = v;
+            r.detail = d;
+        }
+    }
+    RunOutcome {
+        result: r,
+        device: None,
+    }
+}
+
+/// 发人工判定弹窗（先弹窗再执行设备动作，操作员不等空界面——V3.2 教训）。
+fn send_manual(tx: &Sender<UiEvent>, title: &str, question: &str) {
+    let _ = tx.send(UiEvent::Manual {
+        title: title.to_string(),
+        question: question.to_string(),
+    });
+}
+
+/// 等待操作员应答。Ok = 操作员结论；Err = 超时/断开/停止的终态（判定+原因）。
+fn wait_answer(manual: &Receiver<UiResponse>, manual_secs: u64) -> Result<bool, (Verdict, String)> {
+    match recv_manual(manual, manual_secs) {
+        Ok(UiResponse::Manual(yes)) => Ok(yes),
+        // Keys* 应答不会出现在此类弹窗，视为应答异常
+        Ok(_) => Err((Verdict::Skipped, "应答类型不匹配".into())),
+        Err(WaitEnd::Timeout) => Err((
+            Verdict::ManualNo,
+            format!("超时未人工判定（{manual_secs}s），自动判失败"),
+        )),
+        Err(WaitEnd::Disconnected) => Err((Verdict::Skipped, "界面已退出，判定中断".into())),
+        Err(WaitEnd::Aborted) => Err((Verdict::Skipped, "手动结束测试".into())),
+    }
+}
+
+/// 纯人工判定项（V3.5 指示灯：不再发设备指令，仅弹窗确认）。
+fn dialog_flow(
     item: TestItem,
     question: &str,
     tx: &Sender<UiEvent>,
     manual: &Receiver<UiResponse>,
-    repeat: Option<usize>,
     manual_secs: u64,
 ) -> RunOutcome {
     let mut r = TestResult::new(item);
-    // 人工判定项（指示灯/MIC）必有 camera-factory 命令
-    let cmd = item
-        .factory_cmd()
-        .expect("人工判定项必有设备命令")
-        .device_cmd();
-    let n = repeat.unwrap_or(1);
-    let _ = tx.send(UiEvent::Manual {
-        item,
-        question: question.to_string(),
-    });
-    let _ = tx.send(UiEvent::Log(format!(
-        "执行 adb shell {cmd} 共 {n} 次，请观察"
-    )));
-    for _ in 0..n {
+    send_manual(tx, item.label(), question);
+    match wait_answer(manual, manual_secs) {
+        Ok(true) => r.verdict = Verdict::ManualYes,
+        Ok(false) => r.verdict = Verdict::ManualNo,
+        Err((v, d)) => {
+            r.verdict = v;
+            r.detail = d;
+        }
+    }
+    RunOutcome {
+        result: r,
+        device: None,
+    }
+}
+
+/// 麦克风流程（V3.5）：主麦 camera-factory 13、副麦 camera-factory 14，
+/// 各自弹窗先行、命令执行后由操作员听回放判定，两段全部合格才通过。
+fn mic_flow(tx: &Sender<UiEvent>, manual: &Receiver<UiResponse>, manual_secs: u64) -> RunOutcome {
+    let mut r = TestResult::new(TestItem::MicSpeaker);
+    let phases: [(&str, CameraFactory, &str); 2] = [
+        (
+            "主麦",
+            CameraFactory::MicSpeaker,
+            "请对主麦说话，录音回放声音是否正常？",
+        ),
+        (
+            "副麦",
+            CameraFactory::MicSecondary,
+            "请对副麦说话，录音回放声音是否正常？",
+        ),
+    ];
+    let mut marks: Vec<(&str, bool)> = Vec::new();
+    for (name, factory, question) in phases {
+        send_manual(tx, &format!("{name}判定"), question);
+        let cmd = factory.device_cmd();
+        let _ = tx.send(UiEvent::Log(format!("执行 adb shell {cmd}，请听回放")));
+        // 输出不作自动判定，人工听感为准
         let _ = adb::shell(&cmd);
-    }
-    match recv_manual(manual, manual_secs) {
-        Ok(UiResponse::Manual(true)) => r.verdict = Verdict::ManualYes,
-        Ok(UiResponse::Manual(false)) => r.verdict = Verdict::ManualNo,
-        Ok(_) => {
-            // Keys* 应答不会出现在此弹窗，视为应答异常
-            r.verdict = Verdict::Skipped;
-            r.detail = "应答类型不匹配".into();
-        }
-        Err(WaitEnd::Timeout) => {
-            // 保守判失败：宁可复测，不静默放过
-            r.verdict = Verdict::ManualNo;
-            r.detail = format!("超时未人工判定（{manual_secs}s），自动判失败");
-        }
-        Err(WaitEnd::Disconnected) => {
-            r.verdict = Verdict::Skipped;
-            r.detail = "界面已退出，判定中断".into();
-        }
-        Err(WaitEnd::Aborted) => {
-            r.verdict = Verdict::Skipped;
-            r.detail = "手动结束测试".into();
+        match wait_answer(manual, manual_secs) {
+            Ok(ok) => marks.push((name, ok)),
+            Err((v, d)) => {
+                r.verdict = v;
+                r.detail = format!("{name}: {d}");
+                return RunOutcome {
+                    result: r,
+                    device: None,
+                };
+            }
         }
     }
+    let all_ok = marks.iter().all(|&(_, ok)| ok);
+    r.verdict = if all_ok {
+        Verdict::ManualYes
+    } else {
+        Verdict::ManualNo
+    };
+    r.detail = marks
+        .iter()
+        .map(|&(name, ok)| {
+            if ok {
+                format!("{name}合格")
+            } else {
+                format!("{name}不合格")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("、");
     RunOutcome {
         result: r,
         device: None,
@@ -413,10 +549,11 @@ fn recv_manual(manual: &Receiver<UiResponse>, secs: u64) -> Result<UiResponse, W
 
 /// 按键引导流程（V2.1）：弹窗提示按键 → 固件监听窗口内操作员按键 →
 /// 回显已检测到的键，收齐自动 PASS；未收齐由操作员重测/改判。
-/// 必测键集合与解析模式由工位配置裁剪（V2.2）。
+/// 必测键集合由工位配置裁剪（V2.2）。
 ///
-/// 原程序为无提示静默解析（没按到键时什么都不打印、也不判失败），
-/// 一键全测下无人按键必失败，故改为引导式（V2_PLAN.md §1）。
+/// V3.5：固件回读格式为 `key 4/5/6`（多功能键/开机键/音量+）；
+/// 弹窗在命令发出前先行打开（此前首个事件要等检测到键或超时才发，
+/// 真机监听窗口无输出时操作员全程看不到弹窗）。
 fn keys_flow(
     tx: &Sender<UiEvent>,
     manual: &Receiver<UiResponse>,
@@ -426,6 +563,10 @@ fn keys_flow(
     let mut r = TestResult::new(TestItem::Keys);
     let cmd = CameraFactory::Keys.device_cmd();
     loop {
+        let _ = tx.send(UiEvent::KeysUpdate {
+            detected: Vec::new(),
+            awaiting: false,
+        });
         let _ = tx.send(UiEvent::Log(format!("执行 adb shell {cmd}，请依次按键...")));
         // V3.1 流式回显：固件监听窗口内每读到一行即增量解析，
         // 弹窗实时点亮"已按下"（原 MFC 版要等命令退出才显示按下什么键）
@@ -435,11 +576,7 @@ fn keys_flow(
         let stream = adb::shell_stream(&cmd, |line| {
             acc.push_str(line);
             acc.push('\n');
-            let got = if keys.strict {
-                protocol::parse_keys_strict(&acc)
-            } else {
-                protocol::parse_keys_codes(&acc)
-            };
+            let got = protocol::parse_keys_codes(&acc);
             if got != seen {
                 seen = got.clone();
                 let _ = tx_live.send(UiEvent::KeysUpdate {
@@ -450,11 +587,7 @@ fn keys_flow(
         });
         match stream {
             Ok(out) => {
-                let got = if keys.strict {
-                    protocol::parse_keys_strict(&out)
-                } else {
-                    protocol::parse_keys_codes(&out)
-                };
+                let got = protocol::parse_keys_codes(&out);
                 let missing: Vec<&'static str> = keys
                     .required
                     .iter()
@@ -635,53 +768,6 @@ fn wifi_flow(tx: &Sender<UiEvent>, wifi: &WifiCfg) -> RunOutcome {
     }
 }
 
-/// 陀螺仪流程（V2.2）：按配置命令采样两次，数值有变化即 PASS
-/// （验证芯片上电、注册、出数）。固件日后提供 camera-factory 命令后改 cmd 即可。
-fn gyro_flow(tx: &Sender<UiEvent>, gyro: &GyroCfg) -> RunOutcome {
-    let mut r = TestResult::new(TestItem::Gyro);
-    let _ = tx.send(UiEvent::Log(format!("陀螺仪采样: {}", gyro.cmd)));
-    let a = adb::shell(&gyro.cmd);
-    thread::sleep(Duration::from_millis(gyro.interval_ms));
-    let b = adb::shell(&gyro.cmd);
-    match (a, b) {
-        (Ok(a), Ok(b)) => {
-            let (na, nb) = (number_tokens(&a), number_tokens(&b));
-            if na.is_empty() {
-                r.verdict = Verdict::Fail;
-                r.detail = "无数据输出（无陀螺仪或命令不适用）".into();
-            } else if na == nb {
-                r.verdict = Verdict::Fail;
-                r.detail = format!(
-                    "两次采样数值一致（芯片静止或未出数）: {}",
-                    clip(&runner::one_line(&a), 80)
-                );
-            } else {
-                r.verdict = Verdict::Pass;
-                r.detail = format!("两次采样数据有变化（{} 个数值）", na.len());
-            }
-        }
-        (Err(e), _) | (_, Err(e)) => {
-            r.verdict = Verdict::Fail;
-            r.detail = format!("{e:#}");
-        }
-    }
-    RunOutcome {
-        result: r,
-        device: None,
-    }
-}
-
-/// 提取文本中全部数值（排序后比较，陀螺仪采样对比用）。
-fn number_tokens(s: &str) -> Vec<f64> {
-    let mut v: Vec<f64> = s
-        .split(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-'))
-        .filter(|t| !t.is_empty())
-        .filter_map(|t| t.parse().ok())
-        .collect();
-    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    v
-}
-
 #[cfg(all(unix, test))] // 假 adb 桩 + ffmpeg 仅在 unix 测试构建可用
 mod tests {
     use super::*;
@@ -782,17 +868,18 @@ mod tests {
         }
         let report = handle.join().unwrap().expect("应产出报告路径");
 
-        assert_eq!(manual_asked, 1);
+        // 指示灯 + 拍照 + 录像 三次人工判定（V3.5：媒体项也人工确认）
+        assert_eq!(manual_asked, 3);
         assert_eq!(photo_ready, 1);
         assert_eq!(video_ready, 1);
-        // 自动项先行、人工项殿后
+        // 自动项先行、人工项殿后（人工组内保持传入顺序 Led→Photo→Video）
         assert_eq!(
             order,
             vec![
                 TestItem::DeviceInfo,
+                TestItem::Led,
                 TestItem::Photo,
-                TestItem::Video,
-                TestItem::Led
+                TestItem::Video
             ]
         );
         let get = |item: TestItem| {
@@ -804,8 +891,8 @@ mod tests {
         };
         assert_eq!(get(TestItem::DeviceInfo), Verdict::Pass);
         assert_eq!(get(TestItem::Led), Verdict::ManualYes);
-        assert_eq!(get(TestItem::Photo), Verdict::Pass);
-        assert_eq!(get(TestItem::Video), Verdict::Pass);
+        assert_eq!(get(TestItem::Photo), Verdict::ManualYes);
+        assert_eq!(get(TestItem::Video), Verdict::ManualYes);
 
         let text = std::fs::read_to_string(&report).unwrap();
         assert!(text.contains("结果: PASS"));
@@ -835,25 +922,25 @@ mod tests {
             )
         };
         let items = |i: TestItem| vec![i];
-        // 1) 输出全键码：自动收齐 PASS，全程无人工介入
+        // 1) 输出全部键码（V3.5 固件格式 key N）：自动收齐 PASS，全程无人工介入
         let (vs, n) = scenario(
             &kscript,
             items(TestItem::Keys),
             &media,
             &reports,
             Config::default(),
-            &keys_case("printf '5\\n6\\n4\\n'"),
+            &keys_case("printf 'key 4\\nkey 5\\nkey 6\\n'"),
             || unreachable!("全键码不应触发人工应答"),
         );
         assert_eq!((vs[0].1, n), (Verdict::Pass, 0));
-        // 2) 只回 5：未收齐 → 强制改判失败
+        // 2) 只回 key 5：未收齐 → 强制改判失败
         let (vs, n) = scenario(
             &kscript,
             items(TestItem::Keys),
             &media,
             &reports,
             Config::default(),
-            &keys_case("printf '5\\n'"),
+            &keys_case("printf 'key 5\\n'"),
             || Some(UiResponse::KeysForce(false)),
         );
         assert_eq!((vs[0].1, n), (Verdict::ManualNo, 1));
@@ -867,8 +954,8 @@ mod tests {
             Config::default(),
             &keys_case(
                 "n=$(cat \"$KEYS_CNT\" 2>/dev/null || echo 0); n=$((n+1)); \
-                 echo $n > \"$KEYS_CNT\"; [ \"$n\" -ge 2 ] && printf '5\\n6\\n4\\n' \
-                 || printf '5\\n'",
+                 echo $n > \"$KEYS_CNT\"; [ \"$n\" -ge 2 ] && printf 'key 4\\nkey 5\\nkey 6\\n' \
+                 || printf 'key 5\\n'",
             ),
             || Some(UiResponse::KeysRetry),
         );
@@ -881,7 +968,7 @@ mod tests {
             let lscript = base.join("adb-keys-live");
             std::fs::write(
                 &lscript,
-                keys_case("printf '5\\n'; sleep 1; printf '6\\n4\\n'"),
+                keys_case("printf 'key 5\\n'; sleep 1; printf 'key 6\\nkey 4\\n'"),
             )
             .unwrap();
             {
@@ -956,11 +1043,25 @@ mod tests {
         );
         assert_eq!((vs[0].1, n), (Verdict::Pass, 0));
 
-        // —— V2.2 陀螺仪 ——
+        // —— V3.5 麦克风主/副两段判定 ——
+        let (vs, n) = scenario(
+            &base.join("adb-mic"),
+            items(TestItem::MicSpeaker),
+            &media,
+            &reports,
+            Config::default(),
+            "#!/bin/sh\ncase \"$*\" in\n\
+             *\"camera-factory 13\"*) printf 'mic main\\n';;\n\
+             *\"camera-factory 14\"*) printf 'mic sub\\n';;\n\
+             *) printf 'ok\\n';;\nesac\n",
+            || Some(UiResponse::Manual(true)),
+        );
+        assert_eq!((vs[0].1, n), (Verdict::ManualYes, 0));
+
+        // —— V2.2 陀螺仪（V3.5 改 camera-factory 17，返回值判定）——
         let gscript = base.join("adb-gyro");
         let gitems = items(TestItem::Gyro);
-        // 两次采样数值变化 → PASS
-        std::env::set_var("GYRO_CNT", base.join("gcnt").display().to_string());
+        // 返回值无 FAIL → PASS
         let (vs, _) = scenario(
             &gscript,
             gitems.clone(),
@@ -968,13 +1069,12 @@ mod tests {
             &reports,
             Config::default(),
             "#!/bin/sh\ncase \"$*\" in\n\
-             *\"sensorservice\"*) n=$(cat \"$GYRO_CNT\" 2>/dev/null || echo 0); n=$((n+1)); \
-             echo $n > \"$GYRO_CNT\"; echo \"gyro: $n.$n $n.$n $n.$n\";;\n\
+             *\"camera-factory 17\"*) printf 'gyro ok\\n';;\n\
              *) printf 'ok\\n';;\nesac\n",
             || unreachable!(),
         );
         assert_eq!(vs[0].1, Verdict::Pass);
-        // 数值恒定 → FAIL
+        // 返回值含 FAIL → FAIL
         let (vs, _) = scenario(
             &gscript,
             gitems,
@@ -982,12 +1082,11 @@ mod tests {
             &reports,
             Config::default(),
             "#!/bin/sh\ncase \"$*\" in\n\
-             *\"sensorservice\"*) printf 'gyro: 1.0 2.0 3.0\\n';;\n\
+             *\"camera-factory 17\"*) printf 'gyro FAIL\\n';;\n\
              *) printf 'ok\\n';;\nesac\n",
             || unreachable!(),
         );
         assert_eq!(vs[0].1, Verdict::Fail);
-        std::env::remove_var("GYRO_CNT");
 
         // —— V2.3 超时 ——
         let tcfg = Config {
@@ -1016,7 +1115,7 @@ mod tests {
             &media,
             &reports,
             tcfg.clone(),
-            &keys_case("printf '5\\n'"),
+            &keys_case("printf 'key 5\\n'"),
             || None,
         );
         assert_eq!((vs[0].1, n), (Verdict::ManualNo, 1));
@@ -1088,8 +1187,8 @@ mod tests {
     }
 
     /// 场景驱动：写入完整假 adb 脚本后跑 `items` 序列；
-    /// 每次收到 awaiting 应答请求时调 `respond`（返回 None = 不应答，模拟无人操作）。
-    /// 返回 (逐项判定, awaiting 次数)。
+    /// 收到人工应答请求（Manual / 按键 awaiting）时调 `respond`
+    /// （返回 None = 不应答，模拟无人操作）。返回 (逐项判定, awaiting 次数)。
     fn scenario(
         script: &Path,
         items: Vec<TestItem>,
@@ -1116,6 +1215,11 @@ mod tests {
             match ev {
                 UiEvent::KeysUpdate { awaiting: true, .. } => {
                     awaiting += 1;
+                    if let Some(resp) = respond() {
+                        mtx.send(resp).unwrap();
+                    }
+                }
+                UiEvent::Manual { .. } => {
                     if let Some(resp) = respond() {
                         mtx.send(resp).unwrap();
                     }

@@ -288,18 +288,21 @@ impl E02App {
                 if r.item == TestItem::Keys {
                     self.keys_prompt = None; // 结果已定，弹窗收起（兜底）
                 }
-                if matches!(r.item, TestItem::Led | TestItem::MicSpeaker) {
+                if matches!(
+                    r.item,
+                    TestItem::Led | TestItem::MicSpeaker | TestItem::Video | TestItem::Photo
+                ) {
                     self.manual = None; // 已答/超时，弹窗收起（兜底）
                 }
                 if let Some(slot) = self.results.iter_mut().find(|s| s.item == r.item) {
                     *slot = r;
                 }
             }
-            UiEvent::Manual { item, question } => {
+            UiEvent::Manual { title, question } => {
                 if let Some(reply) = self.manual_tx.clone() {
                     attention(ctx); // 及时弹窗（V3）：任务栏闪烁提醒操作员
                     self.manual = Some(ManualAsk {
-                        title: item.label().to_string(),
+                        title,
                         question,
                         deadline: self.manual_deadline(),
                         reply,
@@ -310,16 +313,16 @@ impl E02App {
                 if let Some(reply) = self.manual_tx.clone() {
                     if awaiting {
                         attention(ctx);
-                        self.keys_prompt = Some(KeysPrompt {
-                            detected,
-                            awaiting: true,
-                            deadline: self.manual_deadline(),
-                            reply,
-                        });
-                    } else {
-                        // 收齐自动通过：弹窗即收
-                        self.keys_prompt = None;
                     }
+                    // 任何状态都开窗/更新（V3.5 修复：此前仅 awaiting 开窗，
+                    // 检测阶段无事件可发时操作员全程看不到弹窗）。
+                    // 收窗由 Result/Finished/停止时兜底。
+                    self.keys_prompt = Some(KeysPrompt {
+                        detected,
+                        awaiting,
+                        deadline: self.manual_deadline(),
+                        reply,
+                    });
                 }
             }
             UiEvent::PhotoReady(path) => match load_texture(ctx, &path) {

@@ -1,4 +1,4 @@
-//! 设置窗口（V2.2）：工位档案切换、测试项勾选、WiFi 深度、按键与陀螺仪参数。
+//! 设置窗口（V2.2）：工位档案切换、测试项勾选、WiFi 深度、按键参数、超时。
 //! 改动即时生效（每次测试线程取当前配置快照）；"保存"写回 exe 同目录 config.toml。
 
 use crate::app::E02App;
@@ -103,24 +103,7 @@ pub fn show(ctx: &egui::Context, app: &mut E02App) {
                     }
                 }
             });
-            ui.checkbox(
-                &mut app.config.keys.strict,
-                "严格解析（只认独立数字行，防版本号误判）",
-            );
-
-            ui.separator();
-            ui.strong("陀螺仪");
-            ui.horizontal(|ui| {
-                ui.label("命令");
-                ui.add(
-                    egui::TextEdit::singleline(&mut app.config.gyro.cmd)
-                        .desired_width(f32::INFINITY),
-                );
-            });
-            ui.horizontal(|ui| {
-                ui.label("采样间隔 ms");
-                ui.add(egui::DragValue::new(&mut app.config.gyro.interval_ms).range(100..=5000));
-            });
+            ui.small("固件回读格式 key 4/5/6（多功能键/开机键/音量+）");
 
             ui.separator();
             ui.strong("超时");

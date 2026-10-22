@@ -68,57 +68,19 @@ impl Default for WifiCfg {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct KeysCfg {
-    /// 必测键码：4=多功能 5=开机 6=音量
+    /// 必测键码：4=多功能键 5=开机键 6=音量+
     #[serde(default = "d_keys_required")]
     pub required: Vec<u8>,
-    /// 严格解析：只认独立数字行（防版本号/电压假阳性）
-    #[serde(default)]
-    pub strict: bool,
-    /// 提示窗口时长参考值（实际监听窗口由固件命令决定）
-    #[serde(default = "d_listen_secs")]
-    pub listen_secs: u32,
 }
 
 fn d_keys_required() -> Vec<u8> {
     vec![4, 5, 6]
-}
-fn d_listen_secs() -> u32 {
-    10
 }
 
 impl Default for KeysCfg {
     fn default() -> Self {
         Self {
             required: d_keys_required(),
-            strict: false,
-            listen_secs: d_listen_secs(),
-        }
-    }
-}
-
-/// 陀螺仪：固件暂无 camera-factory 命令，用 shell 命令采样对比。
-/// 固件日后支持后改 `cmd` 即可，程序不用重发版。
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct GyroCfg {
-    #[serde(default = "d_gyro_cmd")]
-    pub cmd: String,
-    /// 两次采样间隔（毫秒）
-    #[serde(default = "d_gyro_interval")]
-    pub interval_ms: u64,
-}
-
-fn d_gyro_cmd() -> String {
-    "dumpsys sensorservice | grep -i -A 3 'gyroscope'".into()
-}
-fn d_gyro_interval() -> u64 {
-    500
-}
-
-impl Default for GyroCfg {
-    fn default() -> Self {
-        Self {
-            cmd: d_gyro_cmd(),
-            interval_ms: d_gyro_interval(),
         }
     }
 }
@@ -167,8 +129,6 @@ pub struct Config {
     pub wifi: WifiCfg,
     #[serde(default)]
     pub keys: KeysCfg,
-    #[serde(default)]
-    pub gyro: GyroCfg,
     /// 超时（V2.3）
     #[serde(default)]
     pub timeouts: TimeoutsCfg,
@@ -205,7 +165,6 @@ impl Default for Config {
             profiles: d_profiles(),
             wifi: WifiCfg::default(),
             keys: KeysCfg::default(),
-            gyro: GyroCfg::default(),
             timeouts: TimeoutsCfg::default(),
         }
     }
@@ -273,9 +232,9 @@ mod tests {
         assert_eq!(cfg.active_items().len(), TestItem::ALL.len());
         let mut module = Config::builtin();
         module.station = "module".into();
-        // 模组工位无充电/电池/按键/MIC/录像/陀螺仪
+        // 模组工位无电池/按键/MIC/录像/陀螺仪
         let items = module.active_items();
-        assert!(!items.contains(&TestItem::Charger));
+        assert!(!items.contains(&TestItem::Battery));
         assert!(!items.contains(&TestItem::Keys));
         assert!(items.contains(&TestItem::Wifi));
     }

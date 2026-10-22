@@ -83,5 +83,10 @@ pub fn show(ctx: &egui::Context, app: &mut E02App) {
             } else {
                 ui.label(egui::RichText::new("检测中...").small().color(theme::MUTED));
             }
+            ui.add_space(6.0);
+            // 弹窗内直达停止（V3.5：真机反馈监听阶段无法从顶栏停止测试）
+            if ui.add(theme::danger("停止测试")).clicked() {
+                app.request_stop();
+            }
         });
 }

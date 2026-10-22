@@ -229,3 +229,23 @@ frame 会撑满剩余可用高度**（`Layout::next_frame_ignore_wrap`：`is_hor
 排查教训：反馈截图（6.png）实为**重建前旧进程**所截（单列旧布局）——
 改完 UI 收到"还是老样子"反馈时，先确认对方运行的是不是重建后的二进制，
 再怀疑代码；像素核对用扫描线/低阈值细采，粗步长采样会漏行误判"空白"。
+
+## V3.5（第五轮真机反馈：8 项产线指令调整，2026-10-22）
+
+反馈逐条与落实：
+
+| # | 反馈 | 落实 |
+|---|---|---|
+| 1 | 录像：读设备返回值判成败，成功拉回播放，人工判清晰/条纹/声音 | `video_flow` 三段式：`camera-factory 1` 输出含 FAIL 即判失败不拉回 → ffmpeg 解码抽帧 + 音频流探测（无音频时操作员靠听）→ 媒体区回放 2.5s 后弹窗人工判定 |
+| 2 | 拍照也要人工判 pass/fail | `photo_flow` 同构：返回值判定 → 拉图 `PhotoReady` → 弹窗"图像是否清晰、色彩正常"人工判定 |
+| 3 | 去充电，电池测电流电压并显示；目前失败 | `TestItem::Charger` 与 `camera-factory 11` 下线；`parse_battery` 收集输出中 voltage/current/电压/电流行拼串展示（行存在即通过，旧 `Battery voltage:` 前缀同样命中） |
+| 4 | 陀螺仪是 17 | `CameraFactory::Gyro = 17`，输出含 FAIL 判失败（走 runner 自动项） |
+| 5 | 指示灯不用指令，纯弹窗确认 | `dialog_flow`：不发 adb，直接弹窗"指示灯显示是否正常" |
+| 6 | 13 主麦 / 14 副麦，弹窗注明 | `mic_flow` 两段：先弹"主麦判定"再执行 13、先弹"副麦判定"再执行 14，听回放各自判定，两段全合格才 PASS（detail 注明主麦/副麦各自结论） |
+| 7 | 按键无弹窗无响应；key 4/5/6=多功能键/开机键/音量+；停止不了 | 双缺陷：worker 在首个按键事件前不发任何 UI 事件（弹窗开不出来）+ app 只在 awaiting 时开弹窗。修复：进 `keys_flow` 先发 `KeysUpdate{detected:[],awaiting:false}` 再跑 adb，app 收到任何 KeysUpdate 即开弹窗；解析改 `key N` 词匹配（`key 45`/`keyboard 4` 不误判）；弹窗内加"停止测试"直达按钮（顶栏停止在监听阶段不可达） |
+| 8 | 测前同步时间：adb shell date -s "YYYY-MM-DD HH:MM" 后跑 19 | `sync_time`：序列启动即取宿主机 `chrono::Local::now()` 格式化，`adb shell date -s "..."` + `camera-factory 19`；失败仅记日志不阻断（继续测试） |
+
+清理：返回值判定统一 `protocol::output_ok`（含 FAIL 即失败，原 wifi_ok 更名）；
+`TestItem::factory_cmd`、`UiEvent::Manual.item`、`CameraFactory::Led` 随重构失去
+调用方一并删除（CameraFactory 枚举注释保留 9/11 号位的去向记录）。
+按键严格模式与陀螺仪数值解析（旧固件格式）一并下线，解析只剩 `key N` 一种。
