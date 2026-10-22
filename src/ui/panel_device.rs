@@ -85,7 +85,9 @@ fn result_card(ui: &mut egui::Ui, app: &E02App) {
         });
 }
 
-/// 当日统计 2×2 看板卡（内容卡 CARD 底）：已测/合格率/合格/不合格。
+/// 当日统计 2×2 看板：四块等宽内容卡（CARD 底 + 8px 圆角，色块表抬升）。
+/// 不用 Grid：格子宽度随内容收缩，会把两列挤到左侧、卡右大片留白；
+/// 显式按半宽分配瓦片，值/标签横向居中。
 fn stats_card(ui: &mut egui::Ui, t: &crate::report::DayStats) {
     let pass_color = if t.pass > 0 {
         theme::OK_STRONG
@@ -98,30 +100,33 @@ fn stats_card(ui: &mut egui::Ui, t: &crate::report::DayStats) {
         Some(pct) => (format!("{pct}%"), theme::WARN),
         None => ("-".to_string(), theme::MUTED),
     };
-    egui::Frame::default()
-        .fill(theme::CARD)
-        .rounding(egui::Rounding::same(12.0))
-        .inner_margin(egui::Margin::same(12.0))
-        .show(ui, |ui| {
-            ui.set_min_width(ui.available_width());
-            egui::Grid::new("today_stats")
-                .num_columns(2)
-                .spacing([8.0, 12.0])
-                .show(ui, |ui| {
-                    stat_cell(ui, &format!("{} 台", t.total), "已测", theme::INK);
-                    stat_cell(ui, &rate, "合格率", rate_color);
-                    ui.end_row(); // 两格一行；end_row 只在行尾调，格内调会把网格压成单列
-                    stat_cell(ui, &t.pass.to_string(), "合格", pass_color);
-                    stat_cell(ui, &t.fail.to_string(), "不合格", fail_color);
-                });
-        });
+    // 两列等宽：预取半宽再下发给瓦片（留 2px 余量防 horizontal 溢出换行）
+    let w = (ui.available_width() - 10.0) / 2.0;
+    ui.horizontal(|ui| {
+        stat_tile(ui, w, &format!("{} 台", t.total), "已测", theme::INK);
+        stat_tile(ui, w, &rate, "合格率", rate_color);
+    });
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        stat_tile(ui, w, &t.pass.to_string(), "合格", pass_color);
+        stat_tile(ui, w, &t.fail.to_string(), "不合格", fail_color);
+    });
 }
 
-fn stat_cell(ui: &mut egui::Ui, value: &str, label: &str, color: Color32) {
-    ui.vertical(|ui| {
-        ui.label(egui::RichText::new(value).strong().size(17.0).color(color));
-        ui.label(egui::RichText::new(label).small().color(theme::MUTED));
-    });
+/// 等宽统计瓦片：set_width 钉死内容宽（min+max），Center 居中才有界可依。
+fn stat_tile(ui: &mut egui::Ui, width: f32, value: &str, label: &str, color: Color32) {
+    egui::Frame::default()
+        .fill(theme::CARD)
+        .rounding(egui::Rounding::same(8.0))
+        .inner_margin(egui::Margin::symmetric(10.0, 9.0))
+        .show(ui, |ui| {
+            ui.set_width(width - 20.0); // 减左右内边距，瓦片总宽=width
+            ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
+                ui.label(egui::RichText::new(value).strong().size(17.0).color(color));
+                ui.add_space(2.0);
+                ui.label(egui::RichText::new(label).small().color(theme::MUTED));
+            });
+        });
 }
 
 /// 一行字段：左侧灰色小标签，右侧等宽值（原程序只读 Edit 的等价物，

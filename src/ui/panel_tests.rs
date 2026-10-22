@@ -64,6 +64,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut E02App) {
         .max_height(max_h)
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 4.0; // 行距压紧：12 项一屏放下（1280×837）
             section(ui, "自动测试");
             for &(item, verdict, enabled, running) in &autos {
                 row(ui, app, item, verdict, enabled, running);
@@ -87,7 +88,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut E02App) {
 }
 
 fn section(ui: &mut egui::Ui, text: &str) {
-    ui.add_space(8.0);
+    ui.add_space(6.0);
     ui.label(
         egui::RichText::new(text)
             .small()
@@ -128,7 +129,7 @@ fn row(
             Color32::TRANSPARENT
         })
         .rounding(Rounding::same(8.0))
-        .inner_margin(egui::Margin::symmetric(8.0, 5.0))
+        .inner_margin(egui::Margin::symmetric(8.0, 4.0))
         .stroke(Stroke::NONE)
         .show(ui, |ui| {
             ui.horizontal(|ui| {

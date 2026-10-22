@@ -512,7 +512,7 @@ impl eframe::App for E02App {
             });
         // 深底日志面板贴底（状态并入日志标题行，去掉独立状态条）
         egui::TopBottomPanel::bottom("log_panel")
-            .default_height(150.0)
+            .default_height(140.0)
             .resizable(true)
             .frame(
                 egui::Frame::default()
@@ -524,7 +524,7 @@ impl eframe::App for E02App {
             .resizable(false)
             // 固定宽度：PanelState 会跨帧/跨次启动记忆面板实际宽度，
             // 内容一旦收缩会被"锁"在窄宽度上，钉死免受污染
-            .exact_width(236.0)
+            .exact_width(240.0)
             .frame(
                 egui::Frame::default()
                     .fill(ui::theme::CANVAS)
@@ -533,7 +533,7 @@ impl eframe::App for E02App {
             .show(ctx, |ui| ui::panel_tests::show(ui, self));
         egui::SidePanel::right("device_panel")
             .resizable(false)
-            .exact_width(320.0)
+            .exact_width(300.0)
             .frame(
                 egui::Frame::default()
                     .fill(ui::theme::CANVAS)
