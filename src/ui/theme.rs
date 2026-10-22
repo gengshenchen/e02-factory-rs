@@ -168,19 +168,19 @@ pub fn danger(text: &str) -> egui::Button<'static> {
     .stroke(Stroke::NONE)
 }
 
-/// 今日看板徽章组（顶栏与报告中心共用）。
+/// 今日看板徽章组（报告中心头部用；主界面看板在右面板 stats_card）。
 pub fn today_badges(ui: &mut egui::Ui, t: &DayStats) {
-    badge(ui, &format!("今日 {} 台", t.total), INK, CARD);
+    badge(ui, &format!("已测 {} 台", t.total), INK, CARD);
     let (pf, pb) = if t.pass > 0 {
         (OK_STRONG, OK_BG)
     } else {
         (MUTED, SOFT)
     };
-    badge(ui, &format!("PASS {}", t.pass), pf, pb);
+    badge(ui, &format!("合格 {}", t.pass), pf, pb);
     let (ff, fb) = if t.fail > 0 {
         (BAD, BAD_BG)
     } else {
         (MUTED, SOFT)
     };
-    badge(ui, &format!("FAIL {}", t.fail), ff, fb);
+    badge(ui, &format!("不合格 {}", t.fail), ff, fb);
 }

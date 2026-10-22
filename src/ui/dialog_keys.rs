@@ -49,7 +49,7 @@ pub fn show(ctx: &egui::Context, app: &mut E02App) {
                 if let Some(dl) = deadline {
                     let left = dl.saturating_duration_since(Instant::now()).as_secs();
                     let countdown =
-                        egui::RichText::new(format!("{left} 秒未应答将自动判定为失败")).small();
+                        egui::RichText::new(format!("{left} 秒未应答将自动判定为不合格")).small();
                     let countdown = if left <= 10 {
                         countdown.strong()
                     } else {
@@ -69,12 +69,12 @@ pub fn show(ctx: &egui::Context, app: &mut E02App) {
                             p.retry();
                         }
                     }
-                    if ui.button("强制通过").clicked() {
+                    if ui.button("强制合格").clicked() {
                         if let Some(p) = app.keys_prompt.take() {
                             p.force(true);
                         }
                     }
-                    if ui.add(theme::danger("判定失败")).clicked() {
+                    if ui.add(theme::danger("判定不合格")).clicked() {
                         if let Some(p) = app.keys_prompt.take() {
                             p.force(false);
                         }

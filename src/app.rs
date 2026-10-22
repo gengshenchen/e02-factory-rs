@@ -98,7 +98,7 @@ pub struct E02App {
     /// 过程日志（尾部若干条）
     pub log: VecDeque<String>,
     /// 序列进度；空闲时 None
-    progress: Option<Progress>,
+    pub(crate) progress: Option<Progress>,
     /// 按键引导弹窗；无按键测试进行时 None
     pub keys_prompt: Option<KeysPrompt>,
     /// 工位配置（V2.2）
@@ -170,7 +170,7 @@ impl E02App {
         app
     }
 
-    /// 一键全测项集：当前工位启用项，按原程序批次顺序执行。
+    /// 开始测试项集：当前工位启用项，按原程序批次顺序执行。
     pub fn batch_items(&self) -> Vec<TestItem> {
         let active = self.config.active_items();
         worker::BATCH_ORDER
@@ -473,17 +473,12 @@ impl eframe::App for E02App {
                             .small()
                             .color(ui::theme::MUTED),
                     );
-                    // 今日看板（V3 报告中心）
-                    if let Some(t) = &self.today {
-                        ui.add_space(6.0);
-                        ui::theme::today_badges(ui, t);
-                    }
                     if self.busy {
                         if let Some(p) = &self.progress {
                             let frac = p.done as f32 / p.total.max(1) as f32;
                             let elapsed = p.started.elapsed();
                             let text = format!(
-                                "{}/{}（{}）{:02}:{:02}",
+                                "测试中 {}/{} {} {:02}:{:02}",
                                 p.done,
                                 p.total,
                                 self.current
@@ -505,7 +500,7 @@ impl eframe::App for E02App {
                         if self.busy && ui.add(ui::theme::danger("停止测试")).clicked() {
                             self.request_stop();
                         }
-                        if ui.button("查看报告").clicked() {
+                        if ui.button("报告中心").clicked() {
                             self.refresh_reports();
                             self.report_open = true;
                         }

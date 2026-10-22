@@ -1,13 +1,17 @@
-//! 左侧测试面板（V3.2 重排）：主按钮一键全测 + 自动/人工分组。
+//! 左侧测试面板（V3.4）：开始测试主按钮 + 自动/人工分组清单。
 //!
 //! 行即按钮：整行可点，圆点表状态，进行中行奶油底+珊瑚强调，未启用项置灰。
+//! 矮窗口下清单区可滚动（按钮与标题钉在滚动区外），底部显示启用计数。
+//!
+//! 坑（V3.3.1 教训）：水平布局 + 垂直 Center 对齐会把子项撑满剩余高度；
+//! 侧面板/ScrollArea 内容高度无界，行内一律 Align::Min。
 
 use crate::app::E02App;
 use crate::engine::{TestItem, Verdict};
 use crate::ui::theme;
 use egui::{Color32, Rounding, Sense, Stroke};
 
-/// 判定语义色（绿通过 / 红失败 / 灰未测；绿取深档保小字对比度）。
+/// 判定语义色（绿合格 / 红不合格 / 灰待测；绿取深档保小字对比度）。
 pub fn verdict_color(verdict: Verdict) -> Color32 {
     match verdict {
         Verdict::Pending | Verdict::Skipped => theme::MUTED,
@@ -26,11 +30,11 @@ pub fn show(ui: &mut egui::Ui, app: &mut E02App) {
     );
     ui.add_space(8.0);
 
-    let run = theme::primary("一键全测").min_size(egui::vec2(ui.available_width(), 44.0));
+    let run = theme::primary("开始测试").min_size(egui::vec2(ui.available_width(), 44.0));
     if ui
         .add_enabled(!app.busy, run)
         .on_hover_text("按工位配置执行全部启用项（自动项先行）")
-        .on_disabled_hover_text("测试进行中，可点右上角停止")
+        .on_disabled_hover_text("测试进行中，可点右上角停止测试")
         .clicked()
     {
         app.start_run(app.batch_items());
@@ -52,25 +56,45 @@ pub fn show(ui: &mut egui::Ui, app: &mut E02App) {
         .collect();
     let (autos, manuals): (Vec<_>, Vec<_>) = rows.iter().partition(|(i, ..)| !i.is_manual());
 
-    section(ui, "自动测试");
-    for &(item, verdict, enabled, running) in &autos {
-        row(ui, app, item, verdict, enabled, running);
-    }
-    section(ui, "人工测试");
-    for &(item, verdict, enabled, running) in &manuals {
-        row(ui, app, item, verdict, enabled, running);
-    }
+    // 清单区滚动：高度封顶到面板可视底（面板内容高度无界，需显式限制，
+    // 否则 ScrollArea 长到内容高度，超出部分照旧被裁）。底部留启用计数行。
+    let max_h = (ui.clip_rect().bottom() - ui.cursor().min.y - 30.0).max(100.0);
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .max_height(max_h)
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            section(ui, "自动测试");
+            for &(item, verdict, enabled, running) in &autos {
+                row(ui, app, item, verdict, enabled, running);
+            }
+            section(ui, "人工测试");
+            for &(item, verdict, enabled, running) in &manuals {
+                row(ui, app, item, verdict, enabled, running);
+            }
+        });
+
+    ui.add_space(4.0);
+    ui.label(
+        egui::RichText::new(format!(
+            "共 {} 项，已启用 {}",
+            TestItem::ALL.len(),
+            active.len()
+        ))
+        .small()
+        .color(theme::MUTED),
+    );
 }
 
 fn section(ui: &mut egui::Ui, text: &str) {
-    ui.add_space(12.0);
+    ui.add_space(8.0);
     ui.label(
         egui::RichText::new(text)
             .small()
             .strong()
             .color(theme::MUTED),
     );
-    ui.add_space(4.0);
+    ui.add_space(3.0);
 }
 
 /// 单项一行：圆点 + 名称 + 右侧状态字；整行点击触发单项重测。
@@ -91,11 +115,11 @@ fn row(
         (verdict_color(verdict), theme::INK, false)
     };
     let (status_text, status_color) = if !enabled {
-        ("未启用".to_string(), theme::MUTED)
+        ("未启用", theme::MUTED)
     } else if running {
-        ("进行中".to_string(), theme::PRIMARY_ACTIVE)
+        ("进行中", theme::PRIMARY_ACTIVE)
     } else {
-        (verdict.label().to_string(), verdict_color(verdict))
+        (verdict.ui_label(), verdict_color(verdict))
     };
     let resp = egui::Frame::default()
         .fill(if running {
@@ -104,12 +128,9 @@ fn row(
             Color32::TRANSPARENT
         })
         .rounding(Rounding::same(8.0))
-        .inner_margin(egui::Margin::symmetric(8.0, 7.0))
+        .inner_margin(egui::Margin::symmetric(8.0, 5.0))
         .stroke(Stroke::NONE)
         .show(ui, |ui| {
-            // 坑：水平布局 + 垂直 Center（horizontal_centered / right_to_left(Center)）
-            // 会把每个子项的 frame 撑满剩余可用高度——侧面板高度无界，第一行
-            // 就会吞掉整栏。单行布局用 Align::Min（视觉无差），圆点靠自身行高居中。
             ui.horizontal(|ui| {
                 theme::dot(ui, dot_color);
                 ui.add_space(7.0);

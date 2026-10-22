@@ -29,12 +29,22 @@ impl Verdict {
         matches!(self, Verdict::Pass | Verdict::ManualYes)
     }
 
-    /// 结果文字（绿/红显示，对应原程序 Printtestinfo）。
+    /// 报告用语（存档件沿用 PASS/FAIL，与统计解析和历史报告兼容）。
     pub fn label(self) -> &'static str {
         match self {
             Verdict::Pending => "未测",
             Verdict::Pass | Verdict::ManualYes => "PASS",
             Verdict::Fail | Verdict::ManualNo => "FAIL",
+            Verdict::Skipped => "跳过",
+        }
+    }
+
+    /// 界面用语（检验规范：合格/不合格）。
+    pub fn ui_label(self) -> &'static str {
+        match self {
+            Verdict::Pending => "待测",
+            Verdict::Pass | Verdict::ManualYes => "合格",
+            Verdict::Fail | Verdict::ManualNo => "不合格",
             Verdict::Skipped => "跳过",
         }
     }

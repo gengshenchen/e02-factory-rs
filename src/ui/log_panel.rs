@@ -25,7 +25,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut E02App) {
             ui.spinner();
             ui.label(
                 egui::RichText::new(format!(
-                    "正在测试：{}",
+                    "测试中：{}",
                     app.current.map(|i| i.label()).unwrap_or_default()
                 ))
                 .color(theme::TEAL),

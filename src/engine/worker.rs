@@ -490,7 +490,7 @@ fn keys_flow(
                     }
                     Ok(UiResponse::KeysForce(true)) => {
                         r.verdict = Verdict::ManualYes;
-                        r.detail = format!("人工强制通过（缺 {}）", missing.join("、"));
+                        r.detail = format!("强制判定合格（缺 {}）", missing.join("、"));
                         break;
                     }
                     Ok(UiResponse::KeysForce(false)) | Ok(UiResponse::Manual(false)) => {
@@ -542,7 +542,7 @@ fn keys_flow(
                         }
                         Ok(UiResponse::KeysForce(true)) => {
                             r.verdict = Verdict::ManualYes;
-                            r.detail = "人工强制通过（监听超时无输出）".into();
+                            r.detail = "强制判定合格（监听超时无输出）".into();
                             break;
                         }
                         Ok(_) => {
