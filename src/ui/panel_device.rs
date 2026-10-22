@@ -110,6 +110,7 @@ fn stats_card(ui: &mut egui::Ui, t: &crate::report::DayStats) {
                 .show(ui, |ui| {
                     stat_cell(ui, &format!("{} 台", t.total), "已测", theme::INK);
                     stat_cell(ui, &rate, "合格率", rate_color);
+                    ui.end_row(); // 两格一行；end_row 只在行尾调，格内调会把网格压成单列
                     stat_cell(ui, &t.pass.to_string(), "合格", pass_color);
                     stat_cell(ui, &t.fail.to_string(), "不合格", fail_color);
                 });
@@ -121,7 +122,6 @@ fn stat_cell(ui: &mut egui::Ui, value: &str, label: &str, color: Color32) {
         ui.label(egui::RichText::new(value).strong().size(17.0).color(color));
         ui.label(egui::RichText::new(label).small().color(theme::MUTED));
     });
-    ui.end_row();
 }
 
 /// 一行字段：左侧灰色小标签，右侧等宽值（原程序只读 Edit 的等价物，
