@@ -24,6 +24,14 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      # rodio/cpal 需要 ALSA 开发头（同 ci.yml；本工作流首次在 Linux 跑，
+      # v0.3.0 首次发布因缺它构建失败）
+      - name: 安装 ALSA 开发头（Linux）
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev pkg-config
+
       - uses: Swatinem/rust-cache@v2
 
       - name: Release 构建
@@ -70,10 +78,24 @@ jobs:
 
       - name: 构建 MSI 安装包
         if: runner.os == 'Windows'
+        shell: pwsh
         run: |
-          cargo install cargo-wix --locked
-          cargo wix
+          cargo install cargo-wix --locked *>&1 | Tee-Object -FilePath wix-build.log
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          cargo wix *>&1 | Tee-Object -FilePath wix-build.log -Append
+          if ($LASTEXITCODE -ne 0) { exit 1 }
           Get-ChildItem target/wix/*.msi | Move-Item -Destination dist/
+
+      # MSI 首次构建未验证过；失败时把日志尾部写进 job summary（公开可读，
+      # 无需仓库权限即可定位）
+      - name: MSI 失败诊断
+        if: failure() && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          "# cargo-wix 日志（末 120 行）" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          if (Test-Path wix-build.log) {
+            Get-Content wix-build.log -Tail 120 | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          }
 
       - uses: actions/upload-artifact@v4
         with:
