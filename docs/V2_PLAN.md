@@ -506,5 +506,7 @@ PC 侧分发已落地：ESnet 源码不支持 mingw 交叉编译（sys/socket.h 
 runner 回环冒烟，JSON 字段与上位机解析器对齐）自动提交 tools/ 进仓库；
 release.yml 取用进 zip/MSI；MSI 安装期 netsh 加防火墙入站规则（immediate
 CA，perMachine 全程提权；卸载删同名规则），zip 用户按 README 手工加。
-待办：tools-build 跑绿+二进制入库 → v0.4.0-test 临时 tag 验证带 iperf3 的
-MSI → 固件侧 iperf3 版本确认、真机 → v0.4.0。
+待办：**v0.4.0-test1 临时 tag 已全链验证通过**（2026-10-23：zip/MSI 均含
+iperf3+cygwin1.dll，MSI 防火墙 CA 过 ICE 校验，windows artifact 238.9MB；
+tag 已清理）→ 剩固件侧 iperf3 版本确认、真机验证（含 MSI 安装后防火墙
+规则实际生效）→ v0.4.0。
