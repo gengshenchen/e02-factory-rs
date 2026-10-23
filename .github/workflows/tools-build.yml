@@ -44,9 +44,28 @@ jobs:
       - name: 交叉编译（静态，无 OpenSSL）
         run: |
           cd "iperf-${IPERF3_VERSION}"
-          ./configure --host=x86_64-w64-mingw32 --without-openssl --enable-static-bin
-          make -j"$(nproc)"
-          file src/iperf3.exe
+          ./configure --host=x86_64-w64-mingw32 --without-openssl --enable-static-bin \
+            > ../configure.log 2>&1 || { echo "configure 失败"; exit 1; }
+          make -j"$(nproc)" > ../make.log 2>&1 || { echo "make 失败"; exit 1; }
+          ls -l src/iperf3.exe
+          # 静态验证：导入表不应出现 mingw 运行库 DLL（objdump 随交叉 binutils 装好，
+          # 不依赖宿主 file 命令）
+          x86_64-w64-mingw32-objdump -p src/iperf3.exe | sed -n '/DLL Name/p'
+
+      # 匿名可读的失败通道（同 release.yml MSI 的做法）：错误行转 ::error 注解
+      # （check-runs annotations API 公开），日志尾部进 job summary（网页可读）
+      - name: 编译失败诊断
+        if: failure()
+        run: |
+          {
+            echo '### configure.log（末 40 行）'
+            tail -40 configure.log 2>/dev/null
+            echo '### make.log（末 40 行）'
+            tail -40 make.log 2>/dev/null
+          } >> "$GITHUB_STEP_SUMMARY"
+          grep -hiE 'error|cannot find|undefined|No such file|not found' configure.log make.log 2>/dev/null |
+            head -15 | while IFS= read -r l; do printf '::error title=tools-build::%s\n' "${l%%$'\r'}"; done
+          true
 
       - uses: actions/upload-artifact@v4
         with:
