@@ -4,7 +4,8 @@
 //! 布局语言（awesome-design-md design-md/claude）：分区一律内容卡
 //! （CARD 色块、12px 圆角、color-block first），卡内输入件回退画布底
 //! 加发丝描边（canvas-on-card），工位/深度用分段选项卡（category-tab），
-//! 按键与超时两列并排。任何改动即时写回 exe 同目录 config.toml。
+//! 按键与超时各占一卡纵排（V3.10.2，真机反馈两列不直观）。任何改动即时写回
+//! exe 同目录 config.toml。
 
 use crate::app::E02App;
 use crate::config::{self, WifiDepth};
@@ -188,73 +189,58 @@ pub fn show(ctx: &egui::Context, app: &mut E02App) {
 
                     ui.add_space(12.0);
 
-                    // —— 按键测试 ｜ 超时（两列并排）——
-                    ui.horizontal_top(|ui| {
-                        let gap = 12.0;
-                        let w = (ui.available_width() - gap) / 2.0;
-                        ui.vertical(|ui| {
-                            ui.set_max_width(w); // 限列宽（min 只抬不限，会吃满剩余宽）
-                            theme::card().show(ui, |ui| {
-                                card_begin(ui);
-                                card_head(ui, "按键测试", None);
-                                ui.add_space(4.0);
-                                ui.horizontal_wrapped(|ui| {
-                                    for code in [4u8, 5, 6] {
-                                        let mut on = app.config.keys.required.contains(&code);
-                                        if ui.checkbox(&mut on, key_name(code)).changed() {
-                                            if on {
-                                                if !app.config.keys.required.contains(&code) {
-                                                    app.config.keys.required.push(code);
-                                                }
-                                            } else {
-                                                app.config.keys.required.retain(|c| *c != code);
-                                            }
-                                            changed = true;
+                    // —— 按键测试 ——
+                    theme::card().show(ui, |ui| {
+                        card_begin(ui);
+                        card_head(ui, "按键测试", None);
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            for code in [4u8, 5, 6] {
+                                let mut on = app.config.keys.required.contains(&code);
+                                if ui.checkbox(&mut on, key_name(code)).changed() {
+                                    if on {
+                                        if !app.config.keys.required.contains(&code) {
+                                            app.config.keys.required.push(code);
                                         }
+                                    } else {
+                                        app.config.keys.required.retain(|c| *c != code);
                                     }
-                                });
-                                ui.add_space(4.0);
-                                caption(ui, "固件回读格式 key 4/5/6，收齐必测键自动通过");
-                            });
+                                    changed = true;
+                                }
+                            }
                         });
-                        ui.add_space(gap);
-                        ui.vertical(|ui| {
-                            ui.set_max_width(w);
-                            theme::card().show(ui, |ui| {
-                                card_begin(ui);
-                                card_head(ui, "超时", None);
-                                ui.add_space(4.0);
-                                egui::Grid::new("timeout_grid")
-                                    .num_columns(2)
-                                    .spacing([12.0, 6.0])
-                                    .show(ui, |ui| {
-                                        ui.label("单项命令");
-                                        changed |= ui
-                                            .add(
-                                                egui::DragValue::new(
-                                                    &mut app.config.timeouts.item_secs,
-                                                )
-                                                .suffix("s")
-                                                .range(0..=600),
-                                            )
-                                            .changed();
-                                        ui.end_row();
-                                        ui.label("人工应答");
-                                        changed |= ui
-                                            .add(
-                                                egui::DragValue::new(
-                                                    &mut app.config.timeouts.manual_secs,
-                                                )
-                                                .suffix("s")
-                                                .range(0..=600),
-                                            )
-                                            .changed();
-                                        ui.end_row();
-                                    });
-                                ui.add_space(2.0);
-                                caption(ui, "0 = 不限制；超时判 FAIL 并继续");
-                            });
+                        ui.add_space(4.0);
+                        caption(ui, "固件回读格式 key 4/5/6，收齐必测键自动通过");
+                    });
+
+                    ui.add_space(12.0);
+
+                    // —— 超时（一行两组，风格同 WiFi 速率行）——
+                    theme::card().show(ui, |ui| {
+                        card_begin(ui);
+                        card_head(ui, "超时", None);
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.label("单项命令");
+                            changed |= ui
+                                .add(
+                                    egui::DragValue::new(&mut app.config.timeouts.item_secs)
+                                        .suffix("s")
+                                        .range(0..=600),
+                                )
+                                .changed();
+                            ui.separator();
+                            ui.label("人工应答");
+                            changed |= ui
+                                .add(
+                                    egui::DragValue::new(&mut app.config.timeouts.manual_secs)
+                                        .suffix("s")
+                                        .range(0..=600),
+                                )
+                                .changed();
                         });
+                        ui.add_space(2.0);
+                        caption(ui, "0 = 不限制；超时判 FAIL 并继续");
                     });
 
                     ui.add_space(12.0);
