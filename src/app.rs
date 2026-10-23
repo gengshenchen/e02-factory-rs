@@ -723,7 +723,6 @@ impl eframe::App for E02App {
             .frame(egui::Frame::default().fill(ui::theme::DARK))
             .show(ctx, |ui| ui::panel_media::show(ui, self));
         // 人工判定模态窗（指示灯 / MIC·喇叭）
-        ui::dialog_manual::show(ctx, self);
         // 按键引导弹窗（V2.1）
         ui::dialog_keys::show(ctx, self);
         // 设置窗口（V2.2）
