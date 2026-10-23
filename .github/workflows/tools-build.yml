@@ -1,0 +1,96 @@
+name: tools-build
+
+# 产线 PC 侧工具的一次性构建：mingw 交叉编译 iperf3（ESnet 官方源码，
+# 固定版本 + sha256 校验），Windows runner 冒烟验证（版本 + 本机回环
+# 自测，顺带确认 JSON 字段与上位机解析器匹配）后提交 tools/ 进仓库。
+# 发布工作流只取用仓库里的成品，互不耦合。升级 iperf3 改 ENV 后
+# 手动跑一次（或改本文件触发）即可。
+
+on:
+  workflow_dispatch:
+  push:
+    paths: ['.github/workflows/tools-build.yml']
+
+permissions:
+  contents: write # 冒烟通过后把二进制提交回 main
+
+env:
+  IPERF3_VERSION: 3.17.1
+  IPERF3_SHA256: 84404ca8431b595e86c473d8f23d8bb102810001f15feaf610effd3b318788aa
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 安装 mingw-w64
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mingw-w64
+
+      - name: 下载源码并校验 sha256
+        run: |
+          curl -fsSL -o iperf3.tar.gz "https://downloads.es.net/pub/iperf/iperf-${IPERF3_VERSION}.tar.gz"
+          echo "${IPERF3_SHA256}  iperf3.tar.gz" | sha256sum -c -
+          tar xzf iperf3.tar.gz
+
+      - name: 交叉编译（静态，无 OpenSSL）
+        run: |
+          cd "iperf-${IPERF3_VERSION}"
+          ./configure --host=x86_64-w64-mingw32 --without-openssl --enable-static-bin
+          make -j"$(nproc)"
+          file src/iperf3.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: iperf3-win64
+          path: iperf-${{ env.IPERF3_VERSION }}/src/iperf3.exe
+
+  smoke:
+    needs: build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: iperf3-win64
+
+      # 回环测试不涉防火墙；验证可执行 + 无 DLL 依赖 + JSON 字段齐全
+      - name: 版本与本机回环自测
+        shell: pwsh
+        run: |
+          .\iperf3.exe --version
+          $p = Start-Process -FilePath .\iperf3.exe -ArgumentList "-s","-1","-p","19705" -PassThru -RedirectStandardOutput srv.log
+          Start-Sleep -Seconds 2
+          .\iperf3.exe -c 127.0.0.1 -p 19705 -t 2 -J | Tee-Object -FilePath cli.json
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          $null = $p.WaitForExit(5000)
+          $j = Get-Content cli.json -Raw | ConvertFrom-Json
+          if (-not $j.end.sum_sent.bits_per_second) {
+            Write-Output "缺 end.sum_sent.bits_per_second 字段（上位机解析依赖）"
+            exit 1
+          }
+          "smoke ok: {0:N1} Mbps" -f ($j.end.sum_sent.bits_per_second / 1e6)
+
+  commit:
+    needs: smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: iperf3-win64
+          path: tools-tmp
+
+      - name: 提交 tools/iperf3-win64.exe
+        run: |
+          mkdir -p tools
+          cp tools-tmp/iperf3.exe tools/iperf3-win64.exe
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add tools/iperf3-win64.exe
+          if git diff --cached --quiet; then
+            echo "二进制无变化，跳过提交"
+            exit 0
+          fi
+          git commit -m "tools: rebuild iperf3-win64.exe ${IPERF3_VERSION} (static mingw, no OpenSSL)"
+          git push
