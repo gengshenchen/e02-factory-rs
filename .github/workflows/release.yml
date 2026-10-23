@@ -57,6 +57,18 @@ jobs:
           Expand-Archive ffmpeg.zip -DestinationPath ffmpegdl
           Get-ChildItem ffmpegdl -Recurse -Include ffmpeg.exe,ffprobe.exe | Copy-Item -Destination target/release/
 
+      # ---- 随包分发：iperf3（tools-build 工作流构建并提交进仓库的静态 win64 版，
+      #      WiFi 吞吐测试用；zip 与 MSI 都要带，须在打包前就位）----
+      - name: 放置 iperf3（WiFi 吞吐测试）
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if (-not (Test-Path tools/iperf3-win64.exe)) {
+            Write-Output "::error title=iperf3 missing::tools/iperf3-win64.exe 不存在——先跑 tools-build 工作流"
+            exit 1
+          }
+          Copy-Item tools/iperf3-win64.exe target/release/iperf3.exe
+
       # ---- Linux: tar.gz + deb ----
       - name: 打包 tar.gz
         if: runner.os == 'Linux'
@@ -76,7 +88,7 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Compress-Archive -Path target/release/e02-factory-rs.exe,target/release/ffmpeg.exe,target/release/ffprobe.exe -DestinationPath dist/${{ matrix.artifact }}.zip
+          Compress-Archive -Path target/release/e02-factory-rs.exe,target/release/ffmpeg.exe,target/release/ffprobe.exe,target/release/iperf3.exe -DestinationPath dist/${{ matrix.artifact }}.zip
 
       # install 与编译分步：步骤级结论公开可读（job 日志要 admin 权限），
       # 再挂能从步骤名直接看出挂在安装还是编译

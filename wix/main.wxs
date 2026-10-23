@@ -33,10 +33,13 @@
           <Component Id="MainExecutable" Guid="B381AAF2-E577-49AF-8894-F7543C1DFD7D" Win64="yes">
             <File Id="ExeFile" Source="target\release\e02-factory-rs.exe" KeyPath="yes" />
           </Component>
-          <!-- bundle ffmpeg/ffprobe (video frame extraction); no PATH dependency -->
+          <!-- bundle ffmpeg/ffprobe (video frame extraction); iperf3 (WiFi
+               throughput test server, built by tools-build workflow); no PATH
+               dependency -->
           <Component Id="BundledTools" Guid="7C4A1B9E-52D8-4E36-9B7A-1F3E2D5C8A64" Win64="yes">
             <File Id="FfmpegExe" Source="target\release\ffmpeg.exe" />
             <File Id="FfprobeExe" Source="target\release\ffprobe.exe" />
+            <File Id="Iperf3Exe" Source="target\release\iperf3.exe" />
           </Component>
         </Directory>
       </Directory>
@@ -69,5 +72,21 @@
       <ComponentRef Id="DesktopShortcut" />
       <ComponentRef Id="StartMenuShortcut" />
     </Feature>
+
+    <!-- WiFi 吞吐测试：iperf3 服务端需入站连通，MSI 静默安装无弹窗可点，
+         安装期直接写防火墙入站放行规则（Return=ignore：失败不阻断安装；
+         zip 分发的用户按 README 手工加）。不用 deferred：延迟 CA 执行期取不到
+         [INSTALLDIR]（不在受限会话可见属性里），immediate 在 perMachine 全程
+         提权下同样有管理员权限。卸载删同名规则，MajorUpgrade 重装不叠加。 -->
+    <CustomAction Id="FwAddIperf3Rule" Directory="INSTALLDIR"
+                  ExeCommand="[SystemFolder]netsh.exe advfirewall firewall add rule name=&quot;E02FactoryTest iperf3&quot; dir=in action=allow program=&quot;[INSTALLDIR]iperf3.exe&quot; enable=yes"
+                  Return="ignore" />
+    <CustomAction Id="FwRemoveIperf3Rule" Directory="INSTALLDIR"
+                  ExeCommand="[SystemFolder]netsh.exe advfirewall firewall delete rule name=&quot;E02FactoryTest iperf3&quot;"
+                  Return="ignore" />
+    <InstallExecuteSequence>
+      <Custom Action="FwAddIperf3Rule" After="InstallFiles">NOT REMOVE</Custom>
+      <Custom Action="FwRemoveIperf3Rule" Before="RemoveFiles">REMOVE~="ALL"</Custom>
+    </InstallExecuteSequence>
   </Product>
 </Wix>

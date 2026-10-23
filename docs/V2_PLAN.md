@@ -499,5 +499,8 @@ doc_lazy_continuation（clippy deny 级）。
   min_mbps_down/max_retr/retest/server_port（旧 ping 字段弃用，老
   config.toml 兼容读取）。
 
-待办：CI 编 win64 静态 iperf3 进 zip/MSI 分发；Windows 防火墙放行
-（MSI 安装期加 netsh 入站规则）；真机验证固件 iperf3 版本/nc 交互。
+PC 侧分发已落地：tools-build 工作流（mingw 交叉编译 ESnet 3.17.1 静态
+版，sha256 钉死 → Windows runner 回环冒烟 → 自动提交 `tools/iperf3-win64.exe`
+进仓库），release.yml 取用进 zip/MSI；MSI 安装期 netsh 加防火墙入站规则
+（immediate CA，perMachine 全程提权；卸载删同名规则），zip 用户按 README
+手工加。待办：真机验证固件 iperf3 版本/nc 交互；v0.4.0 出包。
