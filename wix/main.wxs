@@ -45,7 +45,9 @@
           <Shortcut Id="DesktopShortcutEntry" Name="E02 Factory Test"
                     Target="[INSTALLDIR]e02-factory-rs.exe"
                     WorkingDirectory="INSTALLDIR" Icon="AppIcon" />
-          <RegistryValue Root="HKLM" Key="Software\E02FactoryTest" Name="desktopShortcut"
+          <!-- KeyPath 必须 HKCU：桌面/开始菜单是 per-user 位置，HKLM 值做
+               KeyPath 会挂 ICE38/43/57 校验（light 退出码 204） -->
+          <RegistryValue Root="HKCU" Key="Software\E02FactoryTest" Name="desktopShortcut"
                          Type="integer" Value="1" KeyPath="yes" />
         </Component>
       </Directory>
@@ -55,7 +57,7 @@
                     Target="[INSTALLDIR]e02-factory-rs.exe"
                     WorkingDirectory="INSTALLDIR" Icon="AppIcon" />
           <RemoveFolder Id="RemoveStartMenuDir" On="uninstall" />
-          <RegistryValue Root="HKLM" Key="Software\E02FactoryTest" Name="startMenuShortcut"
+          <RegistryValue Root="HKCU" Key="Software\E02FactoryTest" Name="startMenuShortcut"
                          Type="integer" Value="1" KeyPath="yes" />
         </Component>
       </Directory>
