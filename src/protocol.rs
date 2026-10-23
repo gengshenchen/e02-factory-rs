@@ -148,16 +148,28 @@ pub fn key_name(code: u8) -> &'static str {
     }
 }
 
-/// 按键测试：解析设备输出中的 `key N` 标记（V3.5 固件回读格式，
-/// 大小写不敏感，按词匹配——`key 45`、`keyboard 4` 均不误判）。
+/// 按键测试：解析设备输出中的 `key N` 标记（V3.5 固件回读格式）。
+///
+/// V3.6.2 模糊匹配：真机日志显示固件串口存在粘包，垃圾串 HC0 会糊在
+/// 报文前后——`Key 4HC0`、`HC0...Key test enable`。词级匹配（key 与数字
+/// 须为独立分词）在粘包下永远失配。现改为：`key`（大小写不敏感）后跳过
+/// 空白、紧跟目标数字即命中，数字后跟任意字符（含粘连垃圾）都算。
+/// `keyboard 4` 仍不误判（key 后是字母非数字）；`key test enable/disable`
+/// 也不误判（key 后是空格+字母）。
 pub fn parse_keys_codes(output: &str) -> Vec<u8> {
     let low = output.to_lowercase();
-    let toks: Vec<&str> = low.split_whitespace().collect();
     [4u8, 5, 6]
         .into_iter()
         .filter(|&c| {
-            let digit = c.to_string();
-            toks.windows(2).any(|w| w[0] == "key" && w[1] == digit)
+            let digit = (b'0' + c) as char;
+            let mut from = 0usize;
+            while let Some(pos) = low[from..].find("key") {
+                if low[from + pos + 3..].trim_start().starts_with(digit) {
+                    return true;
+                }
+                from += pos + 3;
+            }
+            false
         })
         .collect()
 }
@@ -299,13 +311,23 @@ mod tests {
         assert!(!gyro_ok("no result line"));
         assert!(sdcard_ok("mount true"));
         assert!(!sdcard_ok("false"));
-        // 按键：固件回读 `key N`（V3.5），按词匹配
+        // 按键：固件回读 `key N`（V3.5），模糊匹配兼容粘包（V3.6.2）
         assert_eq!(parse_keys_codes("key 4\nkey 5\nkey 6"), vec![4, 5, 6]);
         assert_eq!(parse_keys_codes("Key 5"), vec![5]);
         assert_eq!(parse_keys_codes("key 5 key 6"), vec![5, 6]);
-        // 不误判：粘连数字、相近单词、版本号
-        assert!(parse_keys_codes("key 45").is_empty());
+        // 真机粘包实测：HC0 垃圾糊在数字前后都命中
+        assert_eq!(parse_keys_codes("Key 4HC0"), vec![4]);
+        assert_eq!(parse_keys_codes("HC0\\Key test enable\nKey 4HC0"), vec![4]);
+        assert_eq!(
+            parse_keys_codes("d#\nKey 4HC0\nd\"\nKey 6\nKey 5"),
+            vec![4, 5, 6]
+        );
+        // 模糊语义：数字后跟任意字符都算（key 45 → 按了 4）
+        assert_eq!(parse_keys_codes("key 45"), vec![4]);
+        // 仍不误判：key 后是字母（keyboard / key test enable）
         assert!(parse_keys_codes("keyboard 4").is_empty());
+        assert!(parse_keys_codes("Key test enable").is_empty());
+        assert!(parse_keys_codes("Key test disable").is_empty());
         assert!(parse_keys_codes("soft-ware:E02-1.0.5").is_empty());
         assert_eq!(key_name(5), "开机键");
         assert_eq!(key_name(6), "音量+");
