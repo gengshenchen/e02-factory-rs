@@ -476,3 +476,28 @@ doc_lazy_continuation（clippy deny 级）。
   `ManualAsk.in_media`：panel_media 只在 in_media 时画条，
   dialog_manual 只在 !in_media 时弹窗。worker 应答协议、超时、
   阻塞等待均不变。按键引导弹窗（dialog_keys）不需看画面，维持。
+
+## V3.12 WiFi 吞吐测试改 iperf3（2026-10-23，替代 V2.2 的 ping 速率）
+
+背景：小包空载 ping 对"能连上但射频塌了"（模组虚焊/天线不良）不敏感；
+无屏蔽箱、共享 2.4G、产线不固定 AP 的环境下改用 iperf3 吞吐 + 宽松阈值
++ 复测兜底。
+
+- **固件侧自带 iperf3**（`which iperf3` 定位，全路径调用；要求 ≥3.1，
+  3.7+ 最好，无需 OpenSSL）；
+- **PC 侧** iperf3 随包分发（查找顺序同 ffmpeg：环境变量 `IPERF3` →
+  exe 同目录 → PATH），起 `-s -1 --json` 单次服务；
+- 流程：驱动检查 → `ip -4 addr show wlan0` 拿 IP（连通性证明，ping 退役
+  为失败归因）→ `which iperf3` → PC 同网段地址枚举（if-addrs，掩码缺失
+  按 /24 兜底，`E02_LOCAL_IP` 可强制）→ 上/下行各一次（`-R` 反向）；
+- 判定：**每秒窗口吞吐中位数**（共享信道瞬时抢道不误杀）≥ 阈值
+  （↑10/↓15 Mbps 初值）+ TCP 重传 ≤500（反向从服务端 JSON 补）；边缘
+  失败（阈值 50% 裕量内）自动复测一次，仍低才 FAIL；
+- RSSI（`cmd wifi status` → `/proc/net/wireless` 探测链）只记录不设门，
+  唯一兜底 <-80dBm 视天线级故障；失败时 ping 网关区分"断连/连通但慢"；
+- 配置 `[wifi.throughput]`：direction/duration_secs/min_mbps_up/
+  min_mbps_down/max_retr/retest/server_port（旧 ping 字段弃用，老
+  config.toml 兼容读取）。
+
+待办：CI 编 win64 静态 iperf3 进 zip/MSI 分发；Windows 防火墙放行
+（MSI 安装期加 netsh 入站规则）；真机验证固件 iperf3 版本/nc 交互。

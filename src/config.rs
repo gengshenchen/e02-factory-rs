@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// WiFi 测试深度：driver=驱动通（camera-factory 5）；
-/// throughput=驱动 + 速率（ping 网关统计丢包/延迟，阈值判定）。
+/// throughput=驱动 + iperf3 吞吐（上行/下行 Mbps 与 TCP 重传，阈值判定）。
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum WifiDepth {
@@ -19,32 +19,77 @@ pub enum WifiDepth {
     Throughput,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ThroughputCfg {
-    #[serde(default = "d_ping_count")]
-    pub ping_count: u32,
-    #[serde(default = "d_loss_max")]
-    pub loss_max_pct: f32,
-    #[serde(default = "d_rtt_max")]
-    pub rtt_max_ms: f32,
+/// 吞吐测试方向。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum IperfDir {
+    Up,
+    Down,
+    Both,
 }
 
-fn d_ping_count() -> u32 {
-    20
+/// iperf3 吞吐测试配置（V3.12，替代 V2.2 的 ping 丢包/延迟）。
+///
+/// 无屏蔽箱/共享 AP 环境下阈值要宽松 + 复测兜底：主判每秒窗口吞吐的
+/// 中位数（抗共享信道瞬时抢道），TCP 重传对弱射频最灵敏但共享环境
+/// 波动大，默认宽（500，0=不判），建议用金机实测校准。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ThroughputCfg {
+    /// 测试方向（耳机产品方向是下行，但虚焊两个方向都能暴露）
+    #[serde(default = "d_dir")]
+    pub direction: IperfDir,
+    /// 单方向时长（秒）
+    #[serde(default = "d_duration")]
+    pub duration_secs: u32,
+    /// 上行最低吞吐（Mbps，窗口中位数，0=不判）
+    #[serde(default = "d_min_up")]
+    pub min_mbps_up: f32,
+    /// 下行最低吞吐（Mbps，窗口中位数，0=不判）
+    #[serde(default = "d_min_down")]
+    pub min_mbps_down: f32,
+    /// TCP 重传上限（0=不判）
+    #[serde(default = "d_max_retr")]
+    pub max_retr: u32,
+    /// 边缘失败（低于阈值但在 50% 裕量内）自动复测一次，仍低才 FAIL
+    #[serde(default = "d_retest")]
+    pub retest: bool,
+    /// PC 端 iperf3 服务端口（0=自动找空闲）
+    #[serde(default = "d_port")]
+    pub server_port: u16,
 }
-fn d_loss_max() -> f32 {
-    0.0
+
+fn d_dir() -> IperfDir {
+    IperfDir::Both
 }
-fn d_rtt_max() -> f32 {
-    100.0
+fn d_duration() -> u32 {
+    5
+}
+fn d_min_up() -> f32 {
+    10.0
+}
+fn d_min_down() -> f32 {
+    15.0
+}
+fn d_max_retr() -> u32 {
+    500
+}
+fn d_retest() -> bool {
+    true
+}
+fn d_port() -> u16 {
+    0
 }
 
 impl Default for ThroughputCfg {
     fn default() -> Self {
         Self {
-            ping_count: d_ping_count(),
-            loss_max_pct: d_loss_max(),
-            rtt_max_ms: d_rtt_max(),
+            direction: d_dir(),
+            duration_secs: d_duration(),
+            min_mbps_up: d_min_up(),
+            min_mbps_down: d_min_down(),
+            max_retr: d_max_retr(),
+            retest: d_retest(),
+            server_port: d_port(),
         }
     }
 }

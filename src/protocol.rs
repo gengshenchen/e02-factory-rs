@@ -227,6 +227,140 @@ pub fn parse_ping_stats(output: &str) -> Option<(f32, f32)> {
     }
 }
 
+/// 解析 `ip -4 addr show wlan0` 的首个 IPv4（join + DHCP 的连通性证明）。
+/// 样例行：`    inet 192.168.3.42/24 brd 192.168.3.255 scope global wlan0`
+pub fn parse_wlan_ip(output: &str) -> Option<String> {
+    output.lines().find_map(|l| {
+        let rest = l.trim().strip_prefix("inet ")?;
+        let tok = rest.split_whitespace().next()?;
+        let ip = tok.split('/').next()?;
+        (!ip.starts_with("127.")).then(|| ip.to_string())
+    })
+}
+
+/// 解析 `cmd wifi status` 的 `(RSSI dBm, 链路速率 Mbps)`（探测链首选）。
+/// 样例：`... Supplicant state: COMPLETED, RSSI: -52, Link speed: 72Mbps, ...`
+pub fn parse_cmd_wifi_status(output: &str) -> Option<(i32, u32)> {
+    let rssi = output.split("RSSI").nth(1).and_then(|rest| {
+        rest.trim_start_matches([':', ' ', '='])
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '-')
+            .collect::<String>()
+            .parse()
+            .ok()
+    });
+    let speed = output.split("Link speed").nth(1).and_then(|rest| {
+        rest.trim_start_matches([':', ' ', '='])
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect::<String>()
+            .parse()
+            .ok()
+    });
+    rssi.zip(speed)
+}
+
+/// 解析 `/proc/net/wireless` 的 wlan0 电平 dBm（探测链兜底）。
+/// 样例：`wlan0: 0000  70.0.  -52.  -108.  0  0  ...`（第 4 列 level）
+pub fn parse_wireless_level(output: &str) -> Option<i32> {
+    let line = output.lines().find(|l| l.starts_with("wlan0"))?;
+    let mut cols = line.split_whitespace();
+    let _face = cols.next()?; // wlan0:
+    let _status = cols.next()?;
+    let _link = cols.next()?;
+    let level: f32 = cols.next()?.trim_end_matches('.').parse().ok()?;
+    Some(level.round() as i32)
+}
+
+/// iperf3 `-J` 客户端结果摘要。
+#[derive(Debug, Clone, PartialEq)]
+pub struct IperfSummary {
+    /// 每秒窗口吞吐中位数（Mbps；无窗口数据时回退 end 汇总）
+    pub mbps_median: f32,
+    /// end 汇总吞吐（Mbps）
+    pub mbps_end: f32,
+    /// TCP 重传数（客户端为发送端时才有；反向时由服务端结果补）
+    pub retransmits: Option<u32>,
+}
+
+/// 解析 iperf3 客户端 `-J` JSON。
+///
+/// 兼容新旧格式：老版本无 `end.sum_sent` 只有 `end.sum`；
+/// 输出含 `"error"` 字段（连接失败等）返回 `None`，消息取不到了就
+/// 让调用方拿原始输出片段。
+pub fn parse_iperf3_json(output: &str) -> Option<IperfSummary> {
+    // adb 透传时 stdout 前可能混有固件杂散行，取首个 '{' 起的 JSON
+    let start = output.find('{')?;
+    let v: serde_json::Value = serde_json::from_str(&output[start..]).ok()?;
+    if v.get("error").is_some() {
+        return None;
+    }
+    let end = v.get("end")?;
+    let pick = |key: &str| -> Option<f64> {
+        end.get(key)
+            .and_then(|s| s.get("bits_per_second"))
+            .and_then(|b| b.as_f64())
+    };
+    // 吞吐：发送/接收两端取小（同一 TCP 连接，两端差即途中损失）
+    let mbps_end = {
+        let sent = pick("sum_sent");
+        let recv = pick("sum_received");
+        let one = sent.or(recv).or_else(|| {
+            end.get("sum")
+                .and_then(|s| s.get("bits_per_second"))
+                .and_then(|b| b.as_f64())
+        })?;
+        let both = match (sent, recv) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            _ => None,
+        };
+        (both.unwrap_or(one) / 1e6) as f32
+    };
+    // 每秒窗口中位数（iperf3 固定 1s 窗口；-R 时窗口在 streams/sum 结构同）
+    let mut wins: Vec<f32> = v
+        .get("intervals")
+        .and_then(|i| i.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|w| {
+                    w.get("sum")
+                        .or_else(|| w.get("sums").and_then(|s| s.as_array()?.first()))
+                        .and_then(|s| s.get("bits_per_second"))
+                        .and_then(|b| b.as_f64())
+                        .map(|b| (b / 1e6) as f32)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    wins.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mbps_median = match wins.len() {
+        0 => mbps_end,
+        n if n % 2 == 1 => wins[n / 2],
+        n => (wins[n / 2 - 1] + wins[n / 2]) / 2.0,
+    };
+    let retransmits = end
+        .get("sum_sent")
+        .and_then(|s| s.get("retransmits"))
+        .and_then(|x| x.as_u64())
+        .map(|x| x as u32);
+    Some(IperfSummary {
+        mbps_median,
+        mbps_end,
+        retransmits,
+    })
+}
+
+/// 从 iperf3 **服务端** `-J` JSON 取 TCP 重传数（反向测试时发送端在 PC）。
+pub fn parse_iperf3_server_retr(output: &str) -> Option<u32> {
+    let start = output.find('{')?;
+    let v: serde_json::Value = serde_json::from_str(&output[start..]).ok()?;
+    v.get("end")?
+        .get("sum_sent")?
+        .get("retransmits")?
+        .as_u64()
+        .map(|x| x as u32)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -288,6 +422,68 @@ mod tests {
         assert_eq!(parse_ping_stats(busy), Some((0.0, 8.5)));
         // 乱码/空输出
         assert_eq!(parse_ping_stats("nothing here"), None);
+    }
+
+    #[test]
+    fn parse_wlan_ipv4() {
+        let out = "10: wlan0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500\n    inet 192.168.3.42/24 brd 192.168.3.255 scope global wlan0\n    inet6 fe80::1/64 scope link";
+        assert_eq!(parse_wlan_ip(out), Some("192.168.3.42".into()));
+        assert_eq!(parse_wlan_ip("no inet here"), None);
+    }
+
+    #[test]
+    fn parse_wifi_rssi_sources() {
+        let status = "Wifi is enabled\nWi-Fi is connected to X\nmWifiInfo SSID: X, BSSID: aa:bb, MAC: cc, Supplicant state: COMPLETED, RSSI: -52, Link speed: 72Mbps, Frequency: 2437MHz";
+        assert_eq!(parse_cmd_wifi_status(status), Some((-52, 72)));
+        assert_eq!(parse_cmd_wifi_status("no rssi"), None);
+        // /proc/net/wireless：level 列带尾点
+        let proc = "Inter-| sta-|   Quality        |   Discarded packets               | Missed | WE\n face | tus | link level noise |  nwid  ...\nwlan0: 0000  70.0.  -52.  -108.  0  0  0  0  0  0  0  0  0  0  0  0  0";
+        assert_eq!(parse_wireless_level(proc), Some(-52));
+        assert_eq!(
+            parse_wireless_level("wlan0: 0000  70.0.  -71.  -108."),
+            Some(-71)
+        );
+    }
+
+    #[test]
+    fn parse_iperf3_client_forward() {
+        // 正向（设备发送）：end.sum_sent 带 retransmits，3 窗口 → 中位
+        let j = r#"{"start":{},"intervals":[
+            {"sum":{"bits_per_second":20e6,"retransmits":2}},
+            {"sum":{"bits_per_second":24e6,"retransmits":1}},
+            {"sum":{"bits_per_second":22e6,"retransmits":0}}],
+          "end":{"sum_sent":{"bits_per_second":22e6,"retransmits":36},
+                 "sum_received":{"bits_per_second":21.9e6}}}"#;
+        let r = parse_iperf3_json(j).unwrap();
+        assert_eq!(r.mbps_median, 22.0);
+        assert_eq!(r.mbps_end, 21.9); // 两端取小
+        assert_eq!(r.retransmits, Some(36));
+    }
+
+    #[test]
+    fn parse_iperf3_client_reverse_old_shape() {
+        // 反向（设备接收）：客户端只有接收侧；老版本 end 只有 sum
+        let j = r#"{"intervals":[{"sum":{"bits_per_second":30e6}}],
+          "end":{"sum":{"bits_per_second":29e6}}}"#;
+        let r = parse_iperf3_json(j).unwrap();
+        assert_eq!(r.mbps_median, 30.0);
+        assert_eq!(r.mbps_end, 29.0);
+        assert_eq!(r.retransmits, None);
+    }
+
+    #[test]
+    fn parse_iperf3_error_and_noise() {
+        // 固件杂散行混在 JSON 前 + error 字段 → None
+        let noisy = r#"HC0garbage {"error":"unable to connect to server"}"#;
+        assert_eq!(parse_iperf3_json(noisy), None);
+        assert_eq!(parse_iperf3_json("not json at all"), None);
+    }
+
+    #[test]
+    fn parse_iperf3_server_retransmits() {
+        let j = r#"{"start":{},"end":{"sum_sent":{"bits_per_second":28e6,"retransmits":87},"sum_received":{"bits_per_second":27.8e6}}}"#;
+        assert_eq!(parse_iperf3_server_retr(j), Some(87));
+        assert_eq!(parse_iperf3_server_retr("junk"), None);
     }
 
     #[test]

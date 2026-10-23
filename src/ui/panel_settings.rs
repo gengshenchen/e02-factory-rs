@@ -8,7 +8,7 @@
 //! exe 同目录 config.toml。
 
 use crate::app::E02App;
-use crate::config::{self, WifiDepth};
+use crate::config::{self, IperfDir, WifiDepth};
 use crate::engine::TestItem;
 use crate::protocol::key_name;
 use crate::ui::theme;
@@ -158,32 +158,70 @@ pub fn show(ctx: &egui::Context, app: &mut E02App) {
                         if app.config.wifi.depth == WifiDepth::Throughput {
                             ui.add_space(6.0);
                             let t = &mut app.config.wifi.throughput;
+                            // 方向（V3.12 分段选项卡）+ 单向时长
                             ui.horizontal(|ui| {
-                                ui.label("ping 包数");
-                                changed |= ui
-                                    .add(egui::DragValue::new(&mut t.ping_count).range(1..=100))
-                                    .changed();
+                                if tab(ui, t.direction == IperfDir::Up, "上行") {
+                                    t.direction = IperfDir::Up;
+                                    changed = true;
+                                }
+                                if tab(ui, t.direction == IperfDir::Down, "下行") {
+                                    t.direction = IperfDir::Down;
+                                    changed = true;
+                                }
+                                if tab(ui, t.direction == IperfDir::Both, "双向") {
+                                    t.direction = IperfDir::Both;
+                                    changed = true;
+                                }
                                 ui.separator();
-                                ui.label("丢包 ≤");
+                                ui.label("时长");
                                 changed |= ui
                                     .add(
-                                        egui::DragValue::new(&mut t.loss_max_pct)
-                                            .suffix("%")
-                                            .range(0.0..=100.0),
-                                    )
-                                    .changed();
-                                ui.separator();
-                                ui.label("平均延迟 ≤");
-                                changed |= ui
-                                    .add(
-                                        egui::DragValue::new(&mut t.rtt_max_ms)
-                                            .suffix("ms")
-                                            .range(1.0..=2000.0),
+                                        egui::DragValue::new(&mut t.duration_secs)
+                                            .suffix("s")
+                                            .range(2..=30),
                                     )
                                     .changed();
                             });
+                            // 阈值：上/下吞吐 + TCP 重传
+                            ui.horizontal(|ui| {
+                                ui.label("≥↑");
+                                changed |= ui
+                                    .add(
+                                        egui::DragValue::new(&mut t.min_mbps_up)
+                                            .suffix("Mbps")
+                                            .range(0.0..=300.0),
+                                    )
+                                    .changed();
+                                ui.separator();
+                                ui.label("≥↓");
+                                changed |= ui
+                                    .add(
+                                        egui::DragValue::new(&mut t.min_mbps_down)
+                                            .suffix("Mbps")
+                                            .range(0.0..=300.0),
+                                    )
+                                    .changed();
+                                ui.separator();
+                                ui.label("重传 ≤");
+                                changed |= ui
+                                    .add(egui::DragValue::new(&mut t.max_retr).range(0..=10000))
+                                    .changed();
+                            });
+                            ui.horizontal(|ui| {
+                                changed |= ui
+                                    .checkbox(&mut t.retest, "边缘失败自动复测一次")
+                                    .changed();
+                                ui.separator();
+                                ui.label("端口");
+                                changed |= ui
+                                    .add(egui::DragValue::new(&mut t.server_port).range(0..=65535))
+                                    .changed();
+                            });
                             ui.add_space(2.0);
-                            caption(ui, "速率 = 驱动通过后 ping 网关，统计丢包率与平均延迟");
+                            caption(
+                                ui,
+                                "iperf3 上/下行吞吐（窗口中位数）与 TCP 重传阈值；0=不判。                                 需固件集成 iperf3，PC 与设备同网段",
+                            );
                         }
                     });
 

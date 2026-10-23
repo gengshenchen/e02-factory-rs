@@ -2,11 +2,12 @@
 //! 经 [`UiEvent`] 回传状态；人工判定阻塞等待 [`UiResponse`]。
 
 use crate::adb;
-use crate::config::{Config, KeysCfg, WifiCfg};
+use crate::config::{Config, IperfDir, KeysCfg, ThroughputCfg, WifiCfg};
 use crate::engine::events::{UiEvent, UiResponse};
 use crate::engine::runner::{self, RunOutcome};
 use crate::engine::{TestItem, TestResult, Verdict};
 use crate::exec;
+use crate::netip;
 use crate::player;
 use crate::protocol::{self, CameraFactory, DeviceInfo};
 use crate::report;
@@ -930,9 +931,102 @@ fn keys_flow(
     }
 }
 
-/// WiFi 流程（V2.2 深度可配）：
+/// 单方向 iperf3 测试结果（判定与拼 detail 用）。
+struct DirOutcome {
+    label: &'static str, // ↑ / ↓
+    mbps: f32,           // 窗口中位数
+    need: f32,           // 阈值（0=不判）
+    retr: Option<u32>,
+    retr_max: u32, // 0=不判
+    retested: bool,
+}
+
+impl DirOutcome {
+    fn pass(&self) -> bool {
+        let thr_ok = self.need <= 0.0 || self.mbps >= self.need;
+        let retr_ok = self.retr_max == 0 || self.retr.is_none_or(|v| v <= self.retr_max);
+        thr_ok && retr_ok
+    }
+    fn detail(&self) -> String {
+        let mut s = format!("{}{:.1}Mbps", self.label, self.mbps);
+        if self.need > 0.0 {
+            s.push_str(&format!("(阈值{:.0})", self.need));
+        }
+        if let Some(v) = self.retr {
+            if self.retr_max > 0 {
+                s.push_str(&format!(" 重传{v}(≤{})", self.retr_max));
+            } else {
+                s.push_str(&format!(" 重传{v}"));
+            }
+        }
+        if self.retested {
+            s.push_str("[复测]");
+        }
+        s
+    }
+}
+
+/// 起一次服务端（-1 单测自退）+ 设备端客户端，返回结果摘要。
+///
+/// 服务端在 PC 线程里跑（exec::output 带超时与全局停止），反向测试的
+/// 重传数发生在 PC 发送端，从服务端 JSON 补齐。
+fn iperf_once(
+    tx: &Sender<UiEvent>,
+    host: &str,
+    t: &ThroughputCfg,
+    local: std::net::Ipv4Addr,
+    port: u16,
+    reverse: bool,
+) -> Result<protocol::IperfSummary, String> {
+    let label = if reverse { "下行" } else { "上行" };
+    let _ = tx.send(UiEvent::Log(format!(
+        "iperf3 {label}：{local}:{port} {}s",
+        t.duration_secs
+    )));
+
+    let server_timeout = Duration::from_secs(t.duration_secs as u64 + 15);
+    let server = {
+        let mut cmd = std::process::Command::new(host);
+        cmd.args([
+            "-s",
+            "-1",
+            "-B",
+            &local.to_string(),
+            "-p",
+            &port.to_string(),
+            "--json",
+        ]);
+        std::thread::spawn(move || exec::output(&mut cmd, Some(server_timeout)).ok())
+    };
+
+    let mut client = format!("-c {local} -p {port} -t {} -J", t.duration_secs);
+    if reverse {
+        client.push_str(" -R");
+    }
+    // 固件自带 iperf3：which 定位全路径（不依赖设备 PATH）
+    let bin = adb::shell("which iperf3")
+        .ok()
+        .map(|o| runner::one_line(&o))
+        .filter(|p| !p.is_empty())
+        .ok_or_else(|| "固件未集成 iperf3（which 找不到）".to_string())?;
+    let out = adb::shell(&format!("{bin} {client}")).map_err(|e| format!("adb: {e:#}"))?;
+    let srv = server.join().ok().flatten();
+
+    let mut sum = protocol::parse_iperf3_json(&out)
+        .ok_or_else(|| format!("iperf3 输出无法解析: {}", clip(&runner::one_line(&out), 80)))?;
+    if reverse && sum.retransmits.is_none() {
+        // 反向时发送端在 PC：客户端 JSON 无重传字段，从服务端补
+        sum.retransmits = srv
+            .as_ref()
+            .and_then(|o| protocol::parse_iperf3_server_retr(&exec::decode_out(&o.stdout)));
+    }
+    Ok(sum)
+}
+
+/// WiFi 流程（深度可配）：
 /// - driver：`camera-factory 5` 驱动通即过（原程序行为）
-/// - throughput：驱动过后追加 ping 网关统计（丢包率/avg RTT 阈值判定）
+/// - throughput：驱动过后跑 iperf3 上/下行吞吐与 TCP 重传（V3.12；
+///   无屏蔽箱共享 AP 环境：每秒窗口中位数判阈值 + 边缘复测兜底）
 fn wifi_flow(tx: &Sender<UiEvent>, wifi: &WifiCfg) -> RunOutcome {
     // 先跑驱动检查（camera-factory 5），失败直接返回
     let base = runner::run_auto(TestItem::Wifi);
@@ -942,47 +1036,171 @@ fn wifi_flow(tx: &Sender<UiEvent>, wifi: &WifiCfg) -> RunOutcome {
 
     let mut r = base.result;
     let t = &wifi.throughput;
-    let _ = tx.send(UiEvent::Log("WiFi 速率：探测默认网关...".to_string()));
-    let gw = adb::shell("ip route")
+
+    // 设备 IP：join + DHCP 成功即连通性证明（ping 已退役为失败归因用）
+    let _ = tx.send(UiEvent::Log("WiFi 吞吐：读取 wlan0 地址...".to_string()));
+    let ip = adb::shell("ip -4 addr show wlan0")
         .ok()
-        .and_then(|out| protocol::parse_default_gateway(&out));
-    let Some(gw) = gw else {
+        .and_then(|o| protocol::parse_wlan_ip(&o));
+    let Some(ip) = ip else {
         r.verdict = Verdict::Fail;
-        r.detail = "驱动通过，但未解析到默认网关（WiFi 未连路由器？）".into();
+        r.detail = "驱动通过，但 wlan0 无 IPv4（未入网/未拿到 DHCP？）".into();
         return RunOutcome {
             result: r,
             device: base.device,
         };
     };
 
-    let _ = tx.send(UiEvent::Log(format!(
-        "ping 网关 {gw} 共 {} 包",
-        t.ping_count
-    )));
-    match adb::shell(&format!("ping -c {} -W 2 {gw}", t.ping_count)) {
-        Ok(out) => match protocol::parse_ping_stats(&out) {
-            Some((loss, avg)) => {
-                let ok = loss <= t.loss_max_pct && avg <= t.rtt_max_ms;
-                r.verdict = if ok { Verdict::Pass } else { Verdict::Fail };
-                r.detail = format!(
-                    "丢包 {loss}%，avg {avg}ms（阈值 {}% / {}ms）",
-                    t.loss_max_pct, t.rtt_max_ms
-                );
-            }
-            None => {
-                r.verdict = Verdict::Fail;
-                r.detail = format!("ping 输出无法解析: {}", clip(&runner::one_line(&out), 80));
-            }
-        },
-        Err(e) => {
+    // RSSI/链路速率：只记录不设门（环境不控），极宽松兜底抓天线级故障
+    let rssi = wifi_rssi();
+
+    // PC 与设备同网段地址 + 空闲端口
+    let Some(peer) = ip.parse::<std::net::Ipv4Addr>().ok() else {
+        r.verdict = Verdict::Fail;
+        r.detail = format!("驱动 ok，IP {ip}；地址无法解析");
+        return RunOutcome {
+            result: r,
+            device: base.device,
+        };
+    };
+    let Some(local) = netip::local_ip_reaching(peer) else {
+        r.verdict = Verdict::Fail;
+        r.detail = format!("驱动 ok，IP {ip}；PC 无同网段地址（检查 PC 是否接入设备所在网段）");
+        return RunOutcome {
+            result: r,
+            device: base.device,
+        };
+    };
+    let port = if t.server_port == 0 {
+        free_port().unwrap_or(19703)
+    } else {
+        t.server_port
+    };
+
+    // PC 侧 iperf3 预检：随包分发缺失时明确报错，别让客户端玄学解析失败
+    let host = player::resolve_tool(player::exe_dir().as_deref(), "IPERF3", "iperf3");
+    match std::process::Command::new(&host).arg("--version").output() {
+        Ok(o) if o.status.success() => {}
+        _ => {
             r.verdict = Verdict::Fail;
-            r.detail = format!("ping 失败: {e:#}");
+            r.detail =
+                format!("驱动 ok，IP {ip}；PC 缺 iperf3（应随包分发；环境变量 IPERF3 可指定路径）");
+            return RunOutcome {
+                result: r,
+                device: base.device,
+            };
         }
     }
+
+    // 方向序列：(反向?, 标签, 阈值)
+    let dirs: &[(bool, &'static str, f32)] = match t.direction {
+        IperfDir::Up => &[(false, "↑", t.min_mbps_up)],
+        IperfDir::Down => &[(true, "↓", t.min_mbps_down)],
+        IperfDir::Both => &[(false, "↑", t.min_mbps_up), (true, "↓", t.min_mbps_down)],
+    };
+
+    let mut parts = vec![format!("IP {ip}")];
+    let mut all_ok = true;
+    for &(rev, label, need) in dirs {
+        let first = iperf_once(tx, &host, t, local, port, rev);
+        let mut o = match first {
+            Ok(sum) => DirOutcome {
+                label,
+                mbps: sum.mbps_median,
+                need,
+                retr: sum.retransmits,
+                retr_max: t.max_retr,
+                retested: false,
+            },
+            Err(msg) => {
+                all_ok = false;
+                parts.push(format!("{label} 测试失败：{msg}"));
+                continue;
+            }
+        };
+        // 边缘失败自动复测一次（共享 2.4G 下瞬时抢道不冤枉良品）
+        if !o.pass() && t.retest {
+            let marginal = (o.need > 0.0 && o.mbps >= o.need * 0.5)
+                || o.retr.is_some_and(|v| v <= o.retr_max * 2);
+            if marginal {
+                let _ = tx.send(UiEvent::Log(format!("{label} 边缘失败，复测一次...")));
+                if let Ok(sum) = iperf_once(tx, &host, t, local, port, rev) {
+                    o = DirOutcome {
+                        label,
+                        mbps: sum.mbps_median,
+                        need,
+                        retr: sum.retransmits.or(o.retr),
+                        retr_max: t.max_retr,
+                        retested: true,
+                    };
+                }
+            }
+        }
+        if !o.pass() {
+            all_ok = false;
+        }
+        parts.push(o.detail());
+    }
+
+    // RSSI 兜底与记录
+    if let Some((v, speed)) = rssi {
+        if v < -80 {
+            all_ok = false;
+            parts.push(format!("RSSI {v}dBm 过低（疑天线/馈线故障）"));
+        } else if speed > 0 {
+            parts.push(format!("RSSI {v}dBm/{speed}Mbps"));
+        } else {
+            parts.push(format!("RSSI {v}dBm"));
+        }
+    }
+
+    // 失败归因：ping 网关区分"断连"与"连通但慢"
+    if !all_ok {
+        if let Some(gw) = adb::shell("ip route")
+            .ok()
+            .and_then(|o| protocol::parse_default_gateway(&o))
+        {
+            if let Ok(p) = adb::shell(&format!("ping -c 8 -W 2 {gw}")) {
+                if let Some((loss, avg)) = protocol::parse_ping_stats(&p) {
+                    let why = if loss >= 50.0 {
+                        format!("ping 网关 {loss:.0}% 丢包 → 疑断连/严重不良")
+                    } else {
+                        format!("ping 网关丢包 {loss:.0}% avg {avg:.0}ms → 连通但速率低")
+                    };
+                    parts.push(why);
+                }
+            }
+        }
+    }
+
+    r.verdict = if all_ok { Verdict::Pass } else { Verdict::Fail };
+    r.detail = parts.join("；");
     RunOutcome {
         result: r,
         device: base.device,
     }
+}
+
+/// RSSI/链路速率探测链：`cmd wifi status`（Android 11+）→ /proc/net/wireless。
+fn wifi_rssi() -> Option<(i32, u32)> {
+    if let Ok(out) = adb::shell("cmd wifi status") {
+        if let Some(v) = protocol::parse_cmd_wifi_status(&out) {
+            return Some(v);
+        }
+    }
+    adb::shell("cat /proc/net/wireless")
+        .ok()
+        .and_then(|o| protocol::parse_wireless_level(&o))
+        .map(|v| (v, 0))
+}
+
+/// 找一个空闲 TCP 端口（0.0.0.0 绑定即释放，产线 PC 独占、竞态可忽略）。
+fn free_port() -> Option<u16> {
+    std::net::TcpListener::bind("0.0.0.0:0")
+        .ok()?
+        .local_addr()
+        .ok()
+        .map(|a| a.port())
 }
 
 #[cfg(all(unix, test))] // 假 adb 桩 + ffmpeg 仅在 unix 测试构建可用
@@ -1290,14 +1508,21 @@ mod tests {
         // —— V2.2 WiFi 速率（ping 法）——
         let wscript = base.join("adb-wifi");
         // 注：数据里的 % 需经 %s 格式串输出（printf 参数含 % 会被 dash 当格式符）
+        // V3.12：iperf3 客户端桩按 -R 与否吐不同 JSON（正向带重传、反向无）
         let wifi_case = "#!/bin/sh\ncase \"$*\" in\n\
              *\"camera-factory 5\"*) printf 'wifi ok\\n';;\n\
+             *\"ip -4 addr show wlan0\"*) printf 'inet 192.168.3.42/24 brd 192.168.3.255 scope global wlan0\\n';;\n\
+             *\"which iperf3\"*) printf '/system/bin/iperf3\\n';;\n\
+             *\"iperf3 -c\"*) case \"$*\" in\n\
+               *\"-R\"*) printf '%s' '{\"intervals\":[{\"sum\":{\"bits_per_second\":30e6}}],\"end\":{\"sum\":{\"bits_per_second\":29e6}}}';;\n\
+               *) printf '%s' '{\"intervals\":[{\"sum\":{\"bits_per_second\":20e6}},{\"sum\":{\"bits_per_second\":24e6}},{\"sum\":{\"bits_per_second\":22e6}}],\"end\":{\"sum_sent\":{\"bits_per_second\":22e6,\"retransmits\":36},\"sum_received\":{\"bits_per_second\":21.9e6}}} ';;\n\
+             esac;;\n\
              *\"ip route\"*) printf 'default via 192.168.1.1 dev wlan0\\n';;\n\
              *\"ping\"*) printf '%s\\n%s\\n' \
              '20 packets transmitted, 20 received, 0% packet loss' \
              'rtt min/avg/max/mdev = 1.2/23.4/99.0/5.0 ms';;\n\
              *) printf 'ok\\n';;\nesac\n";
-        // driver 深度：不 ping，驱动过即过
+        // driver 深度：不测吞吐，驱动过即过
         let (vs, n) = scenario(
             &wscript,
             items(TestItem::Wifi),
@@ -1308,7 +1533,20 @@ mod tests {
             || unreachable!(),
         );
         assert_eq!((vs[0].1, n), (Verdict::Pass, 0));
-        // throughput 深度：驱动过 + ping 统计达标
+        // throughput 深度：假 iperf3 服务端（PC 侧）+ 本机地址注入，
+        // 客户端桩上行中位 22Mbps ≥ 10、下行 30 ≥ 15、重传 36/87 ≤ 500 → PASS
+        let iscript = base.join("iperf3-host");
+        std::fs::write(
+            &iscript,
+            "#!/bin/sh\nprintf '%s' '{\"start\":{},\"end\":{\"sum_sent\":{\"bits_per_second\":28e6,\"retransmits\":87}}}'\n",
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&iscript, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::env::set_var("IPERF3", &iscript);
+        std::env::set_var("E02_LOCAL_IP", "192.168.3.10");
         let mut cfg = Config::default();
         cfg.wifi.depth = crate::config::WifiDepth::Throughput;
         let (vs, n) = scenario(
@@ -1320,6 +1558,8 @@ mod tests {
             wifi_case,
             || unreachable!(),
         );
+        std::env::remove_var("IPERF3");
+        std::env::remove_var("E02_LOCAL_IP");
         assert_eq!((vs[0].1, n), (Verdict::Pass, 0));
 
         // —— V3.5 麦克风主/副两段判定 ——

@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// exe 所在目录（随包分发工具的查找位置）。
-fn exe_dir() -> Option<PathBuf> {
+pub(crate) fn exe_dir() -> Option<PathBuf> {
     std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
@@ -28,7 +28,8 @@ fn ffprobe_path() -> String {
 }
 
 /// 查找顺序：环境变量 `env_key` → `dir` 下同名可执行 → PATH（裸名字）。
-fn resolve_tool(dir: Option<&Path>, env_key: &str, name: &str) -> String {
+/// ffmpeg/ffprobe/iperf3 等 PC 侧工具共用的查找规则（V3.12 起 iperf3 同规）。
+pub(crate) fn resolve_tool(dir: Option<&Path>, env_key: &str, name: &str) -> String {
     if let Ok(p) = std::env::var(env_key) {
         return p;
     }
