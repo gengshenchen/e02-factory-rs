@@ -26,6 +26,8 @@ const PLAYBACK_INTERVAL: Duration = Duration::from_millis(200);
 pub struct ManualAsk {
     pub title: String,
     pub question: String,
+    /// 判定对象在媒体井（录像/拍照）：井底判定条；否则居中弹窗
+    pub in_media: bool,
     /// 应答截止时刻（None = 不限时）；到点 worker 自动判失败
     pub deadline: Option<Instant>,
     reply: Sender<UiResponse>,
@@ -442,12 +444,17 @@ impl E02App {
                     *slot = r;
                 }
             }
-            UiEvent::Manual { title, question } => {
+            UiEvent::Manual {
+                title,
+                question,
+                in_media,
+            } => {
                 if let Some(reply) = self.manual_tx.clone() {
-                    attention(ctx); // 及时弹窗（V3）：任务栏闪烁提醒操作员
+                    attention(ctx); // 及时提醒（V3）：任务栏闪烁
                     self.manual = Some(ManualAsk {
                         title,
                         question,
+                        in_media,
                         deadline: self.manual_deadline(),
                         reply,
                     });
@@ -725,7 +732,8 @@ impl eframe::App for E02App {
         // 人工判定模态窗（指示灯 / MIC·喇叭）
         // 按键引导弹窗（V2.1）
         ui::dialog_keys::show(ctx, self);
-        // 设置窗口（V2.2）
+        ui::dialog_manual::show(ctx, self); // 非媒体井判定项（指示灯/麦克风）
+                                            // 设置窗口（V2.2）
         ui::panel_settings::show(ctx, self);
         // 报告中心（V3：历史浏览 + 今日统计）
         ui::dialog_report::show(ctx, self);

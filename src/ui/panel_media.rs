@@ -10,7 +10,7 @@ use std::time::Instant;
 
 pub fn show(ui: &mut egui::Ui, app: &mut E02App) {
     // 判定条先占住井底，余下空间画媒体（判定期间内容完整可见）
-    if app.manual.is_some() {
+    if app.manual.as_ref().is_some_and(|m| m.in_media) {
         egui::TopBottomPanel::bottom("judge_bar")
             .frame(egui::Frame::default().inner_margin(egui::Margin {
                 left: 8.0,
@@ -77,6 +77,7 @@ fn judge_bar(ui: &mut egui::Ui, app: &mut E02App) {
         return;
     };
     let (title, question, deadline) = (ask.title.clone(), ask.question.clone(), ask.deadline);
+    debug_assert!(ask.in_media); // 非媒体判定不走本条（弹窗负责）
     egui::Frame::default()
         .fill(theme::DARK_ELEVATED)
         .rounding(egui::Rounding::same(10.0))

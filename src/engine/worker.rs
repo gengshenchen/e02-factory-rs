@@ -329,7 +329,7 @@ fn photo_flow(
     }
     let _ = tx.send(UiEvent::PhotoReady(local));
     // 3) 人工确认图像质量（清晰/色彩/条纹）
-    send_manual(tx, "拍照测试", "拍照图像是否清晰、色彩正常？");
+    send_manual(tx, "拍照测试", "拍照图像是否清晰、色彩正常？", true);
     match wait_answer(manual, manual_secs) {
         Ok(true) => {
             r.verdict = Verdict::ManualYes;
@@ -433,7 +433,12 @@ fn video_flow(
     // 3) 人工确认：媒体区回放（对应原程序 Sleep(2500) 观察窗），
     //    弹窗落在右上面板区，不遮挡画面
     thread::sleep(Duration::from_millis(2500));
-    send_manual(tx, "录像测试", "录像画面是否清晰？有无条纹？声音是否正常？");
+    send_manual(
+        tx,
+        "录像测试",
+        "录像画面是否清晰？有无条纹？声音是否正常？",
+        true,
+    );
     let audio_note = if has_audio {
         "含音频流"
     } else {
@@ -460,10 +465,11 @@ fn video_flow(
 }
 
 /// 发人工判定弹窗（先弹窗再执行设备动作，操作员不等空界面——V3.2 教训）。
-fn send_manual(tx: &Sender<UiEvent>, title: &str, question: &str) {
+fn send_manual(tx: &Sender<UiEvent>, title: &str, question: &str, in_media: bool) {
     let _ = tx.send(UiEvent::Manual {
         title: title.to_string(),
         question: question.to_string(),
+        in_media,
     });
 }
 
@@ -491,7 +497,7 @@ fn dialog_flow(
     manual_secs: u64,
 ) -> RunOutcome {
     let mut r = TestResult::new(item);
-    send_manual(tx, item.label(), question);
+    send_manual(tx, item.label(), question, false);
     match wait_answer(manual, manual_secs) {
         Ok(true) => r.verdict = Verdict::ManualYes,
         Ok(false) => r.verdict = Verdict::ManualNo,
@@ -531,7 +537,7 @@ fn mic_flow(tx: &Sender<UiEvent>, manual: &Receiver<UiResponse>, manual_secs: u6
     ];
     let mut marks: Vec<(&str, bool)> = Vec::new();
     for (name, factory, question) in phases {
-        send_manual(tx, &format!("{name}判定"), question);
+        send_manual(tx, &format!("{name}判定"), question, false);
         let mut loopback = start_loopback(tx, &factory.device_cmd());
         // 输出不作自动判定，人工听感为准
         match wait_answer(manual, manual_secs) {

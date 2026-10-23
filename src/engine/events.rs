@@ -17,8 +17,13 @@ pub enum UiEvent {
     /// 一项测试完成（可能带回设备信息）
     Result(crate::engine::TestResult, Option<DeviceInfo>),
     /// 请求人工判定（worker 阻塞等待应答）。title 区分同项内的多个阶段
-    /// （如麦克风的主麦/副麦两段判定）。
-    Manual { title: String, question: String },
+    /// （如麦克风的主麦/副麦两段判定）。`in_media` = 判定对象在媒体井
+    /// （录像/拍照）：UI 走井底判定条；否则（指示灯/麦克风听感）弹窗。
+    Manual {
+        title: String,
+        question: String,
+        in_media: bool,
+    },
     /// 按键引导流程状态：已检测到的键码（4=多功能 5=开机 6=音量）。
     /// `awaiting` 为真时 worker 阻塞等待 [`UiResponse::KeysRetry`]/[`UiResponse::KeysForce`]。
     KeysUpdate { detected: Vec<u8>, awaiting: bool },

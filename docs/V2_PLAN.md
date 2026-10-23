@@ -469,5 +469,10 @@ doc_lazy_continuation（clippy deny 级）。
   右侧：合格（绿实底）/不合格（红实底）大按钮 118×40。
 - 快捷键 P=合格 / F=不合格（`wants_keyboard_input` 时不抢键，避免
   干扰 DragValue 输入）。
-- `dialog_manual.rs` 删除（人工应答协议、超时、worker 阻塞等待均
-  不变，纯 UI 层替换）。按键引导弹窗（dialog_keys）不需看画面，维持。
+- `dialog_manual.rs` 保留但收窄（V3.11.1 真机反馈）：**井底判定条只
+  用于录像/拍照**（判定对象在媒体井）；指示灯（dialog_flow）、麦克风
+  听感（主麦/副麦）等其余人工项维持居中弹窗——判定内容不在井里，
+  弹窗不挡东西。路由标记 `UiEvent::Manual{in_media}` /
+  `ManualAsk.in_media`：panel_media 只在 in_media 时画条，
+  dialog_manual 只在 !in_media 时弹窗。worker 应答协议、超时、
+  阻塞等待均不变。按键引导弹窗（dialog_keys）不需看画面，维持。
