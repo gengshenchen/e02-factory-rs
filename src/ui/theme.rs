@@ -88,8 +88,16 @@ pub fn apply(ctx: &Context) {
     v.popup_shadow = egui::epaint::Shadow::NONE;
     v.window_shadow = egui::epaint::Shadow::NONE;
 
-    // 控件状态：画布底 + 发丝描边（= 次级按钮形态），悬停微沉，按下珊瑚深档
+    // 控件状态：画布底 + 发丝描边（= 次级按钮形态），悬停微沉，按下珊瑚深档。
+    // weak_bg_fill 是 0.29 新增的"输入件"底（ComboBox/DragValue/勾选框走它，
+    // 默认冷灰 #e6e6e6，漏设会混进 egui 默认灰——V3.7 真机截图发现）：
+    // 输入件统一用 CARD（比画布深一档，同 extreme_bg 语义），悬停 SOFT
     let w = &mut v.widgets;
+    w.noninteractive.weak_bg_fill = SOFT;
+    w.inactive.weak_bg_fill = CARD;
+    w.hovered.weak_bg_fill = SOFT;
+    w.active.weak_bg_fill = CARD;
+    w.open.weak_bg_fill = CARD;
     w.noninteractive.bg_fill = CANVAS;
     w.noninteractive.fg_stroke = hairline(BODY);
     w.noninteractive.bg_stroke = hairline(HAIRLINE);
@@ -123,6 +131,13 @@ pub fn apply(ctx: &Context) {
 /// 浮点回退字面量告警（float-literal-f32-fallback），收口到一处。
 pub fn hairline(color: Color32) -> Stroke {
     Stroke::new(1.0_f32, color)
+}
+
+/// 节标题（设置窗等浅底面板）：14px 暖墨加粗。
+/// 不用裸 `ui.strong()`——其颜色取 widgets.active.fg_stroke（按下态
+/// 按钮白字），画在浅底上不可见（V3.7 真机反馈设置页文字消失）。
+pub fn section(ui: &mut egui::Ui, text: &str) {
+    ui.label(egui::RichText::new(text).size(14.0).strong().color(INK));
 }
 
 /// 状态圆点（避免字形符号：直接画圆）。按正文行高分配高度、圆画中心，

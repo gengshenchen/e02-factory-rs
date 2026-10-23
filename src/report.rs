@@ -90,7 +90,17 @@ pub fn render_text(
         "\n汇总: {} 项，PASS {pass}，FAIL {fail}，跳过 {skip}\n",
         results.len()
     ));
-    s
+    sanitize(&s)
+}
+
+/// 报告文本清洗（V3.7）：设备串口输出会夹带控制字符（真机 WiFi 行
+/// `d\x11!` 一类 DC1/EOT 垃圾），直接落盘在报告中心/外部查看器呈乱码。
+/// 保留换行，其余控制字符（\r、DEL、ANSI 转义等）一律滤除；
+/// 报告中心读取旧文件时同样过一遍。
+pub fn sanitize(text: &str) -> String {
+    text.chars()
+        .filter(|c| *c == '\n' || !c.is_control())
+        .collect()
 }
 
 /// 写入报告，返回路径。文件名规则（V3.2 产线反馈：同机重测要更新同一份报告）：
@@ -219,6 +229,16 @@ fn to_local(t: SystemTime) -> DateTime<Local> {
 mod tests {
     use super::*;
     use crate::engine::TestItem;
+
+    #[test]
+    fn sanitize_strips_device_control_garbage() {
+        // 真机样例（V3.7）：WiFi 输出夹带 DC1(\x11)/EOT(\x04) 串口垃圾
+        let dirty = "d\u{11}!\nSending discover...\r\nd\u{4}$";
+        assert_eq!(sanitize(dirty), "d!\nSending discover...\nd$");
+        // 正常报告文本（含全角标点）不受影响
+        let clean = "结果: FAIL\n汇总: 11 项（60s）";
+        assert_eq!(sanitize(clean), clean);
+    }
 
     fn meta() -> ReportMeta {
         ReportMeta {

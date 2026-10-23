@@ -287,6 +287,8 @@ impl E02App {
             return self.report_text.as_ref().map(|(_, t)| t.as_str());
         }
         let text = std::fs::read_to_string(&want).unwrap_or_else(|e| format!("报告读取失败: {e}"));
+        // 旧报告可能带控制字符（V3.7 之前未过滤），显示时同样清洗
+        let text = report::sanitize(&text);
         self.report_text = Some((want, text));
         self.report_text.as_ref().map(|(_, t)| t.as_str())
     }
@@ -501,6 +503,12 @@ fn load_texture(
 
 impl eframe::App for E02App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // 主题守卫（V3.7）：eframe/系统主题事件可能在启动后改写 visuals
+        // （真机 Linux 黑色主题下弹窗/设置出现 egui 默认灰底白字），
+        // 发现偏离即重刷；正常帧为一次字段比较，无开销
+        if ctx.style().visuals.window_fill != ui::theme::CANVAS {
+            ui::theme::apply(ctx);
+        }
         if self.busy {
             ctx.request_repaint(); // 测试进行期间持续刷新
         }
@@ -531,23 +539,32 @@ impl eframe::App for E02App {
                         if let Some(p) = &self.progress {
                             let frac = p.done as f32 / p.total.max(1) as f32;
                             let elapsed = p.started.elapsed();
-                            let text = format!(
-                                "测试中 {}/{} {} {:02}:{:02}",
-                                p.done,
-                                p.total,
-                                self.current
-                                    .map(|i| i.label().to_string())
-                                    .unwrap_or_default(),
-                                elapsed.as_secs() / 60,
-                                elapsed.as_secs() % 60
-                            );
+                            // V3.7：文字移出条外——ProgressBar 内嵌文字色取
+                            // visuals.selection.stroke（我们=珊瑚发丝线），
+                            // 画在珊瑚填充上不可读；条只作视觉，数字放旁边
                             ui.add_space(10.0);
-                            ui.add(
-                                egui::ProgressBar::new(frac)
-                                    .text(text)
-                                    .desired_width(300.0)
-                                    .fill(ui::theme::PRIMARY),
-                            );
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::ProgressBar::new(frac)
+                                        .desired_width(190.0)
+                                        .desired_height(10.0)
+                                        .fill(ui::theme::PRIMARY),
+                                );
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "{}/{} {} {:02}:{:02}",
+                                        p.done,
+                                        p.total,
+                                        self.current
+                                            .map(|i| i.label().to_string())
+                                            .unwrap_or_default(),
+                                        elapsed.as_secs() / 60,
+                                        elapsed.as_secs() % 60
+                                    ))
+                                    .small()
+                                    .color(ui::theme::BODY),
+                                );
+                            });
                         }
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

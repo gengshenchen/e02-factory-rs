@@ -312,3 +312,32 @@ MFC 源码佐证：老版 MIC 按钮即 `adb shell camera-factory 13` + MessageB
 附带发现（未改代码）：该真机 camera-factory 10 蓝牙 MAC 首轮输出为空
 判 FAIL、复测正常，疑似设备侧偶发；陀螺仪 `gyroscope-test:false`
 （WhoAmI=0x0）为该机硬件/固件真实不良。
+
+## V3.7（真机反馈：进度条/设置页/报告乱码，2026-10-23）
+
+真机 V3.6.3 复测"测试可以"，带回三个界面问题：
+
+1. **进度条文字不可读**：egui 0.29 的 `ProgressBar` 文字色取
+   `visuals.selection.stroke.color`——我们把它设成了主操作珊瑚橙
+   发丝线，文字画在同色填充上等于隐形（截图只见珊瑚色条）。
+   修复：文字移出进度条，改为条右侧 `已测/总数 当前项 mm:ss`
+   小号正文色（BODY）；条本体保留珊瑚填充。
+2. **设置页文字消失 + 控件灰突兀**（用户机器上是 Windows，Linux
+   黑色主题是误归因，实际是两处主题漏洞）：
+   - `ui.strong()` 颜色取 `widgets.active.fg_stroke`（按下按钮白字），
+     我们主题里是纯白——节标题画在浅底上不可见。新增
+     `theme::section()` 助手统一节标题（14px INK），设置窗全部改用；
+   - egui 0.29 新增输入件底色 `widgets.*.weak_bg_fill`（ComboBox/
+     DragValue/勾选框），默认冷灰 #e6e6e6，漏设混进暖色主题。
+     补设：inactive/open=CARD、hovered/noninteractive=SOFT。
+   设置窗同时按设计规范重排：三列测试项 Grid、分节线、右对齐
+   启用数提示、宽度 500。
+3. **报告中心乱码**：设备串口输出夹带控制字符（真机 WiFi 行
+   `d\x11!`、`d\x04$` 一类 DC1/EOT 垃圾）直接落盘。新增
+   `report::sanitize()`（保留换行、滤除其余控制字符），写入前和
+   报告中心显示旧文件时都过一遍。
+4. **设置即时保存**：任何控件改动即写回 exe 同目录 config.toml
+   （成功静默、失败记日志），移除"保存"按钮。
+
+新增测试：sanitize 过滤真机样例（DC1/EOT 滤除、\r 剥离、全角标点
+不受影响）。至此 36 个测试。
