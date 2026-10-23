@@ -417,3 +417,28 @@ config auto_start、worker 拔出中止场景并入序列大测试）。
 
 坑：rustdoc 注释行首 `+` 会被当 Markdown 列表项触发
 doc_lazy_continuation（clippy deny 级）。
+
+### V3.10.1 设置窗撑满整屏修复（真机反馈）
+
+真机（1280 宽屏）打开设置，窗口横向撑满整屏、卡布局变形。三因叠加：
+
+1. **egui Frame 只按内容 min_rect 收缩绘制**（containers/frame.rs
+   `Prepared::paint`），不会自动撑满可用宽——主界面卡显满宽是碰巧
+   内部有分隔线等撑宽元素。设置卡内容（标题/勾选/选项卡）窄，
+   各卡缩成自然宽、参差不齐。
+2. **自动定尺寸 Window**：内容宽跟着"当前可用宽"走，两列卡宽度
+   `available_width()` 推导，真机首帧可用宽=屏幕宽 → 整窗被撑满。
+3. **Window 默认双向滚动**：内容超高触发后同样进入可用宽漂移。
+
+修复（src/ui/panel_settings.rs）：
+
+- 窗口 `fixed_size(620×700)` + `vscroll(false)`：宽度钉死不随屏幕
+  漂移；高度按屏限，超出由显式 `ScrollArea::vertical()` 滚动。
+- 新增 `card_begin()`：卡内起手 `card_inputs()` +
+  `ui.set_min_width(ui.available_width())`——内容抬到卡全宽，
+  Frame 才按全宽绘制（egui 的硬规则，必须显式抬）。
+- 两列卡列宽改 `ui.set_max_width(w)` 限宽（set_min_width 只抬
+  不限，会吃满剩余宽把第二列挤出去）。
+
+验证：桌面冒烟截图逐行测卡带——6 张卡统一 619px 全宽、两列各
+~300px 等宽、窗体外宽固定 654px，任何屏幕一致。
