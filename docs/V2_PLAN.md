@@ -499,8 +499,12 @@ doc_lazy_continuation（clippy deny 级）。
   min_mbps_down/max_retr/retest/server_port（旧 ping 字段弃用，老
   config.toml 兼容读取）。
 
-PC 侧分发已落地：tools-build 工作流（mingw 交叉编译 ESnet 3.17.1 静态
-版，sha256 钉死 → Windows runner 回环冒烟 → 自动提交 `tools/iperf3-win64.exe`
-进仓库），release.yml 取用进 zip/MSI；MSI 安装期 netsh 加防火墙入站规则
-（immediate CA，perMachine 全程提权；卸载删同名规则），zip 用户按 README
-手工加。待办：真机验证固件 iperf3 版本/nc 交互；v0.4.0 出包。
+PC 侧分发已落地：ESnet 源码不支持 mingw 交叉编译（sys/socket.h 等 POSIX 头
+无条件包含，configure socket 探测静默 exit 1，LIBS=-lws2_32 过了 configure
+也编不过），改用 Windows 事实发行版 ar51an/iperf3-win-builds 3.22（Cygwin
+版，iperf3.exe+cygwin1.dll 成对，sha256 钉死）→ tools-build 工作流（Windows
+runner 回环冒烟，JSON 字段与上位机解析器对齐）自动提交 tools/ 进仓库；
+release.yml 取用进 zip/MSI；MSI 安装期 netsh 加防火墙入站规则（immediate
+CA，perMachine 全程提权；卸载删同名规则），zip 用户按 README 手工加。
+待办：tools-build 跑绿+二进制入库 → v0.4.0-test 临时 tag 验证带 iperf3 的
+MSI → 固件侧 iperf3 版本确认、真机 → v0.4.0。

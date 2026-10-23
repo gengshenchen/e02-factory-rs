@@ -1,10 +1,13 @@
 name: tools-build
 
-# 产线 PC 侧工具的一次性构建：mingw 交叉编译 iperf3（ESnet 官方源码，
-# 固定版本 + sha256 校验），Windows runner 冒烟验证（版本 + 本机回环
-# 自测，顺带确认 JSON 字段与上位机解析器匹配）后提交 tools/ 进仓库。
-# 发布工作流只取用仓库里的成品，互不耦合。升级 iperf3 改 ENV 后
-# 手动跑一次（或改本文件触发）即可。
+# 产线 PC 侧工具的一次性入库：WiFi 吞吐测试用的 PC 端 iperf3。
+# ESnet 官方源码不支持 mingw 交叉编译（sys/socket.h 等 POSIX 头无条件
+# 包含，configure 的 socket 探测在 mingw 下静默 exit 1，改 LIBS 也过不了
+# 编译），Windows 事实发行版是 ar51an/iperf3-win-builds（Cygwin 运行时，
+# 不改官方源码，每版过 VirusTotal）。本工作流：钉死 tag + sha256 下载
+# → Windows runner 冒烟（版本 + 本机回环自测，顺带确认 JSON 字段与上位机
+# 解析器匹配）→ 提交 tools/ 进仓库。发布工作流只取用仓库里的成品。
+# 升级 iperf3：改 ENV 版本号与 sha256（本地 curl 下载计算），手动跑一次。
 
 on:
   workflow_dispatch:
@@ -20,86 +23,31 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  IPERF3_VERSION: 3.17.1
-  IPERF3_SHA256: 84404ca8431b595e86c473d8f23d8bb102810001f15feaf610effd3b318788aa
+  IPERF3_VER: '3.22'
+  # ar51an/iperf3-win-builds release 3.22 的 iperf-3.22-win64.zip
+  IPERF3_URL: https://github.com/ar51an/iperf3-win-builds/releases/download/3.22/iperf-3.22-win64.zip
+  IPERF3_SHA256: C9FEABB3D721039508CCB81F74C2ADA3AE11B9E75D33D24510573C2AA21DA420
+  # win64.zip = 无 OpenSSL 版（同上位机 --without-openssl 设计）；
+  # 内容 iperf3.exe + cygwin1.dll（动态链接 Cygwin，两个文件须一起分发）
 
 jobs:
-  build:
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - name: 安装 mingw-w64
-        run: |
-          # 只装 x86_64 交叉链（mingw-w64 元包会拖 i686+x86_64 两套）；优先用
-          # runner 预置索引直接装——apt-get update 偶发镜像挂死（曾卡 60+ 分钟），
-          # 失败才 update 重试
-          pkgs="gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64"
-          if ! sudo apt-get install -y --no-install-recommends $pkgs; then
-            sudo apt-get update
-            sudo apt-get install -y --no-install-recommends $pkgs
-          fi
-          x86_64-w64-mingw32-gcc --version | head -1
-
-      - name: 下载源码并校验 sha256
-        run: |
-          curl -fsSL -o iperf3.tar.gz "https://downloads.es.net/pub/iperf/iperf-${IPERF3_VERSION}.tar.gz"
-          echo "${IPERF3_SHA256}  iperf3.tar.gz" | sha256sum -c -
-          tar xzf iperf3.tar.gz
-
-      - name: 交叉编译（静态，无 OpenSSL）
-        run: |
-          cd "iperf-${IPERF3_VERSION}"
-          # 失败时把日志尾部转 ::error 注解（check-runs annotations API 公开可读，
-          # 匿名也能定位），同时写 job summary；所有路径 || true 防诊断自身失败
-          emit() {
-            { echo "### $2 失败（末 30 行）"; tail -30 "$1" 2>/dev/null || true; } >> "$GITHUB_STEP_SUMMARY" || true
-            grep -aiE 'error|fatal|cannot|undefined|no such|not found|failed|no rule' "$1" 2>/dev/null |
-              head -12 | while IFS= read -r l; do printf '::error title=%s::%s\n' "$2" "${l%%$'\r'}" || true; done
-            tail -5 "$1" 2>/dev/null | while IFS= read -r l; do printf '::error title=%s-tail::%s\n' "$2" "${l%%$'\r'}" || true; done
-            true
-          }
-          # mingw 的 socket/inet_ntop 在 ws2_32，autoconf 默认搜索列表没有——
-          # 预设 LIBS 让首轮 "none required" 即命中（iperf3 configure 的
-          # not-found 分支是 echo + exit 1 静默失败）；LIBS 也会进 Makefile
-          # 参与最终链接
-          if ! LIBS="-lws2_32" ./configure --host=x86_64-w64-mingw32 --without-openssl \
-                --enable-static-bin > ../configure.log 2>&1; then
-            emit ../configure.log configure; exit 1
-          fi
-          if ! make -j"$(nproc)" > ../make.log 2>&1; then
-            emit ../make.log make; exit 1
-          fi
-          ls -l src/iperf3.exe
-          # 静态验证：导入表不应出现 mingw 运行库 DLL（objdump 随交叉 binutils 装好，
-          # 不依赖宿主 file 命令）
-          x86_64-w64-mingw32-objdump -p src/iperf3.exe | sed -n '/DLL Name/p'
-
-      # 失败时留档完整日志（仓库主人可直接取）
-      - name: 上传编译日志
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: tools-build-logs
-          path: |
-            configure.log
-            make.log
-          if-no-files-found: ignore
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: iperf3-win64
-          path: iperf-${{ env.IPERF3_VERSION }}/src/iperf3.exe
-
-  smoke:
-    needs: build
+  verify:
     runs-on: windows-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/download-artifact@v4
-        with:
-          name: iperf3-win64
+      - name: 下载并校验 sha256
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri $env:IPERF3_URL -OutFile iperf3.zip
+          $h = (Get-FileHash -Algorithm SHA256 iperf3.zip).Hash
+          if ($h -ne $env:IPERF3_SHA256) {
+            Write-Output "::error title=sha256::期望 $env:IPERF3_SHA256 实际 $h——上游重新打包了？升级要重钉"
+            exit 1
+          }
+          Expand-Archive iperf3.zip -DestinationPath .
+          Get-ChildItem *.exe,*.dll | Select-Object Name,Length
 
-      # 回环测试不涉防火墙；验证可执行 + 无 DLL 依赖 + JSON 字段齐全
+      # 回环测试不涉防火墙；验证可执行 + JSON 字段齐全（上位机解析依赖）
       - name: 版本与本机回环自测
         shell: pwsh
         run: |
@@ -111,13 +59,20 @@ jobs:
           $null = $p.WaitForExit(5000)
           $j = Get-Content cli.json -Raw | ConvertFrom-Json
           if (-not $j.end.sum_sent.bits_per_second) {
-            Write-Output "缺 end.sum_sent.bits_per_second 字段（上位机解析依赖）"
+            Write-Output "::error title=smoke::缺 end.sum_sent.bits_per_second 字段（上位机解析依赖）"
             exit 1
           }
           "smoke ok: {0:N1} Mbps" -f ($j.end.sum_sent.bits_per_second / 1e6)
 
+      - uses: actions/upload-artifact@v4
+        with:
+          name: iperf3-win64
+          path: |
+            iperf3.exe
+            cygwin1.dll
+
   commit:
-    needs: smoke
+    needs: verify
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -128,16 +83,17 @@ jobs:
           name: iperf3-win64
           path: tools-tmp
 
-      - name: 提交 tools/iperf3-win64.exe
+      - name: 提交 tools/iperf3-win64.exe + tools/cygwin1.dll
         run: |
           mkdir -p tools
           cp tools-tmp/iperf3.exe tools/iperf3-win64.exe
+          cp tools-tmp/cygwin1.dll tools/cygwin1.dll
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add tools/iperf3-win64.exe
+          git add tools/
           if git diff --cached --quiet; then
             echo "二进制无变化，跳过提交"
             exit 0
           fi
-          git commit -m "tools: rebuild iperf3-win64.exe ${IPERF3_VERSION} (static mingw, no OpenSSL)"
+          git commit -m "tools: iperf3-win64 ${IPERF3_VER} from ar51an/iperf3-win-builds (+cygwin1.dll, LGPL)"
           git push

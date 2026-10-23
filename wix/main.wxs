@@ -33,13 +33,15 @@
           <Component Id="MainExecutable" Guid="B381AAF2-E577-49AF-8894-F7543C1DFD7D" Win64="yes">
             <File Id="ExeFile" Source="target\release\e02-factory-rs.exe" KeyPath="yes" />
           </Component>
-          <!-- bundle ffmpeg/ffprobe (video frame extraction); iperf3 (WiFi
-               throughput test server, built by tools-build workflow); no PATH
+          <!-- bundle ffmpeg/ffprobe (video frame extraction); iperf3 + cygwin1.dll
+               (WiFi throughput test server, ar51an win-builds via tools-build
+               workflow; cygwin1.dll must sit next to iperf3.exe); no PATH
                dependency -->
           <Component Id="BundledTools" Guid="7C4A1B9E-52D8-4E36-9B7A-1F3E2D5C8A64" Win64="yes">
             <File Id="FfmpegExe" Source="target\release\ffmpeg.exe" />
             <File Id="FfprobeExe" Source="target\release\ffprobe.exe" />
             <File Id="Iperf3Exe" Source="target\release\iperf3.exe" />
+            <File Id="CygwinDll" Source="target\release\cygwin1.dll" />
           </Component>
         </Directory>
       </Directory>

@@ -67,7 +67,7 @@ exe 同目录 `config.toml`（缺失用内置默认；GUI "⚙ 设置" 可视化
 
 - 推送任意分支：GitHub Actions 在 Ubuntu / Windows / macOS 上跑 `fmt + clippy + test + release build`
 - 推送 `v*` 标签：自动构建各平台安装包并发布到 GitHub Releases
-  - Windows：zip（exe + 随包 ffmpeg/ffprobe/iperf3）+ MSI（同 zip 内容，另自动加 iperf3 防火墙入站规则）
+  - Windows：zip（exe + 随包 ffmpeg/ffprobe/iperf3/cygwin1.dll）+ MSI（同 zip 内容，另自动加 iperf3 防火墙入站规则）
   - Linux：tar.gz（含 ffmpeg/ffprobe）+ deb（安装时自动依赖 ffmpeg）
 
 ```bash
@@ -82,7 +82,7 @@ git tag v0.1.0 && git push origin v0.1.0
 |---|---|
 | adb | Android platform-tools，置于 PATH；或设环境变量 `ADB` 指向绝对路径 |
 | ffmpeg / ffprobe | 仅录像测试需要。zip / tar.gz 已随包附带（解压即用，程序自动识别同目录）；deb 安装时自动装；MSI v0.3.1 起随包附带 |
-| iperf3 | 仅 WiFi 深度吞吐测试需要（PC 侧）。zip / MSI 已随包附带；自备版本设环境变量 `IPERF3` 指向路径。**zip 用户需手动加防火墙规则**（MSI 安装时已自动加，zip 没有安装过程）：管理员运行 `netsh advfirewall firewall add rule name="E02FactoryTest iperf3" dir=in action=allow program="<zip解压目录>\iperf3.exe" enable=yes`，否则吞吐测试会被防火墙拦下 |
+| iperf3 | 仅 WiFi 深度吞吐测试需要（PC 侧）。zip / MSI 已随包附带（ar51an/iperf3-win-builds 的 iperf3.exe + cygwin1.dll，二者必须同目录成对）；自备版本设环境变量 `IPERF3` 指向路径。**zip 用户需手动加防火墙规则**（MSI 安装时已自动加，zip 没有安装过程）：管理员运行 `netsh advfirewall firewall add rule name="E02FactoryTest iperf3" dir=in action=allow program="<zip解压目录>\iperf3.exe" enable=yes`，否则吞吐测试会被防火墙拦下 |
 | USB 驱动 | Windows 需安装设备 ADB 驱动（通常随 platform-tools 或厂商驱动） |
 
 首次运行在数据目录生成 `media/`（拉回的照片/视频）与 `reports/`（每测一份 txt 报告，文件名带时间与 SN），换台设备重新打开即可。
@@ -107,6 +107,6 @@ git tag v0.1.0 && git push origin v0.1.0
   - [x] 应用图标（assets/icon.png 窗口图标；icon.ico 已用于 MSI/快捷方式）
   - [x] MSI 桌面 + 开始菜单快捷方式（wix/main.wxs 定制，版本号跟 Cargo.toml）——安装效果待 Windows 真机验证
   - [x] ffmpeg 随包分发：zip/tar.gz 附带 LGPL 静态版（BtbN n8.1，与 exe 同目录自动识别）；deb 声明 apt 依赖；MSI v0.3.1 起随包附带
-  - [x] iperf3 随包分发（WiFi 吞吐测试）：tools-build 工作流 mingw 交叉编译 ESnet 3.17.1 静态版（sha256 钉死）→ Windows runner 冒烟 → 提交 `tools/iperf3-win64.exe` 进仓库，zip / MSI 取用；MSI 安装期自动加防火墙入站规则
+  - [x] iperf3 随包分发（WiFi 吞吐测试）：ESnet 源码不支持 mingw 交叉编译（POSIX 头无条件包含），改用 Windows 事实发行版 ar51an/iperf3-win-builds 3.22（Cygwin 版 iperf3.exe + cygwin1.dll 成对，sha256 钉死）→ tools-build 工作流 Windows runner 冒烟 → 提交 `tools/` 进仓库，zip / MSI 取用；MSI 安装期自动加防火墙入站规则
   - [ ] 安装包元数据定稿（license / 维护者信息）
   - [ ] 真机回归（adb + E02 设备）与产线试运行
