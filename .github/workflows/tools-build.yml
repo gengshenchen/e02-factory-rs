@@ -58,7 +58,12 @@ jobs:
             tail -5 "$1" 2>/dev/null | while IFS= read -r l; do printf '::error title=%s-tail::%s\n' "$2" "${l%%$'\r'}" || true; done
             true
           }
-          if ! ./configure --host=x86_64-w64-mingw32 --without-openssl --enable-static-bin > ../configure.log 2>&1; then
+          # mingw 的 socket/inet_ntop 在 ws2_32，autoconf 默认搜索列表没有——
+          # 预设 LIBS 让首轮 "none required" 即命中（iperf3 configure 的
+          # not-found 分支是 echo + exit 1 静默失败）；LIBS 也会进 Makefile
+          # 参与最终链接
+          if ! LIBS="-lws2_32" ./configure --host=x86_64-w64-mingw32 --without-openssl \
+                --enable-static-bin > ../configure.log 2>&1; then
             emit ../configure.log configure; exit 1
           fi
           if ! make -j"$(nproc)" > ../make.log 2>&1; then
