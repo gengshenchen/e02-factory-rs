@@ -1,4 +1,4 @@
-<?xml version="1.0" encoding="windows-1252"?>
+<?xml version="1.0" encoding="UTF-8"?>
 <!--
   MSI 安装定义（V3 产线反馈：安装后找不到程序、无快捷方式）。
   cargo wix 直接使用本文件（不再用 init 默认模板）：
@@ -6,7 +6,10 @@
   - 桌面 + 开始菜单快捷方式（指向主程序，工作目录=安装目录）
   - 版本号取 Cargo.toml（$(var.Version)；cargo-wix 只传 candle -dVersion= 等变量，
   !(wix.*) 绑定变量没人注入——v0.3.0 首发因此挂在 light 链接期）
-  文案保持 ASCII：MSI 代码页 1252 放不下中文。
+  安装器内字符串（Name/Description 等）保持 ASCII；MSI 数据库代码页默认 1252
+  放不下中文。源文件本身须声明 UTF-8：注释里的中文按 UTF-8 存盘，若声明
+  windows-1252，0x8D/0x8F 等字节在 1252 无定义，candle 解析 XML 直接失败
+  （v0.3.0 首发两连挂的真凶之一）。
 -->
 <Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
   <Product Id="*" Name="E02 Factory Test" Language="1033"

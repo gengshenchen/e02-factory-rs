@@ -76,13 +76,17 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Compress-Archive -Path target/release/e02-factory-rs.exe,target/release/ffmpeg.exe,target/release/ffprobe.exe -DestinationPath dist/${{ matrix.artifact }}.zip
 
-      - name: 构建 MSI 安装包
+      # install 与编译分步：步骤级结论公开可读（job 日志要 admin 权限），
+      # 再挂能从步骤名直接看出挂在安装还是编译
+      - name: 安装 cargo-wix
+        if: runner.os == 'Windows'
+        run: cargo install cargo-wix --locked
+
+      - name: 编译 MSI（cargo wix）
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          cargo install cargo-wix --locked *>&1 | Tee-Object -FilePath wix-build.log
-          if ($LASTEXITCODE -ne 0) { exit 1 }
-          cargo wix *>&1 | Tee-Object -FilePath wix-build.log -Append
+          cargo wix *>&1 | Tee-Object -FilePath wix-build.log
           if ($LASTEXITCODE -ne 0) { exit 1 }
           Get-ChildItem target/wix/*.msi | Move-Item -Destination dist/
 
@@ -101,6 +105,15 @@ jobs:
         with:
           name: ${{ matrix.artifact }}
           path: dist/*
+
+      # 失败时留档 wix 日志（下载需登录，但仓库主人可直接取）
+      - name: 上传 MSI 失败日志
+        if: failure() && runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: wix-build-log
+          path: wix-build.log
+          if-no-files-found: ignore
 
   release:
     needs: build
