@@ -3,6 +3,8 @@ name: Release
 on:
   push:
     tags: ['v*']
+  # 手动触发（main 上空跑迭代 MSI，不发布、不动 tag）
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -82,18 +84,29 @@ jobs:
         if: runner.os == 'Windows'
         run: cargo install cargo-wix --locked
 
+      # cargo-wix 默认捕获 candle/light 输出、只吐末行错误（上轮日志仅 263
+      # 字节即此故）；-v 关捕获拿全量日志。错误行转 ::error 注解——check-runs
+      # annotations API 公开可读，无仓库权限也能定位真实报错。
+      # continue-on-error：MSI 迭代期不阻塞 zip/deb 发布。
       - name: 编译 MSI（cargo wix）
         if: runner.os == 'Windows'
+        continue-on-error: true
         shell: pwsh
         run: |
-          cargo wix *>&1 | Tee-Object -FilePath wix-build.log
-          if ($LASTEXITCODE -ne 0) { exit 1 }
+          cargo wix -v *>&1 | Tee-Object -FilePath wix-build.log
+          if ($LASTEXITCODE -ne 0) {
+            Select-String -Path wix-build.log -Pattern 'error','cannot find','failed' |
+              Select-Object -First 10 | ForEach-Object {
+                Write-Output "::error title=MSI build::$($_.Line)"
+              }
+            exit 1
+          }
           Get-ChildItem target/wix/*.msi | Move-Item -Destination dist/
 
       # MSI 首次构建未验证过；失败时把日志尾部写进 job summary（公开可读，
       # 无需仓库权限即可定位）
       - name: MSI 失败诊断
-        if: failure() && runner.os == 'Windows'
+        if: always() && runner.os == 'Windows'
         shell: pwsh
         run: |
           "# cargo-wix 日志（末 120 行）" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
@@ -108,7 +121,7 @@ jobs:
 
       # 失败时留档 wix 日志（下载需登录，但仓库主人可直接取）
       - name: 上传 MSI 失败日志
-        if: failure() && runner.os == 'Windows'
+        if: always() && runner.os == 'Windows'
         uses: actions/upload-artifact@v4
         with:
           name: wix-build-log
@@ -117,6 +130,7 @@ jobs:
 
   release:
     needs: build
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
