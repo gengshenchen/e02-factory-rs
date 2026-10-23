@@ -36,6 +36,37 @@ pub const BATCH_ORDER: [TestItem; 11] = [
 
 /// 同步执行测试序列（worker 线程与测试共用）。
 /// 自动项先行、人工项殿后（V3 产线反馈：操作员可在自动项期间离手）。
+/// 测试项在批序中的位置（报告行序基准；不在批序的排最后）。
+fn batch_pos(item: TestItem) -> usize {
+    BATCH_ORDER
+        .iter()
+        .position(|&i| i == item)
+        .unwrap_or(usize::MAX)
+}
+
+/// 结果入列（V3.9）：按测试项替换既有槽位（单项补测合并整机报告），
+/// 无则按批序插入。
+fn upsert(results: &mut Vec<TestResult>, r: TestResult) {
+    if let Some(slot) = results.iter_mut().find(|s| s.item == r.item) {
+        *slot = r;
+    } else {
+        let at = results
+            .iter()
+            .position(|s| batch_pos(s.item) > batch_pos(r.item))
+            .unwrap_or(results.len());
+        results.insert(at, r);
+    }
+}
+
+/// 整机基线（V3.9 单项补测）：上一轮设备信息 + 各项结果。单项补测以
+/// 此为底稿，新结果按项替换后重写整机报告（一机一日一份不散页）；
+/// 全测传默认值（空白，全新开始）。
+#[derive(Debug, Default)]
+pub struct RunBase {
+    pub device: DeviceInfo,
+    pub results: Vec<TestResult>,
+}
+
 /// 返回报告文件路径；写入失败为 None。
 pub fn run_sequence(
     items: &[TestItem],
@@ -44,6 +75,7 @@ pub fn run_sequence(
     media_dir: &Path,
     reports_dir: &Path,
     cfg: &Config,
+    base: RunBase,
 ) -> Option<PathBuf> {
     exec::clear_abort(); // 新序列不残留上一轮的停止请求
     let _ = std::fs::create_dir_all(media_dir);
@@ -61,8 +93,9 @@ pub fn run_sequence(
     ordered.sort_by_key(|i| i.is_manual());
     let first_manual = ordered.iter().position(|i| i.is_manual());
 
-    let mut device = DeviceInfo::default();
-    let mut results: Vec<TestResult> = Vec::new();
+    let mut device = base.device;
+    let mut results = base.results;
+    results.sort_by_key(|r| batch_pos(r.item)); // 底稿按批序归位，报告行序稳定
     let _ = tx.send(UiEvent::Log(format!(
         "序列开始，工位 {}，共 {} 项（自动 {} + 人工 {}），单项超时 {}",
         cfg.station,
@@ -101,7 +134,7 @@ pub fn run_sequence(
             device.merge(d.clone());
         }
         let _ = tx.send(UiEvent::Result(result.clone(), dev));
-        results.push(result);
+        upsert(&mut results, result);
         // 报告边测边写：中途卡死/退出也留有报告；文件名同机同日固定，
         // 重测覆盖更新，SN 中途解析到后改名并删旧文件（V3.2）
         let _ = write_update(
@@ -119,7 +152,7 @@ pub fn run_sequence(
                 let mut r = TestResult::new(skip);
                 r.verdict = Verdict::Skipped;
                 r.detail = exec::abort_reason().text().into();
-                results.push(r.clone());
+                upsert(&mut results, r.clone());
                 let _ = tx.send(UiEvent::Result(r, None));
             }
             let _ = tx.send(UiEvent::Log(format!(
@@ -1017,8 +1050,17 @@ mod tests {
         let media_c = media.clone();
         let reports_c = reports.clone();
         let cfg = Config::default();
-        let handle =
-            thread::spawn(move || run_sequence(&items, &tx, &mrx, &media_c, &reports_c, &cfg));
+        let handle = thread::spawn(move || {
+            run_sequence(
+                &items,
+                &tx,
+                &mrx,
+                &media_c,
+                &reports_c,
+                &cfg,
+                RunBase::default(),
+            )
+        });
 
         let (mut manual_asked, mut photo_ready, mut video_ready) = (0, 0, 0);
         let mut verdicts: Vec<(TestItem, Verdict)> = Vec::new();
@@ -1204,7 +1246,15 @@ mod tests {
             let (m_c, r_c) = (media.clone(), reports.clone());
             let live_items = vec![TestItem::Keys];
             let handle = thread::spawn(move || {
-                run_sequence(&live_items, &tx, &mrx, &m_c, &r_c, &Config::default())
+                run_sequence(
+                    &live_items,
+                    &tx,
+                    &mrx,
+                    &m_c,
+                    &r_c,
+                    &Config::default(),
+                    RunBase::default(),
+                )
             });
             let (mut waves, mut verdict) = (0usize, None);
             while let Ok(ev) = rx.recv_timeout(Duration::from_secs(60)) {
@@ -1305,7 +1355,15 @@ mod tests {
             let mic_items = vec![TestItem::MicSpeaker];
             let t0 = Instant::now();
             let handle = thread::spawn(move || {
-                run_sequence(&mic_items, &tx, &mrx, &m_c, &r_c, &Config::default())
+                run_sequence(
+                    &mic_items,
+                    &tx,
+                    &mrx,
+                    &m_c,
+                    &r_c,
+                    &Config::default(),
+                    RunBase::default(),
+                )
             });
             let (mut asked, mut verdict) = (0usize, None);
             while let Ok(ev) = rx.recv_timeout(Duration::from_secs(30)) {
@@ -1422,7 +1480,15 @@ mod tests {
         let (m_c, r_c) = (media.clone(), reports.clone());
         let t0 = Instant::now();
         let handle = thread::spawn(move || {
-            run_sequence(&stop_items, &tx, &mrx, &m_c, &r_c, &Config::default())
+            run_sequence(
+                &stop_items,
+                &tx,
+                &mrx,
+                &m_c,
+                &r_c,
+                &Config::default(),
+                RunBase::default(),
+            )
         });
         let mut stop_verdicts = Vec::new();
         while let Ok(ev) = rx.recv_timeout(Duration::from_secs(30)) {
@@ -1459,7 +1525,15 @@ mod tests {
         let (_mtx, mrx) = mpsc::channel();
         let (m_g, r_g) = (media.clone(), reports.clone());
         let handle = thread::spawn(move || {
-            run_sequence(&gone_items, &tx, &mrx, &m_g, &r_g, &Config::default())
+            run_sequence(
+                &gone_items,
+                &tx,
+                &mrx,
+                &m_g,
+                &r_g,
+                &Config::default(),
+                RunBase::default(),
+            )
         });
         let mut gone_verdicts = Vec::new();
         while let Ok(ev) = rx.recv_timeout(Duration::from_secs(30)) {
@@ -1505,7 +1579,15 @@ mod tests {
         let t0 = Instant::now();
         let ks_items = vec![TestItem::Keys];
         let handle = thread::spawn(move || {
-            run_sequence(&ks_items, &tx, &mrx, &m_c, &r_c, &Config::default())
+            run_sequence(
+                &ks_items,
+                &tx,
+                &mrx,
+                &m_c,
+                &r_c,
+                &Config::default(),
+                RunBase::default(),
+            )
         });
         let mut ks_verdicts = Vec::new();
         while let Ok(ev) = rx.recv_timeout(Duration::from_secs(30)) {
@@ -1544,7 +1626,15 @@ mod tests {
         let t0 = Instant::now();
         let ks_items = vec![TestItem::Keys];
         let handle = thread::spawn(move || {
-            run_sequence(&ks_items, &tx, &mrx, &m_c, &r_c, &Config::default())
+            run_sequence(
+                &ks_items,
+                &tx,
+                &mrx,
+                &m_c,
+                &r_c,
+                &Config::default(),
+                RunBase::default(),
+            )
         });
         let mut ks_verdicts = Vec::new();
         while let Ok(ev) = rx.recv_timeout(Duration::from_secs(30)) {
@@ -1591,7 +1681,9 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let (mtx, mrx) = mpsc::channel();
         let (m, r) = (media.to_path_buf(), reports.to_path_buf());
-        let handle = thread::spawn(move || run_sequence(&items, &tx, &mrx, &m, &r, &cfg));
+        let handle = thread::spawn(move || {
+            run_sequence(&items, &tx, &mrx, &m, &r, &cfg, RunBase::default())
+        });
 
         let (mut verdicts, mut awaiting) = (Vec::new(), 0usize);
         while let Ok(ev) = rx.recv_timeout(Duration::from_secs(60)) {
@@ -1613,5 +1705,64 @@ mod tests {
         }
         handle.join().unwrap();
         (verdicts, awaiting)
+    }
+
+    #[test]
+    fn single_item_retest_merges_into_unit_report() {
+        let _g = crate::exec::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::exec::clear_abort();
+        let base_dir = std::env::temp_dir().join(format!("e02-merge-{}", std::process::id()));
+        let media = base_dir.join("media");
+        let reports = base_dir.join("reports");
+        std::fs::create_dir_all(&reports).unwrap();
+        let script = base_dir.join("adb-merge");
+        std::fs::write(&script, "#!/bin/sh\nprintf 'wifi ok\n'\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::env::set_var("ADB", &script);
+        // 整机底稿：设备信息合格、WiFi 不合格，SN 已知（上一轮全测产物）
+        let mut r_info = TestResult::new(TestItem::DeviceInfo);
+        r_info.verdict = Verdict::Pass;
+        let mut r_wifi = TestResult::new(TestItem::Wifi);
+        r_wifi.verdict = Verdict::Fail;
+        let base = RunBase {
+            device: DeviceInfo {
+                sn: "SNM".into(),
+                ..Default::default()
+            },
+            results: vec![r_info, r_wifi],
+        };
+        // 单项补测 WiFi（假桩输出 ok → 合格），应替换底稿槽位并重写整机报告
+        let items = vec![TestItem::Wifi];
+        let (tx, rx) = mpsc::channel();
+        let (_mtx, mrx) = mpsc::channel();
+        let (m, r) = (media.clone(), reports.clone());
+        let handle = thread::spawn(move || {
+            run_sequence(&items, &tx, &mrx, &m, &r, &Config::default(), base)
+        });
+        let mut verdicts = Vec::new();
+        while let Ok(ev) = rx.recv_timeout(Duration::from_secs(30)) {
+            if let UiEvent::Result(res, _) = ev {
+                verdicts.push((res.item, res.verdict));
+            }
+        }
+        let report = handle.join().unwrap().expect("补测应产出报告");
+        assert_eq!(verdicts, vec![(TestItem::Wifi, Verdict::Pass)]);
+        // 同 SN 同日文件：整机报告被重写，不是另散一份单项报告
+        assert!(report.to_string_lossy().contains("SNM"), "{report:?}");
+        let text = std::fs::read_to_string(&report).unwrap();
+        assert!(text.contains("sn-address:SNM"), "{text}");
+        assert!(text.contains("设备信息:PASS"), "{text}"); // 底稿项保留
+        assert!(text.contains("WiFi 测试:PASS"), "{text}"); // 补测项替换
+        assert!(!text.contains("WiFi 测试:FAIL"), "{text}");
+        assert!(text.contains("汇总: 2 项，PASS 2"), "{text}");
+        assert!(text.contains("结果: PASS"), "{text}"); // 补测通过整机翻 PASS
+        std::env::remove_var("ADB");
+        crate::exec::clear_abort();
+        let _ = std::fs::remove_dir_all(&base_dir);
     }
 }

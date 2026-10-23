@@ -228,8 +228,24 @@ impl E02App {
         let reports = self.reports_dir.clone();
         let n = items.len();
         let cfg = self.config.clone();
+        // 单项补测以当前整机结果为底稿（V3.9）：测完按项合并、重写整机
+        // 报告，不另散一份单项报告；全测从空白开始
+        let base = if items.len() == 1 {
+            let active = self.config.active_items();
+            worker::RunBase {
+                device: self.device.clone(),
+                results: self
+                    .results
+                    .iter()
+                    .filter(|r| active.contains(&r.item))
+                    .cloned()
+                    .collect(),
+            }
+        } else {
+            worker::RunBase::default()
+        };
         thread::spawn(move || {
-            let report = worker::run_sequence(&items, &tx, &mrx, &media, &reports, &cfg);
+            let report = worker::run_sequence(&items, &tx, &mrx, &media, &reports, &cfg, base);
             let _ = tx.send(UiEvent::Finished { report });
         });
         self.push_log(format!("开始测试，共 {n} 项（自动项先行，人工项弹窗判定）"));
@@ -248,6 +264,16 @@ impl E02App {
             StopReason::DeviceGone => "设备已拔出，测试中止，等待当前命令退出...",
         };
         self.push_log(msg);
+    }
+
+    /// 清空上一台的界面显示（V3.9）：结果回待测、设备信息清空、媒体区
+    /// 复位、停回放声音；报告文件与日志不动（磁盘审计留痕）。
+    /// 在"下一台插入"沿调用而非拔出沿——操作员拔线后还要看结果。
+    fn clear_unit_state(&mut self) {
+        self.results = TestItem::ALL.map(TestResult::new).to_vec();
+        self.device = DeviceInfo::default();
+        self.stop_audio();
+        self.media = MediaState::Note("媒体区：拍照显示图片，录像解码后回放".into());
     }
 
     /// 播放录像音轨（V3.6）。OutputStream 首次播放时创建并保活。
@@ -354,11 +380,16 @@ impl E02App {
                 }
                 DevState::Online(sn) => {
                     self.push_log(format!("设备已连接: {sn}"));
-                    if self.config.conn.auto_start && !self.busy {
-                        let items = self.batch_items();
-                        if !items.is_empty() {
-                            self.push_log("设备已插入，自动开始全测");
-                            self.start_run(items);
+                    if !self.busy {
+                        // 新机插入（V3.9）：清上一台界面显示再（可选）自动开测
+                        self.clear_unit_state();
+                        self.push_log("已清空上一台显示");
+                        if self.config.conn.auto_start {
+                            let items = self.batch_items();
+                            if !items.is_empty() {
+                                self.push_log("自动开始全测");
+                                self.start_run(items);
+                            }
                         }
                     }
                 }
