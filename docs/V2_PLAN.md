@@ -273,3 +273,12 @@ frame 会撑满剩余可用高度**（`Layout::next_frame_ignore_wrap`：`is_hor
 | 陀螺仪 `gyroscope-test:false` 判 PASS | 只按"输出含 FAIL"通用判定；固件自检失败时回读 `:false` 而无 FAIL 字样 | 新增 `gyro_ok`：严格等 `gyroscope-test:true`，拿不到 true 即失败 |
 
 MFC 源码佐证：老版 MIC 按钮即 `adb shell camera-factory 13` + MessageBox（等待命令完成后再弹窗）；T33 新版日志显示 13 有"停校准→回环"两段语义且 2s 自退——当前固件行为已变，上位机不能把"命令退出"当流程节点。
+
+## V3.6.2（真机日志：按键粘包，2026-10-23）
+
+真机 camera-factory 15 输出存在**串口粘包**：垃圾串 HC0 糊在报文前后
+（`Key 4HC0`、`HC0…\Key test enable`）。词级匹配（key 与数字须为独立
+空白分词）在 `Key 4HC0` 上永远失配——多功能键收不齐、弹窗转人工改判。
+改为模糊匹配：`key`（大小写不敏感）后跳过空白、紧跟目标数字即命中，
+数字后跟任意字符（粘连垃圾/粘连数字）都算；`keyboard 4`、
+`Key test enable/disable`（key 后是字母）仍不误判。真机粘贴样例入单测。
