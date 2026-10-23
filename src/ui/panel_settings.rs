@@ -105,7 +105,7 @@ pub fn show(ctx: &egui::Context, app: &mut E02App) {
                     }
                 }
             });
-            ui.small("固件回读格式 key 4/5/6（多功能键/开机键/音量+）");
+            ui.small("固件回读格式 key 4/5/6（多功能键 / 开机键·音量- / 音量+）");
 
             ui.separator();
             ui.strong("超时");

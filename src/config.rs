@@ -68,7 +68,7 @@ impl Default for WifiCfg {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct KeysCfg {
-    /// 必测键码：4=多功能键 5=开机键 6=音量+
+    /// 必测键码：4=多功能键 5=开机键/音量-（复用按键） 6=音量+
     #[serde(default = "d_keys_required")]
     pub required: Vec<u8>,
 }

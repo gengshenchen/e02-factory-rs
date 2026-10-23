@@ -139,10 +139,11 @@ pub fn sdcard_ok(output: &str) -> bool {
     output.contains("true")
 }
 
-/// 键码 → 名称（V3.5 固件回读格式 `key N`：4=多功能键，5=开机键/-，6=音量+）。
+/// 键码 → 名称（V3.5 固件回读格式 `key N`：4=多功能键，5=开机键/音量-
+/// （复用按键），6=音量+）。
 pub fn key_name(code: u8) -> &'static str {
     match code {
-        5 => "开机键",
+        5 => "开机键/音量-",
         6 => "音量+",
         _ => "多功能键",
     }
@@ -329,7 +330,7 @@ mod tests {
         assert!(parse_keys_codes("Key test enable").is_empty());
         assert!(parse_keys_codes("Key test disable").is_empty());
         assert!(parse_keys_codes("soft-ware:E02-1.0.5").is_empty());
-        assert_eq!(key_name(5), "开机键");
+        assert_eq!(key_name(5), "开机键/音量-");
         assert_eq!(key_name(6), "音量+");
         assert_eq!(key_name(4), "多功能键");
     }
