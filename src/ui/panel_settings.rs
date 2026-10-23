@@ -199,6 +199,22 @@ pub fn show(ctx: &egui::Context, app: &mut E02App) {
                     .small()
                     .color(theme::MUTED),
             );
+
+            ui.add_space(10.0);
+            ui.separator();
+
+            // —— 连接 ——
+            theme::section(ui, "连接");
+            ui.add_space(6.0);
+            changed |= ui
+                .checkbox(&mut app.config.conn.auto_start, "插入设备后自动开始全测")
+                .changed();
+            ui.add_space(2.0);
+            ui.label(
+                egui::RichText::new("检测到 USB 设备上线即开始；测试中拔出立即中止")
+                    .small()
+                    .color(theme::MUTED),
+            );
         });
     app.settings_open = open;
     // 即时保存（V3.7）：改动即落盘 config.toml，成功静默、失败记日志

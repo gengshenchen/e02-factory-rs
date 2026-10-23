@@ -112,6 +112,14 @@ impl Default for TimeoutsCfg {
     }
 }
 
+/// 连接（V3.8 设备在位监测）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ConnCfg {
+    /// 检测到设备插入（USB/adb 上线）即自动开始全测
+    #[serde(default)]
+    pub auto_start: bool,
+}
+
 /// 工位档案：启用的测试项（slug 列表，顺序即执行顺序参考）。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Profile {
@@ -132,6 +140,9 @@ pub struct Config {
     /// 超时（V2.3）
     #[serde(default)]
     pub timeouts: TimeoutsCfg,
+    /// 连接/在位监测（V3.8）
+    #[serde(default)]
+    pub conn: ConnCfg,
 }
 
 fn d_station() -> String {
@@ -166,6 +177,7 @@ impl Default for Config {
             wifi: WifiCfg::default(),
             keys: KeysCfg::default(),
             timeouts: TimeoutsCfg::default(),
+            conn: ConnCfg::default(),
         }
     }
 }
@@ -247,7 +259,17 @@ mod tests {
         assert_eq!(cfg.wifi.depth, WifiDepth::Driver);
         assert_eq!(cfg.keys.required, vec![4, 5, 6]);
         assert_eq!(cfg.timeouts.item_secs, 60);
+        assert!(!cfg.conn.auto_start);
         assert_eq!(cfg.active_items().len(), 6);
+    }
+
+    #[test]
+    fn conn_auto_start_parses() {
+        let cfg: Config = toml::from_str("[conn]\nauto_start = true\n").unwrap();
+        assert!(cfg.conn.auto_start);
+        // roundtrip 保持
+        let back: Config = toml::from_str(&cfg.to_toml().unwrap()).unwrap();
+        assert!(back.conn.auto_start);
     }
 
     #[test]

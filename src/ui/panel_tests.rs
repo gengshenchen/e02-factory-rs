@@ -31,13 +31,29 @@ pub fn show(ui: &mut egui::Ui, app: &mut E02App) {
     ui.add_space(8.0);
 
     let run = theme::primary("开始测试").min_size(egui::vec2(ui.available_width(), 44.0));
+    // 在位门槛（V3.8）：未连接/多台都禁用（start_run 内同款兜底）
+    let online = app.device_online();
+    let disabled_hint = if app.busy {
+        "测试进行中，可点右上角停止测试"
+    } else if !online {
+        "设备未连接：请插入 USB 线"
+    } else {
+        "按工位配置执行全部启用项（自动项先行）"
+    };
     if ui
-        .add_enabled(!app.busy, run)
+        .add_enabled(!app.busy && online, run)
         .on_hover_text("按工位配置执行全部启用项（自动项先行）")
-        .on_disabled_hover_text("测试进行中，可点右上角停止测试")
+        .on_disabled_hover_text(disabled_hint)
         .clicked()
     {
         app.start_run(app.batch_items());
+    }
+    if !online && !app.busy {
+        ui.label(
+            egui::RichText::new("设备未连接，插入 USB 后开始")
+                .small()
+                .color(theme::MUTED),
+        );
     }
 
     let active = app.config.active_items();

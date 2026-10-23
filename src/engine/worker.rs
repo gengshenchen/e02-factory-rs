@@ -89,7 +89,7 @@ pub fn run_sequence(
         // 停止请求落在当前项：命令被强杀记为 FAIL 的改记跳过，不计失败
         if exec::abort_requested() && result.verdict == Verdict::Fail {
             result.verdict = Verdict::Skipped;
-            result.detail = "手动结束测试".into();
+            result.detail = exec::abort_reason().text().into();
         }
         let _ = tx.send(UiEvent::Log(format!(
             "【{}】{} {}",
@@ -118,12 +118,13 @@ pub fn run_sequence(
             for &skip in rest {
                 let mut r = TestResult::new(skip);
                 r.verdict = Verdict::Skipped;
-                r.detail = "手动结束测试".into();
+                r.detail = exec::abort_reason().text().into();
                 results.push(r.clone());
                 let _ = tx.send(UiEvent::Result(r, None));
             }
             let _ = tx.send(UiEvent::Log(format!(
-                "手动结束测试，剩余 {} 项跳过",
+                "{}，剩余 {} 项跳过",
+                exec::abort_reason().text(),
                 rest.len()
             )));
             break;
@@ -444,7 +445,7 @@ fn wait_answer(manual: &Receiver<UiResponse>, manual_secs: u64) -> Result<bool, 
             format!("超时未人工判定（{manual_secs}s），自动判失败"),
         )),
         Err(WaitEnd::Disconnected) => Err((Verdict::Skipped, "界面已退出，判定中断".into())),
-        Err(WaitEnd::Aborted) => Err((Verdict::Skipped, "手动结束测试".into())),
+        Err(WaitEnd::Aborted) => Err((Verdict::Skipped, exec::abort_reason().text().into())),
     }
 }
 
@@ -765,7 +766,7 @@ fn keys_flow(
             }
             KeysListen::Aborted => {
                 r.verdict = Verdict::Skipped;
-                r.detail = "手动结束测试".into();
+                r.detail = exec::abort_reason().text().into();
                 break;
             }
             // 监听等待循环只在终态 break，Update 已在循环内转发
@@ -835,7 +836,7 @@ fn keys_flow(
                     }
                     Err(WaitEnd::Aborted) => {
                         r.verdict = Verdict::Skipped;
-                        r.detail = "手动结束测试".into();
+                        r.detail = exec::abort_reason().text().into();
                         break;
                     }
                 }
@@ -877,7 +878,7 @@ fn keys_flow(
                     }
                     Err(WaitEnd::Aborted) => {
                         r.verdict = Verdict::Skipped;
-                        r.detail = "手动结束测试".into();
+                        r.detail = exec::abort_reason().text().into();
                         break;
                     }
                 }
@@ -1426,7 +1427,7 @@ mod tests {
         let mut stop_verdicts = Vec::new();
         while let Ok(ev) = rx.recv_timeout(Duration::from_secs(30)) {
             if matches!(ev, UiEvent::Current(_)) {
-                exec::request_abort(); // 收到第一项 Current 即模拟操作员按停止
+                exec::request_abort(exec::StopReason::User); // 收到第一项 Current 即模拟操作员按停止
             }
             if let UiEvent::Result(r, _) = ev {
                 stop_verdicts.push((r.item, r.verdict));
@@ -1447,6 +1448,39 @@ mod tests {
         );
         let text = std::fs::read_to_string(&stop_report).unwrap();
         assert!(text.contains("手动结束测试"));
+        assert!(text.contains("结果: 跳过"));
+        exec::clear_abort();
+
+        // —— V3.8 设备拔出中止：同一停止路径，文案按原因 ——
+        exec::clear_abort();
+        std::env::set_var("ADB", &sscript); // 复用上面的慢速桩
+        let gone_items = vec![TestItem::Wifi, TestItem::SdCard];
+        let (tx, rx) = mpsc::channel();
+        let (_mtx, mrx) = mpsc::channel();
+        let (m_g, r_g) = (media.clone(), reports.clone());
+        let handle = thread::spawn(move || {
+            run_sequence(&gone_items, &tx, &mrx, &m_g, &r_g, &Config::default())
+        });
+        let mut gone_verdicts = Vec::new();
+        while let Ok(ev) = rx.recv_timeout(Duration::from_secs(30)) {
+            if matches!(ev, UiEvent::Current(_)) {
+                // 模拟监测线程发现设备拔出
+                exec::request_abort(exec::StopReason::DeviceGone);
+            }
+            if let UiEvent::Result(r, _) = ev {
+                gone_verdicts.push((r.item, r.verdict));
+            }
+        }
+        let gone_report = handle.join().unwrap().expect("拔出后仍应产出报告");
+        assert_eq!(
+            gone_verdicts,
+            vec![
+                (TestItem::Wifi, Verdict::Skipped),
+                (TestItem::SdCard, Verdict::Skipped)
+            ]
+        );
+        let text = std::fs::read_to_string(&gone_report).unwrap();
+        assert!(text.contains("设备已拔出"));
         assert!(text.contains("结果: 跳过"));
         exec::clear_abort();
 
@@ -1482,7 +1516,7 @@ mod tests {
                     ..
                 }
             ) {
-                exec::request_abort(); // 弹窗已开、监听进行中：模拟按停止
+                exec::request_abort(exec::StopReason::User); // 弹窗已开、监听进行中：模拟按停止
             }
             if let UiEvent::Result(r, _) = ev {
                 ks_verdicts.push((r.item, r.verdict));
@@ -1515,7 +1549,7 @@ mod tests {
         let mut ks_verdicts = Vec::new();
         while let Ok(ev) = rx.recv_timeout(Duration::from_secs(30)) {
             if matches!(ev, UiEvent::KeysUpdate { awaiting: true, .. }) {
-                exec::request_abort(); // 不应答，直接停止
+                exec::request_abort(exec::StopReason::User); // 不应答，直接停止
             }
             if let UiEvent::Result(r, _) = ev {
                 ks_verdicts.push((r.item, r.verdict));

@@ -1,9 +1,11 @@
 //! 应用状态与窗口装配：worker 事件消费、媒体显示、人工判定应答。
 
 use crate::config::{self, Config};
+use crate::devwatch::{self, DevState};
 use crate::engine::events::{UiEvent, UiResponse};
 use crate::engine::worker;
 use crate::engine::{TestItem, TestResult};
+use crate::exec::StopReason;
 use crate::protocol::DeviceInfo;
 use crate::report;
 use crate::ui;
@@ -83,6 +85,8 @@ pub enum MediaState {
 pub struct E02App {
     /// 被测设备信息（原 Deviceinfo 结构）
     pub device: DeviceInfo,
+    /// 设备在位状态（V3.8 USB 插拔监测：开测门槛与拔出中止依据）
+    pub dev: DevState,
     /// 各测试项结果，顺序与左侧面板一致
     pub results: Vec<TestResult>,
     /// 测试序列进行中
@@ -118,6 +122,8 @@ pub struct E02App {
     /// 报告中心：选中文件内容缓存（路径, 文本）
     report_text: Option<(PathBuf, String)>,
     event_rx: Option<Receiver<UiEvent>>,
+    /// 在位监测线程事件（V3.8）
+    dev_rx: Receiver<DevState>,
     manual_tx: Option<Sender<UiResponse>>,
     /// 录像回放声音（V3.6）：OutputStream 须保活，Sink 可替换曲目
     audio_out: Option<(rodio::OutputStream, rodio::OutputStreamHandle)>,
@@ -128,6 +134,8 @@ impl E02App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         install_cjk_font(&cc.egui_ctx);
         ui::theme::apply(&cc.egui_ctx);
+        // USB 在位监测（V3.8）：后台线程轮询 adb devices，插拔经事件驱动 UI
+        let dev_rx = devwatch::spawn(&cc.egui_ctx);
         // 配置：exe 同目录 config.toml；缺失用内置默认，坏文件降级并提示
         let (cfg, cfg_err) = match Config::load(&config::default_path()) {
             Ok(c) => (c, None),
@@ -138,6 +146,7 @@ impl E02App {
         };
         let mut app = Self {
             device: DeviceInfo::default(),
+            dev: DevState::Disconnected,
             results: TestItem::ALL.map(TestResult::new).to_vec(),
             busy: false,
             current: None,
@@ -156,6 +165,7 @@ impl E02App {
             report_sel: None,
             report_text: None,
             event_rx: None,
+            dev_rx,
             manual_tx: None,
             audio_out: None,
             audio_sink: None,
@@ -169,6 +179,7 @@ impl E02App {
             app.config.active_items().len(),
             crate::paths::data_dir().display()
         ));
+        app.push_log("等待设备插入（USB 连接后自动检测）");
         app.refresh_stats();
         app
     }
@@ -182,9 +193,23 @@ impl E02App {
             .collect()
     }
 
+    /// 设备是否在线且唯一（可开始测试）。
+    pub fn device_online(&self) -> bool {
+        matches!(self.dev, DevState::Online(_))
+    }
+
     /// 启动测试序列（单项或全测）；busy 期间忽略重复触发。
     pub fn start_run(&mut self, items: Vec<TestItem>) {
         if self.busy || items.is_empty() {
+            return;
+        }
+        // 在位门槛（V3.8）：所有测试依赖 USB 连接，未插/多台都不开测
+        if !self.device_online() {
+            self.push_log(match &self.dev {
+                DevState::Disconnected => "设备未连接：请插入 USB 线后再开始".to_string(),
+                DevState::Multiple => "检测到多台设备：请只连接一台被测耳机".to_string(),
+                DevState::Online(_) => unreachable!("device_online 已排除"),
+            });
             return;
         }
         self.busy = true;
@@ -213,12 +238,16 @@ impl E02App {
     /// 操作员请求停止：杀掉当前命令、剩余项记跳过（worker 侧配合）。
     /// 弹窗立即收起给"已停"反馈（worker 侧 Result/Finished 事件再兜底），
     /// 回放声音同步停止。
-    pub fn request_stop(&mut self) {
-        crate::exec::request_abort();
+    pub fn request_stop(&mut self, reason: StopReason) {
+        crate::exec::request_abort(reason);
         self.keys_prompt = None;
         self.manual = None;
         self.stop_audio();
-        self.push_log("已请求停止，等待当前命令退出...");
+        let msg = match reason {
+            StopReason::User => "已请求停止，等待当前命令退出...",
+            StopReason::DeviceGone => "设备已拔出，测试中止，等待当前命令退出...",
+        };
+        self.push_log(msg);
     }
 
     /// 播放录像音轨（V3.6）。OutputStream 首次播放时创建并保活。
@@ -307,6 +336,42 @@ impl E02App {
     fn manual_deadline(&self) -> Option<Instant> {
         let secs = self.config.timeouts.manual_secs;
         (secs > 0).then(|| Instant::now() + Duration::from_secs(secs))
+    }
+
+    /// 消费在位监测事件（V3.8）：插入可测（配置可开自动开始）；
+    /// 测试中拔出立即走停止路径中止（各项记"设备已拔出"）；多台提示。
+    fn drain_dev_events(&mut self) {
+        while let Ok(next) = self.dev_rx.try_recv() {
+            if next == self.dev {
+                continue;
+            }
+            let was_online = matches!(self.dev, DevState::Online(_));
+            // 先落状态再动作：插入自动开始要过 start_run 的在位门槛
+            self.dev = next.clone();
+            match next {
+                DevState::Multiple => {
+                    self.push_log("检测到多台设备，请只连接一台被测耳机");
+                }
+                DevState::Online(sn) => {
+                    self.push_log(format!("设备已连接: {sn}"));
+                    if self.config.conn.auto_start && !self.busy {
+                        let items = self.batch_items();
+                        if !items.is_empty() {
+                            self.push_log("设备已插入，自动开始全测");
+                            self.start_run(items);
+                        }
+                    }
+                }
+                DevState::Disconnected => {
+                    if was_online {
+                        self.push_log("设备已拔出");
+                        if self.busy {
+                            self.request_stop(StopReason::DeviceGone);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// 排空 worker 事件并落到界面状态。
@@ -512,6 +577,7 @@ impl eframe::App for E02App {
         if self.busy {
             ctx.request_repaint(); // 测试进行期间持续刷新
         }
+        self.drain_dev_events(); // 先处理插拔（拔出要尽快触发中止）
         self.drain_events(ctx);
         self.tick_video(ctx);
 
@@ -569,7 +635,7 @@ impl eframe::App for E02App {
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if self.busy && ui.add(ui::theme::danger("停止测试")).clicked() {
-                            self.request_stop();
+                            self.request_stop(StopReason::User);
                         }
                         if ui.button("报告中心").clicked() {
                             self.refresh_reports();
@@ -578,6 +644,16 @@ impl eframe::App for E02App {
                         if ui.button("设置").clicked() {
                             self.settings_open = true;
                         }
+                        // 设备在位指示（V3.8）：灰=未连接 绿=在线 琥珀=多台
+                        // （right_to_left 布局后加的在最左，呈 "● 设备 …" 排列）
+                        ui.add_space(10.0);
+                        let (dot_color, text) = match &self.dev {
+                            DevState::Disconnected => (ui::theme::MUTED, "设备未连接".to_string()),
+                            DevState::Online(sn) => (ui::theme::OK, format!("设备 {sn}")),
+                            DevState::Multiple => (ui::theme::WARN, "多台设备".to_string()),
+                        };
+                        ui.label(egui::RichText::new(text).small().color(ui::theme::BODY));
+                        ui::theme::dot(ui, dot_color);
                     });
                 });
             });

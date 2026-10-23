@@ -6,6 +6,7 @@ mod adb;
 mod app;
 mod cli;
 mod config;
+mod devwatch;
 mod engine;
 mod exec;
 mod paths;

@@ -88,6 +88,17 @@ pub fn devices() -> Result<Vec<String>> {
     Ok(parse_devices_output(&exec::decode_out(&out.stdout)))
 }
 
+/// `adb devices`（在位监测线程专用，V3.8）：不受全局停止标志影响
+/// （见 [`exec::output_no_abort`]），固定 5s 超时兜底 adb server 卡死。
+pub fn devices_watch() -> Result<Vec<String>> {
+    let out = exec::output_no_abort(
+        Command::new(adb_path()).arg("devices"),
+        Some(std::time::Duration::from_secs(5)),
+    )
+    .context("执行 adb devices 失败")?;
+    Ok(parse_devices_output(&exec::decode_out(&out.stdout)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

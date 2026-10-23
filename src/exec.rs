@@ -8,7 +8,7 @@
 
 use std::io::Read;
 use std::process::{Command, Output, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
 /// 子进程输出解码：优先严格 UTF-8，失败则按 GBK 回退
@@ -34,8 +34,39 @@ static DEFAULT_MS: AtomicU64 = AtomicU64::new(0);
 /// GUI 停止按钮置位；`run_sequence` 入口清零，开始下一轮前不残留。
 static ABORT: AtomicBool = AtomicBool::new(false);
 
+/// 停止原因（V3.8 设备在位监测）：决定中止后各项 detail 文案与看门狗
+/// 强杀消息——操作员手停 vs 设备拔出中止，worker/报告按此落字。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StopReason {
+    #[default]
+    User,
+    DeviceGone,
+}
+
+impl StopReason {
+    /// 跳过项/中止路径的 detail 文案（进报告）。
+    pub fn text(self) -> &'static str {
+        match self {
+            StopReason::User => "手动结束测试",
+            StopReason::DeviceGone => "设备已拔出",
+        }
+    }
+
+    /// 看门狗强杀子进程时的错误消息。
+    fn kill_msg(self) -> &'static str {
+        match self {
+            StopReason::User => "已手动停止，强制终止",
+            StopReason::DeviceGone => "设备已拔出，强制终止",
+        }
+    }
+}
+
+/// 与 ABORT 配套的原因标记（0=User 1=DeviceGone）
+static ABORT_REASON: AtomicU8 = AtomicU8::new(0);
+
 /// 请求停止：正在执行的子进程立即强杀，worker 循环把剩余项记跳过。
-pub fn request_abort() {
+pub fn request_abort(reason: StopReason) {
+    ABORT_REASON.store(reason as u8, Ordering::Relaxed);
     ABORT.store(true, Ordering::Relaxed);
 }
 
@@ -43,8 +74,17 @@ pub fn abort_requested() -> bool {
     ABORT.load(Ordering::Relaxed)
 }
 
+/// 当前停止原因（停止位置位后有效；未置位按手动停止）。
+pub fn abort_reason() -> StopReason {
+    match ABORT_REASON.load(Ordering::Relaxed) {
+        1 => StopReason::DeviceGone,
+        _ => StopReason::User,
+    }
+}
+
 pub fn clear_abort() {
     ABORT.store(false, Ordering::Relaxed);
+    ABORT_REASON.store(StopReason::User as u8, Ordering::Relaxed);
 }
 
 /// exec 与 worker 测试共用此锁串行执行：停止标志是全局静态，
@@ -73,6 +113,21 @@ pub fn default_timeout() -> Option<Duration> {
 /// 无论是否设了超时都走看门狗轮询（V3.6）：此前"0=不限制"直接
 /// `cmd.output()` 阻塞，停止请求在无超时配置下永远不生效。
 pub fn output(cmd: &mut Command, timeout: Option<Duration>) -> std::io::Result<Output> {
+    run(cmd, timeout, true)
+}
+
+/// 同 [`output`] 但不受全局停止标志影响（V3.8 设备在位监测）：
+/// 停止测试置位 ABORT 后，普通查询会被当作停止请求误杀，监测从此
+/// 冻结、插拔不再被感知；超时兜底仍然生效。
+pub fn output_no_abort(cmd: &mut Command, timeout: Option<Duration>) -> std::io::Result<Output> {
+    run(cmd, timeout, false)
+}
+
+fn run(
+    cmd: &mut Command,
+    timeout: Option<Duration>,
+    respect_abort: bool,
+) -> std::io::Result<Output> {
     let deadline = timeout.map(|t| Instant::now() + t);
     let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
     loop {
@@ -83,9 +138,9 @@ pub fn output(cmd: &mut Command, timeout: Option<Duration>) -> std::io::Result<O
                 stderr: read_all(&mut child.stderr),
             });
         }
-        let stop = if abort_requested() {
+        let stop = if respect_abort && abort_requested() {
             Some((
-                "已手动停止，强制终止".to_string(),
+                abort_reason().kill_msg().to_string(),
                 std::io::ErrorKind::Interrupted,
             ))
         } else if deadline.is_some_and(|d| Instant::now() >= d) {
@@ -150,5 +205,31 @@ mod tests {
         cmd.args(["-c", "echo partial; sleep 5"]);
         let r = output(&mut cmd, Some(Duration::from_millis(400)));
         assert!(r.is_err());
+    }
+
+    #[test]
+    fn abort_reason_selects_kill_message() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        request_abort(StopReason::DeviceGone);
+        assert_eq!(abort_reason(), StopReason::DeviceGone);
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "sleep 5"]);
+        let err = output(&mut cmd, None).unwrap_err();
+        assert!(
+            err.to_string().contains("设备已拔出"),
+            "消息应随原因变化: {err}"
+        );
+        clear_abort();
+    }
+
+    #[test]
+    fn no_abort_variant_ignores_stop_flag() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        request_abort(StopReason::User);
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "echo hi"]);
+        let out = output_no_abort(&mut cmd, Some(Duration::from_secs(5))).unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "hi");
+        clear_abort();
     }
 }
