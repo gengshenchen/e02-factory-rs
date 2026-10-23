@@ -11,7 +11,7 @@ use crate::player;
 use crate::protocol::{self, CameraFactory, DeviceInfo};
 use crate::report;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -619,6 +619,21 @@ fn recv_manual(manual: &Receiver<UiResponse>, secs: u64) -> Result<UiResponse, W
     }
 }
 
+/// 按键监听阶段结果：读线程发 `Update`/`Collected`/`Done`，
+/// `Timeout`/`Aborted` 是主流程本地终态。
+enum KeysListen {
+    /// 流中增量检测到新键（主循环转发 UI 点亮弹窗）
+    Update(Vec<u8>),
+    /// 流中收齐全部必测键（V3.6.3：不等固件退出即结束）
+    Collected(Vec<u8>),
+    /// 监听命令自行退出（旧固件行为），携带完整输出
+    Done(String),
+    /// 单项超时耗尽仍未收齐
+    Timeout,
+    /// 手动停止
+    Aborted,
+}
+
 /// 按键引导流程（V2.1）：弹窗提示按键 → 固件监听窗口内操作员按键 →
 /// 回显已检测到的键，收齐自动 PASS；未收齐由操作员重测/改判。
 /// 必测键集合由工位配置裁剪（V2.2）。
@@ -626,6 +641,12 @@ fn recv_manual(manual: &Receiver<UiResponse>, secs: u64) -> Result<UiResponse, W
 /// V3.5：固件回读格式为 `key 4/5/6`（多功能键/开机键·音量-/音量+）；
 /// 弹窗在命令发出前先行打开（此前首个事件要等检测到键或超时才发，
 /// 真机监听窗口无输出时操作员全程看不到弹窗）。
+///
+/// V3.6.3：固件 v2.4.2 的 15 监听进程收齐按键后并不退出（同 13/14 回环
+/// 的行为漂移），原实现把判定押在命令返回上，真机复现"弹窗三键全亮但
+/// 流程不动"。改为 spawn + 读线程：读线程增量解析实时点亮（V3.1 行为
+/// 保留），发现收齐立即发信号，主流程杀本地会话直接判 PASS；命令自行
+/// 退出（旧固件）或单项超时才进入"未收齐"人工弹窗。
 fn keys_flow(
     tx: &Sender<UiEvent>,
     manual: &Receiver<UiResponse>,
@@ -640,25 +661,116 @@ fn keys_flow(
             awaiting: false,
         });
         let _ = tx.send(UiEvent::Log(format!("执行 adb shell {cmd}，请依次按键...")));
-        // V3.1 流式回显：固件监听窗口内每读到一行即增量解析，
-        // 弹窗实时点亮"已按下"（原 MFC 版要等命令退出才显示按下什么键）
-        let mut seen: Vec<u8> = Vec::new();
-        let mut acc = String::new();
-        let tx_live = tx.clone();
-        let stream = adb::shell_stream(&cmd, |line| {
-            acc.push_str(line);
-            acc.push('\n');
-            let got = protocol::parse_keys_codes(&acc);
-            if got != seen {
-                seen = got.clone();
-                let _ = tx_live.send(UiEvent::KeysUpdate {
+        // V3.6.3：spawn + 读线程（同 mic 回环模式）。读线程沿用 V3.1 的
+        // 增量解析——弹窗实时点亮"已按下"（原 MFC 版要等命令退出才显示
+        // 按下什么键）；发现收齐立即发信号，不等固件退出。
+        let mut child = match adb::spawn_shell(&cmd) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                r.verdict = Verdict::Fail;
+                r.detail = format!("启动 {cmd} 失败: {e:#}");
+                break;
+            }
+        };
+        let (sig_tx, sig_rx) = channel::<KeysListen>();
+        if let Some(stdout) = child.as_mut().and_then(|c| c.stdout.take()) {
+            let required = keys.required.clone();
+            thread::spawn(move || {
+                use std::io::{BufRead, BufReader};
+                let mut reader = BufReader::new(stdout);
+                let mut acc = String::new();
+                let mut seen = Vec::new();
+                let mut buf = Vec::new();
+                // 读线程必以一个信号收尾（收齐或 EOF），主流程据此判定。
+                // 增量点亮也走本通道由主循环转发——读线程绝不持有 UI Sender：
+                // 杀掉 adb 后孤儿孙进程可能仍握着管道，读线程会吊到它退出，
+                // 若持有 Sender 克隆，UI 事件通道迟迟不关，界面侧等不到收尾
+                let sig = loop {
+                    buf.clear();
+                    match reader.read_until(b'\n', &mut buf) {
+                        // EOF：监听命令退出（旧固件自退行为），按完整输出判定
+                        Ok(0) => break KeysListen::Done(acc),
+                        Ok(_) => {
+                            // 按字节读行再解码：GBK 输出不被 BufRead::lines 拦腰截断
+                            let line = exec::decode_out(&buf);
+                            let line = line.trim_end_matches(['\n', '\r']);
+                            acc.push_str(line);
+                            acc.push('\n');
+                            let got = protocol::parse_keys_codes(&acc);
+                            if got != seen {
+                                seen = got.clone();
+                                if sig_tx.send(KeysListen::Update(got.clone())).is_err() {
+                                    // 主流程已放弃（超时/停止），继续读无意义
+                                    break KeysListen::Done(acc);
+                                }
+                            }
+                            if required.iter().all(|c| got.contains(c)) {
+                                // 收齐即收尾（V3.6.3 核心修复）
+                                break KeysListen::Collected(got);
+                            }
+                        }
+                        Err(_) => break KeysListen::Done(acc),
+                    }
+                };
+                let _ = sig_tx.send(sig);
+            });
+        } else {
+            let _ = sig_tx.send(KeysListen::Done(String::new()));
+        }
+
+        // 主流程等待信号：250ms 切片响应停止请求，并遵守单项超时
+        // （结构同 recv_manual）
+        let deadline = exec::default_timeout().map(|d| Instant::now() + d);
+        let listen = loop {
+            let slice = deadline
+                .map(|d| d.saturating_duration_since(Instant::now()))
+                .unwrap_or(Duration::from_millis(250))
+                .min(Duration::from_millis(250));
+            if slice.is_zero() {
+                break KeysListen::Timeout;
+            }
+            match sig_rx.recv_timeout(slice) {
+                // 增量点亮：转发 UI 后继续等终态（不 break）
+                Ok(KeysListen::Update(got)) => {
+                    let _ = tx.send(UiEvent::KeysUpdate {
+                        detected: got,
+                        awaiting: false,
+                    });
+                }
+                Ok(sig) => break sig,
+                Err(RecvTimeoutError::Timeout) => {
+                    if exec::abort_requested() {
+                        break KeysListen::Aborted;
+                    }
+                }
+                // 读线程必先发信号再退出；Disconnected 视作空输出退出
+                Err(RecvTimeoutError::Disconnected) => {
+                    break KeysListen::Done(String::new());
+                }
+            }
+        };
+        // 去向无论如何都先结束本地会话（设备侧随会话断开停止监听）
+        stop_loopback(&mut child);
+
+        match listen {
+            KeysListen::Collected(got) => {
+                let _ = tx.send(UiEvent::KeysUpdate {
                     detected: got,
                     awaiting: false,
                 });
+                let _ = tx.send(UiEvent::Log("收齐全部必测按键，结束监听".to_string()));
+                r.verdict = Verdict::Pass;
+                r.detail = "收齐全部按键".into();
+                break;
             }
-        });
-        match stream {
-            Ok(out) => {
+            KeysListen::Aborted => {
+                r.verdict = Verdict::Skipped;
+                r.detail = "手动结束测试".into();
+                break;
+            }
+            // 监听等待循环只在终态 break，Update 已在循环内转发
+            KeysListen::Update(_) => unreachable!("按键监听等待循环只在终态 break"),
+            KeysListen::Done(out) => {
                 let got = protocol::parse_keys_codes(&out);
                 let missing: Vec<&'static str> = keys
                     .required
@@ -728,53 +840,46 @@ fn keys_flow(
                     }
                 }
             }
-            Err(e) => {
-                let msg = format!("{e:#}");
-                if msg.contains("超时") {
-                    // 固件监听窗口一直阻塞到超时：按"未收齐"处理，交给操作员
-                    let _ = tx.send(UiEvent::KeysUpdate {
-                        detected: Vec::new(),
-                        awaiting: true,
-                    });
-                    let _ = tx.send(UiEvent::Log("按键监听超时，无输出".to_string()));
-                    match recv_manual(manual, manual_secs) {
-                        Ok(UiResponse::KeysRetry) | Ok(UiResponse::Manual(true)) => {
-                            let _ = tx.send(UiEvent::KeysUpdate {
-                                detected: Vec::new(),
-                                awaiting: false,
-                            });
-                            continue;
-                        }
-                        Ok(UiResponse::KeysForce(true)) => {
-                            r.verdict = Verdict::ManualYes;
-                            r.detail = "强制判定合格（监听超时无输出）".into();
-                            break;
-                        }
-                        Ok(_) => {
-                            r.verdict = Verdict::ManualNo;
-                            r.detail = "监听超时，未检测到按键".into();
-                            break;
-                        }
-                        Err(WaitEnd::Timeout) => {
-                            r.verdict = Verdict::ManualNo;
-                            r.detail = format!("监听超时且无人应答（{manual_secs}s）");
-                            break;
-                        }
-                        Err(WaitEnd::Disconnected) => {
-                            r.verdict = Verdict::Skipped;
-                            r.detail = "界面已退出，按键判定中断".into();
-                            break;
-                        }
-                        Err(WaitEnd::Aborted) => {
-                            r.verdict = Verdict::Skipped;
-                            r.detail = "手动结束测试".into();
-                            break;
-                        }
+            KeysListen::Timeout => {
+                // 监听窗口耗尽仍没收齐：按"未收齐"处理，交给操作员
+                let _ = tx.send(UiEvent::KeysUpdate {
+                    detected: Vec::new(),
+                    awaiting: true,
+                });
+                let _ = tx.send(UiEvent::Log("按键监听超时，未收齐".to_string()));
+                match recv_manual(manual, manual_secs) {
+                    Ok(UiResponse::KeysRetry) | Ok(UiResponse::Manual(true)) => {
+                        let _ = tx.send(UiEvent::KeysUpdate {
+                            detected: Vec::new(),
+                            awaiting: false,
+                        });
+                        continue;
                     }
-                } else {
-                    r.verdict = Verdict::Fail;
-                    r.detail = msg;
-                    break;
+                    Ok(UiResponse::KeysForce(true)) => {
+                        r.verdict = Verdict::ManualYes;
+                        r.detail = "强制判定合格（监听超时未收齐）".into();
+                        break;
+                    }
+                    Ok(_) => {
+                        r.verdict = Verdict::ManualNo;
+                        r.detail = "监听超时，未收齐按键".into();
+                        break;
+                    }
+                    Err(WaitEnd::Timeout) => {
+                        r.verdict = Verdict::ManualNo;
+                        r.detail = format!("监听超时且无人应答（{manual_secs}s）");
+                        break;
+                    }
+                    Err(WaitEnd::Disconnected) => {
+                        r.verdict = Verdict::Skipped;
+                        r.detail = "界面已退出，按键判定中断".into();
+                        break;
+                    }
+                    Err(WaitEnd::Aborted) => {
+                        r.verdict = Verdict::Skipped;
+                        r.detail = "手动结束测试".into();
+                        break;
+                    }
                 }
             }
         }
@@ -1060,6 +1165,24 @@ mod tests {
         );
         assert_eq!((vs[0].1, n), (Verdict::Pass, 1));
         std::env::remove_var("KEYS_CNT");
+        // 4) V3.6.3 收齐即判 PASS：固件收齐后不退出（真机 v2.4.2 行为，
+        //    日志复现"弹窗三键全亮但流程不动"），也不能把判定押在命令返回上
+        let t0 = Instant::now();
+        let (vs, n) = scenario(
+            &kscript,
+            items(TestItem::Keys),
+            &media,
+            &reports,
+            Config::default(),
+            &keys_case("printf 'key 4\\nkey 5\\nkey 6\\n'; sleep 30"),
+            || unreachable!("收齐即判，不应触发人工应答"),
+        );
+        assert_eq!((vs[0].1, n), (Verdict::Pass, 0));
+        assert!(
+            t0.elapsed() < Duration::from_secs(15),
+            "收齐后应杀会话立即结束，不等固件退出，实测 {:?}",
+            t0.elapsed()
+        );
 
         // —— V3.1 按键流式回显：键码分两波输出（间隔 1s），
         //     弹窗应在监听窗口内逐波点亮，而非命令退出后一次性更新 ——

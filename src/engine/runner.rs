@@ -176,8 +176,14 @@ mod tests {
     use super::*;
 
     /// 用假 adb 脚本桩做端到端验证（Windows CI 跳过，真机行为由产线回归覆盖）。
+    /// ADB 是进程级环境变量、exec 停止位是全局静态：与其他用到假 adb 的
+    /// 测试（worker 序列）互斥，否则并行时互相覆盖桩/误置停止位。
     #[test]
     fn run_auto_info_with_fake_adb() {
+        let _lock = crate::exec::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::exec::clear_abort();
         let dir = std::env::temp_dir().join(format!("e02-fake-adb-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let script = dir.join("adb");

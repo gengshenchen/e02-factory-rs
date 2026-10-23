@@ -31,19 +31,6 @@ pub fn shell(cmd: &str) -> Result<String> {
     Ok(exec::decode_out(&out.stdout).trim().replace('\r', ""))
 }
 
-/// 执行 `adb shell <cmd>` 并流式逐行回调（按键实时回显用），返回完整输出。
-/// 与 [`shell`] 的差别：不因退出码非零报错——按键监听窗口的判定依据是
-/// 输出内容而非退出码；超时/停止语义同 [`exec::output`]。
-pub fn shell_stream(cmd: &str, on_line: impl FnMut(&str)) -> Result<String> {
-    exec::stream_lines(
-        Command::new(adb_path()).arg("shell").arg(cmd),
-        exec::default_timeout(),
-        on_line,
-    )
-    .with_context(|| format!("执行 adb shell {cmd} 失败（adb 是否在 PATH？）"))
-    .map(|out| out.trim().replace('\r', ""))
-}
-
 /// 启动 `adb shell <cmd>` 但不等它退出（V3.6 麦克风回环用）。
 /// 新版固件的 13/14 回环进程存活期间才有声音、不再自动退出；
 /// 调用方拿到 Child 自行读输出、在人工应答后 kill 结束回环。
