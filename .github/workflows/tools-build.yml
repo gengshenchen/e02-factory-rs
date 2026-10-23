@@ -14,6 +14,11 @@ on:
 permissions:
   contents: write # 冒烟通过后把二进制提交回 main
 
+# 重复触发只跑最新一次（旧 run 自动取消，避免堆积占 runner）
+concurrency:
+  group: tools-build
+  cancel-in-progress: true
+
 env:
   IPERF3_VERSION: 3.17.1
   IPERF3_SHA256: 84404ca8431b595e86c473d8f23d8bb102810001f15feaf610effd3b318788aa
