@@ -133,11 +133,32 @@ pub fn hairline(color: Color32) -> Stroke {
     Stroke::new(1.0_f32, color)
 }
 
-/// 节标题（设置窗等浅底面板）：14px 暖墨加粗。
+/// 卡标题（规范 title-sm：16px/500 暖墨）。
 /// 不用裸 `ui.strong()`——其颜色取 widgets.active.fg_stroke（按下态
 /// 按钮白字），画在浅底上不可见（V3.7 真机反馈设置页文字消失）。
-pub fn section(ui: &mut egui::Ui, text: &str) {
-    ui.label(egui::RichText::new(text).size(14.0).strong().color(INK));
+pub fn card_title(ui: &mut egui::Ui, text: &str) {
+    ui.label(egui::RichText::new(text).size(16.0).strong().color(INK));
+}
+
+/// 内容卡（规范 feature-card）：CARD 色块、12px 圆角、无描边无阴影
+/// （color-block first, shadow rare）——深度靠色块分层而非线框。
+pub fn card() -> egui::Frame {
+    egui::Frame::default()
+        .fill(CARD)
+        .rounding(Rounding::same(12.0))
+        .inner_margin(Margin::same(20.0))
+}
+
+/// 卡内输入件配色（规范 text-input）：卡面是 CARD，输入件（勾选/数字/
+/// 下拉）回退画布底 + 发丝描边——比卡面亮一档（canvas-on-card）。
+/// 只改本 Ui 子树（visuals_mut 是子树克隆），不污染全局主题。
+pub fn card_inputs(ui: &mut egui::Ui) {
+    let v = ui.visuals_mut();
+    v.widgets.inactive.weak_bg_fill = CANVAS;
+    v.widgets.active.weak_bg_fill = CANVAS;
+    v.widgets.open.weak_bg_fill = CANVAS;
+    v.widgets.hovered.weak_bg_fill = SOFT;
+    v.widgets.noninteractive.weak_bg_fill = SOFT;
 }
 
 /// 状态圆点（避免字形符号：直接画圆）。按正文行高分配高度、圆画中心，

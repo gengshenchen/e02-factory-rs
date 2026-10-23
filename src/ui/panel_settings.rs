@@ -1,12 +1,49 @@
-//! 设置窗口（V2.2 起，V3.7 重排 + 即时保存）：工位档案、测试项勾选、
-//! WiFi 深度、按键参数、超时。任何改动即时写回 exe 同目录 config.toml
-//! （无需手动点保存）；改动即时生效（每次测试线程取当前配置快照）。
+//! 设置窗口（V2.2 起，V3.10 按设计规范重排）：工位档案、测试项勾选、
+//! WiFi 深度、按键参数、超时、连接。
+//!
+//! 布局语言（awesome-design-md design-md/claude）：分区一律内容卡
+//! （CARD 色块、12px 圆角、color-block first），卡内输入件回退画布底
+//! 加发丝描边（canvas-on-card），工位/深度用分段选项卡（category-tab），
+//! 按键与超时两列并排。任何改动即时写回 exe 同目录 config.toml。
 
 use crate::app::E02App;
 use crate::config::{self, WifiDepth};
 use crate::engine::TestItem;
 use crate::protocol::key_name;
 use crate::ui::theme;
+
+/// 小号说明文字（规范 caption：12.5px 次要色）。
+fn caption(ui: &mut egui::Ui, text: &str) {
+    ui.label(egui::RichText::new(text).small().color(theme::MUTED));
+}
+
+/// 卡标题 + 右侧可选徽章（启用项数等）。
+fn card_head(ui: &mut egui::Ui, title: &str, badge: Option<String>) {
+    ui.horizontal(|ui| {
+        theme::card_title(ui, title);
+        if let Some(t) = badge {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                theme::badge(ui, &t, theme::INK, theme::SELECTED);
+            });
+        }
+    });
+}
+
+/// 分段选项（规范 category-tab）：未选中透明底 + 次要色文字，
+/// 选中奶油强底 + 暖墨文字（圆角随全局 8px）。
+fn tab(ui: &mut egui::Ui, active: bool, text: &str) -> bool {
+    let (bg, fg) = if active {
+        (theme::SELECTED, theme::INK)
+    } else {
+        (egui::Color32::TRANSPARENT, theme::MUTED)
+    };
+    ui.add(
+        egui::Button::new(egui::RichText::new(text).size(14.0).color(fg))
+            .fill(bg)
+            .stroke(egui::Stroke::NONE),
+    )
+    .clicked()
+}
 
 pub fn show(ctx: &egui::Context, app: &mut E02App) {
     if !app.settings_open {
@@ -20,201 +57,199 @@ pub fn show(ctx: &egui::Context, app: &mut E02App) {
         .open(&mut open)
         .collapsible(false)
         .resizable(false)
-        .default_pos(center - egui::vec2(250.0, 330.0))
+        .default_pos(center - egui::vec2(300.0, 360.0))
         .show(ctx, |ui| {
-            ui.set_min_width(500.0);
-
-            // —— 工位档案 ——
-            theme::section(ui, "工位档案");
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                ui.label("当前工位");
-                let station_before = app.config.station.clone();
-                let names: Vec<String> = app.config.profiles.keys().cloned().collect();
-                egui::ComboBox::from_id_salt("station")
-                    .selected_text(&app.config.station)
-                    .width(150.0)
-                    .show_ui(ui, |ui| {
-                        for n in &names {
-                            ui.selectable_value(&mut app.config.station, n.clone(), n);
-                        }
-                    });
-                changed |= app.config.station != station_before;
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(
-                        egui::RichText::new(format!("启用 {} 项", app.config.active_items().len()))
-                            .small()
-                            .color(theme::MUTED),
-                    );
-                });
-            });
-
-            ui.add_space(10.0);
-            ui.separator();
-
-            // —— 测试项 ——
-            theme::section(ui, "测试项");
-            ui.add_space(2.0);
-            ui.label(
-                egui::RichText::new("勾选写入当前工位")
-                    .small()
-                    .color(theme::MUTED),
-            );
+            ui.set_min_width(560.0);
             ui.add_space(4.0);
-            if let Some(profile) = app.config.profiles.get_mut(&app.config.station) {
-                egui::Grid::new("items_grid")
-                    .num_columns(3)
-                    .spacing([20.0, 8.0])
-                    .show(ui, |ui| {
-                        for (idx, item) in TestItem::ALL.iter().enumerate() {
-                            let slug = item.slug().to_string();
-                            let mut on = profile.items.contains(&slug);
-                            if ui.checkbox(&mut on, item.label()).changed() {
-                                if on {
-                                    profile.items.push(slug);
-                                } else {
-                                    profile.items.retain(|s| s != &slug);
-                                }
-                                changed = true;
-                            }
-                            if idx % 3 == 2 {
-                                ui.end_row();
-                            }
-                        }
-                    });
-            }
 
-            ui.add_space(10.0);
-            ui.separator();
-
-            // —— WiFi 测试深度 ——
-            theme::section(ui, "WiFi 测试深度");
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                let depth_before = app.config.wifi.depth;
-                ui.selectable_value(
-                    &mut app.config.wifi.depth,
-                    WifiDepth::Driver,
-                    "驱动（camera-factory 5）",
+            // —— 工位档案：分段选择 + 启用徽章 ——
+            theme::card().show(ui, |ui| {
+                theme::card_inputs(ui);
+                card_head(
+                    ui,
+                    "工位档案",
+                    Some(format!("启用 {} 项", app.config.active_items().len())),
                 );
-                ui.selectable_value(
-                    &mut app.config.wifi.depth,
-                    WifiDepth::Throughput,
-                    "驱动 + 速率（ping 网关）",
-                );
-                changed |= app.config.wifi.depth != depth_before;
-            });
-            if app.config.wifi.depth == WifiDepth::Throughput {
                 ui.add_space(4.0);
-                let t = &mut app.config.wifi.throughput;
-                ui.horizontal(|ui| {
-                    ui.label("ping 包数");
-                    changed |= ui
-                        .add(egui::DragValue::new(&mut t.ping_count).range(1..=100))
-                        .changed();
-                    ui.separator();
-                    ui.label("丢包 ≤");
-                    changed |= ui
-                        .add(
-                            egui::DragValue::new(&mut t.loss_max_pct)
-                                .suffix("%")
-                                .range(0.0..=100.0),
-                        )
-                        .changed();
-                    ui.separator();
-                    ui.label("平均延迟 ≤");
-                    changed |= ui
-                        .add(
-                            egui::DragValue::new(&mut t.rtt_max_ms)
-                                .suffix("ms")
-                                .range(1.0..=2000.0),
-                        )
-                        .changed();
-                });
-                ui.add_space(2.0);
-                ui.label(
-                    egui::RichText::new("速率 = 驱动通过后 ping 网关，统计丢包率与平均延迟")
-                        .small()
-                        .color(theme::MUTED),
-                );
-            }
-
-            ui.add_space(10.0);
-            ui.separator();
-
-            // —— 按键测试 ——
-            theme::section(ui, "按键测试");
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                ui.label("必测键:");
-                for code in [4u8, 5, 6] {
-                    let mut on = app.config.keys.required.contains(&code);
-                    if ui.checkbox(&mut on, key_name(code)).changed() {
-                        if on {
-                            if !app.config.keys.required.contains(&code) {
-                                app.config.keys.required.push(code);
-                            }
-                        } else {
-                            app.config.keys.required.retain(|c| *c != code);
+                let names: Vec<String> = app.config.profiles.keys().cloned().collect();
+                let station_before = app.config.station.clone();
+                ui.horizontal_wrapped(|ui| {
+                    for n in &names {
+                        if tab(ui, *n == station_before, n) && n != &station_before {
+                            app.config.station = n.clone();
                         }
-                        changed = true;
                     }
+                });
+                changed |= app.config.station != station_before;
+            });
+
+            ui.add_space(12.0);
+
+            // —— 测试项：三列勾选 ——
+            theme::card().show(ui, |ui| {
+                theme::card_inputs(ui);
+                card_head(ui, "测试项", None);
+                ui.add_space(2.0);
+                caption(ui, "勾选写入当前工位");
+                ui.add_space(4.0);
+                if let Some(profile) = app.config.profiles.get_mut(&app.config.station) {
+                    egui::Grid::new("items_grid")
+                        .num_columns(3)
+                        .spacing([24.0, 8.0])
+                        .show(ui, |ui| {
+                            for (idx, item) in TestItem::ALL.iter().enumerate() {
+                                let slug = item.slug().to_string();
+                                let mut on = profile.items.contains(&slug);
+                                if ui.checkbox(&mut on, item.label()).changed() {
+                                    if on {
+                                        profile.items.push(slug);
+                                    } else {
+                                        profile.items.retain(|s| s != &slug);
+                                    }
+                                    changed = true;
+                                }
+                                if idx % 3 == 2 {
+                                    ui.end_row();
+                                }
+                            }
+                        });
                 }
             });
-            ui.add_space(2.0);
-            ui.label(
-                egui::RichText::new("固件回读格式 key 4/5/6，收齐必测键自动通过")
-                    .small()
-                    .color(theme::MUTED),
-            );
 
-            ui.add_space(10.0);
-            ui.separator();
+            ui.add_space(12.0);
 
-            // —— 超时 ——
-            theme::section(ui, "超时");
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                ui.label("单项命令");
-                changed |= ui
-                    .add(
-                        egui::DragValue::new(&mut app.config.timeouts.item_secs)
-                            .suffix("s")
-                            .range(0..=600),
-                    )
-                    .changed();
-                ui.separator();
-                ui.label("人工应答");
-                changed |= ui
-                    .add(
-                        egui::DragValue::new(&mut app.config.timeouts.manual_secs)
-                            .suffix("s")
-                            .range(0..=600),
-                    )
-                    .changed();
+            // —— WiFi 测试深度 ——
+            theme::card().show(ui, |ui| {
+                theme::card_inputs(ui);
+                card_head(ui, "WiFi 测试深度", None);
+                ui.add_space(4.0);
+                let depth_before = app.config.wifi.depth;
+                ui.horizontal(|ui| {
+                    if tab(ui, app.config.wifi.depth == WifiDepth::Driver, "驱动") {
+                        app.config.wifi.depth = WifiDepth::Driver;
+                    }
+                    if tab(
+                        ui,
+                        app.config.wifi.depth == WifiDepth::Throughput,
+                        "驱动 + 速率",
+                    ) {
+                        app.config.wifi.depth = WifiDepth::Throughput;
+                    }
+                });
+                changed |= app.config.wifi.depth != depth_before;
+                if app.config.wifi.depth == WifiDepth::Throughput {
+                    ui.add_space(6.0);
+                    let t = &mut app.config.wifi.throughput;
+                    ui.horizontal(|ui| {
+                        ui.label("ping 包数");
+                        changed |= ui
+                            .add(egui::DragValue::new(&mut t.ping_count).range(1..=100))
+                            .changed();
+                        ui.separator();
+                        ui.label("丢包 ≤");
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut t.loss_max_pct)
+                                    .suffix("%")
+                                    .range(0.0..=100.0),
+                            )
+                            .changed();
+                        ui.separator();
+                        ui.label("平均延迟 ≤");
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut t.rtt_max_ms)
+                                    .suffix("ms")
+                                    .range(1.0..=2000.0),
+                            )
+                            .changed();
+                    });
+                    ui.add_space(2.0);
+                    caption(ui, "速率 = 驱动通过后 ping 网关，统计丢包率与平均延迟");
+                }
             });
-            ui.add_space(2.0);
-            ui.label(
-                egui::RichText::new("0 = 不限制；命令超时判 FAIL 并继续，人工超时自动判不合格")
-                    .small()
-                    .color(theme::MUTED),
-            );
 
-            ui.add_space(10.0);
-            ui.separator();
+            ui.add_space(12.0);
+
+            // —— 按键测试 ｜ 超时（两列并排）——
+            ui.horizontal_top(|ui| {
+                let gap = 12.0;
+                let w = (ui.available_width() - gap) / 2.0;
+                ui.vertical(|ui| {
+                    ui.set_min_width(w);
+                    theme::card().show(ui, |ui| {
+                        theme::card_inputs(ui);
+                        card_head(ui, "按键测试", None);
+                        ui.add_space(4.0);
+                        ui.horizontal_wrapped(|ui| {
+                            for code in [4u8, 5, 6] {
+                                let mut on = app.config.keys.required.contains(&code);
+                                if ui.checkbox(&mut on, key_name(code)).changed() {
+                                    if on {
+                                        if !app.config.keys.required.contains(&code) {
+                                            app.config.keys.required.push(code);
+                                        }
+                                    } else {
+                                        app.config.keys.required.retain(|c| *c != code);
+                                    }
+                                    changed = true;
+                                }
+                            }
+                        });
+                        ui.add_space(4.0);
+                        caption(ui, "固件回读格式 key 4/5/6，收齐必测键自动通过");
+                    });
+                });
+                ui.add_space(gap);
+                ui.vertical(|ui| {
+                    ui.set_min_width(w - 2.0);
+                    theme::card().show(ui, |ui| {
+                        theme::card_inputs(ui);
+                        card_head(ui, "超时", None);
+                        ui.add_space(4.0);
+                        egui::Grid::new("timeout_grid")
+                            .num_columns(2)
+                            .spacing([12.0, 6.0])
+                            .show(ui, |ui| {
+                                ui.label("单项命令");
+                                changed |= ui
+                                    .add(
+                                        egui::DragValue::new(&mut app.config.timeouts.item_secs)
+                                            .suffix("s")
+                                            .range(0..=600),
+                                    )
+                                    .changed();
+                                ui.end_row();
+                                ui.label("人工应答");
+                                changed |= ui
+                                    .add(
+                                        egui::DragValue::new(&mut app.config.timeouts.manual_secs)
+                                            .suffix("s")
+                                            .range(0..=600),
+                                    )
+                                    .changed();
+                                ui.end_row();
+                            });
+                        ui.add_space(2.0);
+                        caption(ui, "0 = 不限制；超时判 FAIL 并继续");
+                    });
+                });
+            });
+
+            ui.add_space(12.0);
 
             // —— 连接 ——
-            theme::section(ui, "连接");
-            ui.add_space(6.0);
-            changed |= ui
-                .checkbox(&mut app.config.conn.auto_start, "插入设备后自动开始全测")
-                .changed();
-            ui.add_space(2.0);
-            ui.label(
-                egui::RichText::new("检测到 USB 设备上线即开始；测试中拔出立即中止")
-                    .small()
-                    .color(theme::MUTED),
-            );
+            theme::card().show(ui, |ui| {
+                theme::card_inputs(ui);
+                card_head(ui, "连接", None);
+                ui.add_space(4.0);
+                changed |= ui
+                    .checkbox(&mut app.config.conn.auto_start, "插入设备后自动开始全测")
+                    .changed();
+                ui.add_space(2.0);
+                caption(ui, "检测到 USB 设备上线即开始；测试中拔出立即中止");
+            });
+            ui.add_space(4.0);
         });
     app.settings_open = open;
     // 即时保存（V3.7）：改动即落盘 config.toml，成功静默、失败记日志

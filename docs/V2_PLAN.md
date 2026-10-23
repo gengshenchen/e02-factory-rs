@@ -395,3 +395,25 @@ config auto_start、worker 拔出中止场景并入序列大测试）。
 
 测试 42 个（新增：单项补测合并——底稿保留、槽位替换、同文件重写、
 整机结论翻转）。
+
+## V3.10（设置窗按设计规范重排，2026-10-23）
+
+用户反馈设置页布局不好看，要求按 awesome-design-md（design-md/claude，
+仓库克隆在 /tmp/awesome-design-md，会被系统清理）重设计。对照规范
+逐条落地：
+
+- **分区一律内容卡**（feature-card：surface-card 色块 + 12px 圆角 +
+  20px 内边距，无描边无阴影——"color-block first, shadow rare"），
+  取代 V3.7 的"标题 + separator 一列到底"；卡间 12px。
+  theme 新增 `card()` / `card_title()`（规范 title-sm 16px/500）。
+- **卡内输入件 canvas-on-card**（规范 text-input：输入底比卡面亮一档
+  加发丝描边）：`card_inputs()` 用 `ui.visuals_mut()` 只改卡内子树的
+  weak_bg_fill，不污染全局主题。
+- **工位选择改分段选项卡**（category-tab：未选中透明底次要色、选中
+  奶油强底暖墨、8px 圆角），替代 ComboBox 下拉；WiFi 深度两档同款。
+  卡头右侧配徽章（启用 N 项）。
+- **按键测试与超时两列并排**，打破单列单调；超时改两行标签列对齐。
+- 小注统一 caption（12.5px 次要色）。窗宽 560。
+
+坑：rustdoc 注释行首 `+` 会被当 Markdown 列表项触发
+doc_lazy_continuation（clippy deny 级）。
