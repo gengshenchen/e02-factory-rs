@@ -151,6 +151,9 @@ pub fn card() -> egui::Frame {
 
 /// 卡内输入件配色（规范 text-input）：卡面是 CARD，输入件（勾选/数字/
 /// 下拉）回退画布底 + 发丝描边——比卡面亮一档（canvas-on-card）。
+/// TextEdit 的底走 visuals.extreme_bg_color（全局主题设为 CARD，
+/// 主窗里比画布深一档，但画到卡面上会同色隐形），卡内需翻回 CANVAS；
+/// 其描边走 bg_stroke，一并补发丝线（V3.12.2 截图发现）。
 /// 只改本 Ui 子树（visuals_mut 是子树克隆），不污染全局主题。
 pub fn card_inputs(ui: &mut egui::Ui) {
     let v = ui.visuals_mut();
@@ -159,6 +162,11 @@ pub fn card_inputs(ui: &mut egui::Ui) {
     v.widgets.open.weak_bg_fill = CANVAS;
     v.widgets.hovered.weak_bg_fill = SOFT;
     v.widgets.noninteractive.weak_bg_fill = SOFT;
+    v.extreme_bg_color = CANVAS;
+    v.widgets.inactive.bg_stroke = hairline(HAIRLINE);
+    v.widgets.active.bg_stroke = hairline(HAIRLINE);
+    v.widgets.open.bg_stroke = hairline(HAIRLINE);
+    v.widgets.hovered.bg_stroke = hairline(HAIRLINE);
 }
 
 /// 状态圆点（避免字形符号：直接画圆）。按正文行高分配高度、圆画中心，

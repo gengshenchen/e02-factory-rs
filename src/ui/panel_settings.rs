@@ -226,13 +226,15 @@ pub fn show(ctx: &egui::Context, app: &mut E02App) {
                                     .add(
                                         egui::TextEdit::singleline(&mut app.config.wifi.ssid)
                                             .hint_text("耳机已入网则留空")
-                                            .desired_width(110.0),
+                                            .desired_width(150.0),
                                     )
                                     .changed();
+                                ui.separator();
                                 ui.label("密码");
                                 changed |= ui
                                     .add(
                                         egui::TextEdit::singleline(&mut app.config.wifi.psk)
+                                            .hint_text("开放网络留空")
                                             .desired_width(110.0),
                                     )
                                     .changed();
