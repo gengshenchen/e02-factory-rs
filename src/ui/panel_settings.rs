@@ -217,10 +217,30 @@ pub fn show(ctx: &egui::Context, app: &mut E02App) {
                                     .add(egui::DragValue::new(&mut t.server_port).range(0..=65535))
                                     .changed();
                             });
+                            ui.add_space(6.0);
+                            // 产线 SSID：耳机 MIPS/uClibc 固件无 Android cmd wifi，
+                            // 未入网时经 camera-factory 20 下发连接
+                            ui.horizontal(|ui| {
+                                ui.label("产线 SSID");
+                                changed |= ui
+                                    .add(
+                                        egui::TextEdit::singleline(&mut app.config.wifi.ssid)
+                                            .hint_text("耳机已入网则留空")
+                                            .desired_width(110.0),
+                                    )
+                                    .changed();
+                                ui.label("密码");
+                                changed |= ui
+                                    .add(
+                                        egui::TextEdit::singleline(&mut app.config.wifi.psk)
+                                            .desired_width(110.0),
+                                    )
+                                    .changed();
+                            });
                             ui.add_space(2.0);
                             caption(
                                 ui,
-                                "iperf3 上/下行吞吐（窗口中位数）与 TCP 重传阈值；0=不判。                                 需固件集成 iperf3，PC 与设备同网段",
+                                "iperf3 上/下行吞吐（窗口中位数）与 TCP 重传阈值；0=不判。                                 需固件集成 iperf3，PC 与设备同网段；未入网时按产线 SSID 经 camera-factory 20 连接",
                             );
                         }
                     });

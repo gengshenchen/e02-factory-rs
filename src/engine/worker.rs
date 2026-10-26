@@ -1037,14 +1037,54 @@ fn wifi_flow(tx: &Sender<UiEvent>, wifi: &WifiCfg) -> RunOutcome {
     let mut r = base.result;
     let t = &wifi.throughput;
 
-    // 设备 IP：join + DHCP 成功即连通性证明（ping 已退役为失败归因用）
+    // 设备 IP：join + DHCP 成功即连通性证明（ping 已退役为失败归因用）。
+    // MIPS/uClibc 固件没有 Android 的 cmd wifi——wlan0 未入网且配了产线
+    // SSID 时经 camera-factory 20 下发连接，再轮询等 DHCP
     let _ = tx.send(UiEvent::Log("WiFi 吞吐：读取 wlan0 地址...".to_string()));
-    let ip = adb::shell("ip -4 addr show wlan0")
+    let mut ip = adb::shell("ip -4 addr show wlan0")
         .ok()
         .and_then(|o| protocol::parse_wlan_ip(&o));
+    if ip.is_none() && !wifi.ssid.is_empty() {
+        let _ = tx.send(UiEvent::Log(format!(
+            "wlan0 未入网，下发连接 {}（camera-factory 20）...",
+            wifi.ssid
+        )));
+        // 参数固定两个：SSID、密码（开放网络密码传空）；格式与固件组对齐
+        if let Ok(out) = adb::shell(&format!(
+            "camera-factory 20 \"{}\" \"{}\"",
+            wifi.ssid, wifi.psk
+        )) {
+            if out.contains("FAIL") {
+                r.verdict = Verdict::Fail;
+                r.detail = format!(
+                    "camera-factory 20 连接 {} 失败: {}",
+                    wifi.ssid,
+                    clip(&runner::one_line(&out), 60)
+                );
+                return RunOutcome {
+                    result: r,
+                    device: base.device,
+                };
+            }
+        }
+        // 等 DHCP：2s 一次最多 8 次（慢 AP 也够）
+        for _ in 0..8 {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            ip = adb::shell("ip -4 addr show wlan0")
+                .ok()
+                .and_then(|o| protocol::parse_wlan_ip(&o));
+            if ip.is_some() {
+                break;
+            }
+        }
+    }
     let Some(ip) = ip else {
         r.verdict = Verdict::Fail;
-        r.detail = "驱动通过，但 wlan0 无 IPv4（未入网/未拿到 DHCP？）".into();
+        r.detail = if wifi.ssid.is_empty() {
+            "驱动通过，但 wlan0 无 IPv4（未入网/未拿到 DHCP？设置页配产线 SSID 可自动连接）".into()
+        } else {
+            format!("驱动通过，已下发连接 {}，wlan0 仍未拿到 IPv4", wifi.ssid)
+        };
         return RunOutcome {
             result: r,
             device: base.device,
@@ -1508,10 +1548,13 @@ mod tests {
         // —— V2.2 WiFi 速率（ping 法）——
         let wscript = base.join("adb-wifi");
         // 注：数据里的 % 需经 %s 格式串输出（printf 参数含 % 会被 dash 当格式符）
-        // V3.12：iperf3 客户端桩按 -R 与否吐不同 JSON（正向带重传、反向无）
+        // V3.12：iperf3 客户端桩按 -R 与否吐不同 JSON（正向带重传、反向无）；
+        // V3.12.1：wlan0 有 IP 由 wlan-up 标记文件控制——camera-factory 20
+        // （产线 SSID 连接）创建标记，模拟"连接成功后拿到 DHCP"
         let wifi_case = "#!/bin/sh\ncase \"$*\" in\n\
              *\"camera-factory 5\"*) printf 'wifi ok\\n';;\n\
-             *\"ip -4 addr show wlan0\"*) printf 'inet 192.168.3.42/24 brd 192.168.3.255 scope global wlan0\\n';;\n\
+             *\"camera-factory 20\"*) : > \"$(dirname \"$0\")/wlan-up\"; printf 'ok\\n';;\n\
+             *\"ip -4 addr show wlan0\"*) if [ -f \"$(dirname \"$0\")/wlan-up\" ]; then printf 'inet 192.168.3.42/24 brd 192.168.3.255 scope global wlan0\\n'; fi;;\n\
              *\"which iperf3\"*) printf '/system/bin/iperf3\\n';;\n\
              *\"iperf3 -c\"*) case \"$*\" in\n\
                *\"-R\"*) printf '%s' '{\"intervals\":[{\"sum\":{\"bits_per_second\":30e6}}],\"end\":{\"sum\":{\"bits_per_second\":29e6}}}';;\n\
@@ -1522,7 +1565,8 @@ mod tests {
              '20 packets transmitted, 20 received, 0% packet loss' \
              'rtt min/avg/max/mdev = 1.2/23.4/99.0/5.0 ms';;\n\
              *) printf 'ok\\n';;\nesac\n";
-        // driver 深度：不测吞吐，驱动过即过
+        // driver 深度：不测吞吐，驱动过即过（wlan-up 标记使 IP 恒在）
+        std::fs::write(base.join("wlan-up"), b"").unwrap();
         let (vs, n) = scenario(
             &wscript,
             items(TestItem::Wifi),
@@ -1549,6 +1593,28 @@ mod tests {
         std::env::set_var("E02_LOCAL_IP", "192.168.3.10");
         let mut cfg = Config::default();
         cfg.wifi.depth = crate::config::WifiDepth::Throughput;
+        let (vs, n) = scenario(
+            &wscript,
+            items(TestItem::Wifi),
+            &media,
+            &reports,
+            cfg,
+            wifi_case,
+            || unreachable!(),
+        );
+        std::env::remove_var("IPERF3");
+        std::env::remove_var("E02_LOCAL_IP");
+        assert_eq!((vs[0].1, n), (Verdict::Pass, 0));
+
+        // V3.12.1：配了产线 SSID 且未入网 → camera-factory 20 连接（桩随命令
+        // 创建 wlan-up 标记模拟拿到 DHCP）→ 等 DHCP → 吞吐照常 PASS
+        std::fs::remove_file(base.join("wlan-up")).unwrap();
+        std::env::set_var("IPERF3", &iscript);
+        std::env::set_var("E02_LOCAL_IP", "192.168.3.10");
+        let mut cfg = Config::default();
+        cfg.wifi.depth = crate::config::WifiDepth::Throughput;
+        cfg.wifi.ssid = "line-ap".into();
+        cfg.wifi.psk = "12345678".into();
         let (vs, n) = scenario(
             &wscript,
             items(TestItem::Wifi),
@@ -1614,12 +1680,16 @@ mod tests {
             let (mut asked, mut verdict) = (0usize, None);
             while let Ok(ev) = rx.recv_timeout(Duration::from_secs(30)) {
                 match ev {
-                    UiEvent::Manual { .. } => {
-                        asked += 1;
+                    UiEvent::Manual { .. } => asked += 1,
+                    // 回环行到达 = 脚本已在 sleep 中：此刻作答才真正考验"应答即杀"
+                    UiEvent::Log(ref l) if l.contains("回环:") => {
                         mtx.send(UiResponse::Manual(true)).unwrap();
                     }
                     UiEvent::Result(r, _) => verdict = Some(r.verdict),
                     _ => {}
+                }
+                if verdict.is_some() && asked == 2 {
+                    break;
                 }
             }
             handle.join().unwrap();

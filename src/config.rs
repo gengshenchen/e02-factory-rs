@@ -98,6 +98,13 @@ impl Default for ThroughputCfg {
 pub struct WifiCfg {
     #[serde(default)]
     pub depth: WifiDepth,
+    /// 产线 SSID：吞吐测试时 wlan0 未入网，则经 camera-factory 20 下发连接
+    /// （耳机是 MIPS/uClibc Linux，无 Android cmd wifi 可用）
+    #[serde(default)]
+    pub ssid: String,
+    /// 产线 AP 密码（开放网络留空）
+    #[serde(default)]
+    pub psk: String,
     #[serde(default)]
     pub throughput: ThroughputCfg,
 }
@@ -106,6 +113,8 @@ impl Default for WifiCfg {
     fn default() -> Self {
         Self {
             depth: WifiDepth::Driver,
+            ssid: String::new(),
+            psk: String::new(),
             throughput: ThroughputCfg::default(),
         }
     }
