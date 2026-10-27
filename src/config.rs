@@ -98,7 +98,8 @@ impl Default for ThroughputCfg {
 pub struct WifiCfg {
     #[serde(default)]
     pub depth: WifiDepth,
-    /// 产线 SSID：吞吐测试时 wlan0 未入网，则经 camera-factory 20 下发连接
+    /// 产线 SSID：吞吐测试时 wlan0 未入网，则推送
+    /// /config/IConfig/wpa_supplicant.conf 并跑 camera-factory 5 重连
     /// （耳机是 MIPS/uClibc Linux，无 Android cmd wifi 可用）
     #[serde(default)]
     pub ssid: String,

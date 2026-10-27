@@ -483,13 +483,16 @@ doc_lazy_continuation（clippy deny 级）。
 无屏蔽箱、共享 2.4G、产线不固定 AP 的环境下改用 iperf3 吞吐 + 宽松阈值
 + 复测兜底。
 
-- **固件侧自带 iperf3**（`which iperf3` 定位，全路径调用；要求 ≥3.1，
-  3.7+ 最好，无需 OpenSSL）；
+- **固件侧自带 iperf3**（固件放系统目录 PATH 可达，裸名直接执行；
+  要求 ≥3.1，3.7+ 最好，无需 OpenSSL）；
 - **PC 侧** iperf3 随包分发（查找顺序同 ffmpeg：环境变量 `IPERF3` →
   exe 同目录 → PATH），起 `-s -1 --json` 单次服务；
 - 流程：驱动检查 → `ip -4 addr show wlan0` 拿 IP（连通性证明，ping 退役
-  为失败归因）→ `which iperf3` → PC 同网段地址枚举（if-addrs，掩码缺失
-  按 /24 兜底，`E02_LOCAL_IP` 可强制）→ 上/下行各一次（`-R` 反向）；
+  为失败归因；未入网且配了产线 SSID 则推送 /config/IConfig/
+  wpa_supplicant.conf 后再跑 camera-factory 5 重连——V3.12.3，原
+  camera-factory 20 直连指令方案弃用）→ PC 同网段地址枚举（if-addrs，
+  掩码缺失按 /24 兜底，`E02_LOCAL_IP` 可强制）→ 上/下行各一次
+  （`-R` 反向）；
 - 判定：**每秒窗口吞吐中位数**（共享信道瞬时抢道不误杀）≥ 阈值
   （↑10/↓15 Mbps 初值）+ TCP 重传 ≤500（反向从服务端 JSON 补）；边缘
   失败（阈值 50% 裕量内）自动复测一次，仍低才 FAIL；

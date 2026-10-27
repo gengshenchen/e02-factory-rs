@@ -219,7 +219,7 @@ pub fn show(ctx: &egui::Context, app: &mut E02App) {
                             });
                             ui.add_space(6.0);
                             // 产线 SSID：耳机 MIPS/uClibc 固件无 Android cmd wifi，
-                            // 未入网时经 camera-factory 20 下发连接
+                            // 未入网时推送 wpa_supplicant.conf 并重连
                             ui.horizontal(|ui| {
                                 ui.label("产线 SSID");
                                 changed |= ui
@@ -242,7 +242,7 @@ pub fn show(ctx: &egui::Context, app: &mut E02App) {
                             ui.add_space(2.0);
                             caption(
                                 ui,
-                                "iperf3 上/下行吞吐（窗口中位数）与 TCP 重传阈值；0=不判。                                 需固件集成 iperf3，PC 与设备同网段；未入网时按产线 SSID 经 camera-factory 20 连接",
+                                "iperf3 上/下行吞吐（窗口中位数）与 TCP 重传阈值；0=不判。                                 需固件集成 iperf3，PC 与设备同网段；未入网时按产线 SSID 推送配置并重连",
                             );
                         }
                     });

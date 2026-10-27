@@ -1003,17 +1003,17 @@ fn iperf_once(
     if reverse {
         client.push_str(" -R");
     }
-    // 固件自带 iperf3：which 定位全路径（不依赖设备 PATH）
-    let bin = adb::shell("which iperf3")
-        .ok()
-        .map(|o| runner::one_line(&o))
-        .filter(|p| !p.is_empty())
-        .ok_or_else(|| "固件未集成 iperf3（which 找不到）".to_string())?;
-    let out = adb::shell(&format!("{bin} {client}")).map_err(|e| format!("adb: {e:#}"))?;
+    // 固件把 iperf3 放在系统目录（PATH 可达；固件侧无 which 指令），裸名执行
+    let out = adb::shell(&format!("iperf3 {client}")).map_err(|e| format!("adb: {e:#}"))?;
     let srv = server.join().ok().flatten();
 
-    let mut sum = protocol::parse_iperf3_json(&out)
-        .ok_or_else(|| format!("iperf3 输出无法解析: {}", clip(&runner::one_line(&out), 80)))?;
+    let mut sum = protocol::parse_iperf3_json(&out).ok_or_else(|| {
+        if out.contains("not found") {
+            "固件未集成 iperf3（PATH 直接执行失败）".to_string()
+        } else {
+            format!("iperf3 输出无法解析: {}", clip(&runner::one_line(&out), 80))
+        }
+    })?;
     if reverse && sum.retransmits.is_none() {
         // 反向时发送端在 PC：客户端 JSON 无重传字段，从服务端补
         sum.retransmits = srv
@@ -1023,8 +1023,44 @@ fn iperf_once(
     Ok(sum)
 }
 
+/// 推送产线 WiFi 配置并触发重连（V3.12.3）：本地按设备原格式生成
+/// wpa_supplicant.conf（密码空 = key_mgmt NONE 开放网络）→ adb push 到
+/// /config/IConfig/ → camera-factory 5 走固件既有逻辑按新配置重连。
+/// 输出含 FAIL 视为连接失败。
+fn join_wifi(ssid: &str, psk: &str) -> Result<(), String> {
+    let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+    let network = if psk.is_empty() {
+        format!(
+            "network={{\n        ssid=\"{}\"\n        key_mgmt=NONE\n}}",
+            esc(ssid)
+        )
+    } else {
+        format!(
+            "network={{\n        ssid=\"{}\"\n        psk=\"{}\"\n        key_mgmt=WPA-PSK\n}}",
+            esc(ssid),
+            esc(psk)
+        )
+    };
+    let conf = format!(
+        "ctrl_interface=/var/run/wpa_supplicant\nap_scan=1\nupdate_config=1\n\n{network}\n"
+    );
+    let local = std::env::temp_dir().join(format!("e02-wpa-{}.conf", std::process::id()));
+    std::fs::write(&local, conf).map_err(|e| format!("写临时配置失败: {e}"))?;
+    let pushed = adb::push(&local, "/config/IConfig/wpa_supplicant.conf");
+    let _ = std::fs::remove_file(&local); // 推完即删，不留本机痕迹
+    pushed.map_err(|e| format!("adb push 配置失败: {e:#}"))?;
+    let out = adb::shell("camera-factory 5").map_err(|e| format!("camera-factory 5: {e:#}"))?;
+    if out.contains("FAIL") {
+        return Err(format!(
+            "固件重连失败: {}",
+            clip(&runner::one_line(&out), 60)
+        ));
+    }
+    Ok(())
+}
+
 /// WiFi 流程（深度可配）：
-/// - driver：`camera-factory 5` 驱动通即过（原程序行为）
+/// - driver：只跑 camera-factory 5 驱动检查；
 /// - throughput：驱动过后跑 iperf3 上/下行吞吐与 TCP 重传（V3.12；
 ///   无屏蔽箱共享 AP 环境：每秒窗口中位数判阈值 + 边缘复测兜底）
 fn wifi_flow(tx: &Sender<UiEvent>, wifi: &WifiCfg) -> RunOutcome {
@@ -1039,33 +1075,24 @@ fn wifi_flow(tx: &Sender<UiEvent>, wifi: &WifiCfg) -> RunOutcome {
 
     // 设备 IP：join + DHCP 成功即连通性证明（ping 已退役为失败归因用）。
     // MIPS/uClibc 固件没有 Android 的 cmd wifi——wlan0 未入网且配了产线
-    // SSID 时经 camera-factory 20 下发连接，再轮询等 DHCP
+    // SSID 时，推送 wpa_supplicant.conf 再跑 camera-factory 5 走固件既有
+    // 连接逻辑重连（原 camera-factory 20 直连指令方案已弃，固件侧不动）
     let _ = tx.send(UiEvent::Log("WiFi 吞吐：读取 wlan0 地址...".to_string()));
     let mut ip = adb::shell("ip -4 addr show wlan0")
         .ok()
         .and_then(|o| protocol::parse_wlan_ip(&o));
     if ip.is_none() && !wifi.ssid.is_empty() {
         let _ = tx.send(UiEvent::Log(format!(
-            "wlan0 未入网，下发连接 {}（camera-factory 20）...",
+            "wlan0 未入网，推送产线 SSID {} 并重连...",
             wifi.ssid
         )));
-        // 参数固定两个：SSID、密码（开放网络密码传空）；格式与固件组对齐
-        if let Ok(out) = adb::shell(&format!(
-            "camera-factory 20 \"{}\" \"{}\"",
-            wifi.ssid, wifi.psk
-        )) {
-            if out.contains("FAIL") {
-                r.verdict = Verdict::Fail;
-                r.detail = format!(
-                    "camera-factory 20 连接 {} 失败: {}",
-                    wifi.ssid,
-                    clip(&runner::one_line(&out), 60)
-                );
-                return RunOutcome {
-                    result: r,
-                    device: base.device,
-                };
-            }
+        if let Err(e) = join_wifi(&wifi.ssid, &wifi.psk) {
+            r.verdict = Verdict::Fail;
+            r.detail = format!("连接 {} 失败: {e}", wifi.ssid);
+            return RunOutcome {
+                result: r,
+                device: base.device,
+            };
         }
         // 等 DHCP：2s 一次最多 8 次（慢 AP 也够）
         for _ in 0..8 {
@@ -1083,7 +1110,10 @@ fn wifi_flow(tx: &Sender<UiEvent>, wifi: &WifiCfg) -> RunOutcome {
         r.detail = if wifi.ssid.is_empty() {
             "驱动通过，但 wlan0 无 IPv4（未入网/未拿到 DHCP？设置页配产线 SSID 可自动连接）".into()
         } else {
-            format!("驱动通过，已下发连接 {}，wlan0 仍未拿到 IPv4", wifi.ssid)
+            format!(
+                "驱动通过，已推送 {} 配置重连，wlan0 仍未拿到 IPv4",
+                wifi.ssid
+            )
         };
         return RunOutcome {
             result: r,
@@ -1549,13 +1579,13 @@ mod tests {
         let wscript = base.join("adb-wifi");
         // 注：数据里的 % 需经 %s 格式串输出（printf 参数含 % 会被 dash 当格式符）
         // V3.12：iperf3 客户端桩按 -R 与否吐不同 JSON（正向带重传、反向无）；
-        // V3.12.1：wlan0 有 IP 由 wlan-up 标记文件控制——camera-factory 20
-        // （产线 SSID 连接）创建标记，模拟"连接成功后拿到 DHCP"
+        // V3.12.3：wlan0 有 IP 由 wlan-up 标记文件控制——adb push 推送
+        // wpa_supplicant.conf（产线 SSID 配网）时拷贝留证并创建标记，
+        // 模拟"按新配置重连后拿到 DHCP"
         let wifi_case = "#!/bin/sh\ncase \"$*\" in\n\
              *\"camera-factory 5\"*) printf 'wifi ok\\n';;\n\
-             *\"camera-factory 20\"*) : > \"$(dirname \"$0\")/wlan-up\"; printf 'ok\\n';;\n\
+             push*) cp \"$2\" \"$(dirname \"$0\")/pushed.conf\" 2>/dev/null; : > \"$(dirname \"$0\")/wlan-up\"; printf 'ok\\n';;\n\
              *\"ip -4 addr show wlan0\"*) if [ -f \"$(dirname \"$0\")/wlan-up\" ]; then printf 'inet 192.168.3.42/24 brd 192.168.3.255 scope global wlan0\\n'; fi;;\n\
-             *\"which iperf3\"*) printf '/system/bin/iperf3\\n';;\n\
              *\"iperf3 -c\"*) case \"$*\" in\n\
                *\"-R\"*) printf '%s' '{\"intervals\":[{\"sum\":{\"bits_per_second\":30e6}}],\"end\":{\"sum\":{\"bits_per_second\":29e6}}}';;\n\
                *) printf '%s' '{\"intervals\":[{\"sum\":{\"bits_per_second\":20e6}},{\"sum\":{\"bits_per_second\":24e6}},{\"sum\":{\"bits_per_second\":22e6}}],\"end\":{\"sum_sent\":{\"bits_per_second\":22e6,\"retransmits\":36},\"sum_received\":{\"bits_per_second\":21.9e6}}} ';;\n\
@@ -1606,8 +1636,9 @@ mod tests {
         std::env::remove_var("E02_LOCAL_IP");
         assert_eq!((vs[0].1, n), (Verdict::Pass, 0));
 
-        // V3.12.1：配了产线 SSID 且未入网 → camera-factory 20 连接（桩随命令
-        // 创建 wlan-up 标记模拟拿到 DHCP）→ 等 DHCP → 吞吐照常 PASS
+        // V3.12.3：配了产线 SSID 且未入网 → adb push 推送 wpa_supplicant.conf
+        // （桩拷到 pushed.conf 留证并置 wlan-up 标记模拟重连成功）→
+        // camera-factory 5 → 等 DHCP → 吞吐照常 PASS
         std::fs::remove_file(base.join("wlan-up")).unwrap();
         std::env::set_var("IPERF3", &iscript);
         std::env::set_var("E02_LOCAL_IP", "192.168.3.10");
@@ -1627,6 +1658,12 @@ mod tests {
         std::env::remove_var("IPERF3");
         std::env::remove_var("E02_LOCAL_IP");
         assert_eq!((vs[0].1, n), (Verdict::Pass, 0));
+        // 推送内容核对：设备原格式 + 产线 SSID/密码的 WPA-PSK 网络块
+        let pushed = std::fs::read_to_string(base.join("pushed.conf")).unwrap();
+        assert!(pushed.starts_with("ctrl_interface=/var/run/wpa_supplicant"));
+        assert!(pushed.contains("ssid=\"line-ap\""));
+        assert!(pushed.contains("psk=\"12345678\""));
+        assert!(pushed.contains("key_mgmt=WPA-PSK"));
 
         // —— V3.5 麦克风主/副两段判定 ——
         let (vs, n) = scenario(

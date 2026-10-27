@@ -60,6 +60,22 @@ pub fn pull(remote: &str, local: &Path) -> Result<()> {
     Ok(())
 }
 
+/// `adb push <local> <remote>`（写设备侧文件，WiFi 配网用）。
+pub fn push(local: &Path, remote: &str) -> Result<()> {
+    let out = exec::output(
+        Command::new(adb_path()).arg("push").arg(local).arg(remote),
+        exec::default_timeout(),
+    )
+    .with_context(|| format!("adb push {} 失败", local.display()))?;
+    if !out.status.success() {
+        bail!(
+            "adb push {remote}: {}",
+            exec::decode_out(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
 /// 解析 `adb devices` 输出为在线设备序列号列表（纯函数）。
 ///
 /// 样例输入：
