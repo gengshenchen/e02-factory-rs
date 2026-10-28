@@ -182,26 +182,33 @@ pub fn show(ctx: &egui::Context, app: &mut E02App) {
                                     )
                                     .changed();
                             });
-                            // 阈值：上/下吞吐 + TCP 重传
+                            // 阈值：只显示所选方向的吞吐阈值（双向两个都显示），
+                            // 重传上限两方向共用
                             ui.horizontal(|ui| {
-                                ui.label("≥↑");
-                                changed |= ui
-                                    .add(
-                                        egui::DragValue::new(&mut t.min_mbps_up)
-                                            .suffix("Mbps")
-                                            .range(0.0..=300.0),
-                                    )
-                                    .changed();
-                                ui.separator();
-                                ui.label("≥↓");
-                                changed |= ui
-                                    .add(
-                                        egui::DragValue::new(&mut t.min_mbps_down)
-                                            .suffix("Mbps")
-                                            .range(0.0..=300.0),
-                                    )
-                                    .changed();
-                                ui.separator();
+                                if t.direction != IperfDir::Down {
+                                    ui.label("≥↑");
+                                    changed |= ui
+                                        .add(
+                                            egui::DragValue::new(&mut t.min_mbps_up)
+                                                .suffix("Mbps")
+                                                .range(0.0..=300.0),
+                                        )
+                                        .changed();
+                                    if t.direction == IperfDir::Both {
+                                        ui.separator();
+                                    }
+                                }
+                                if t.direction != IperfDir::Up {
+                                    ui.label("≥↓");
+                                    changed |= ui
+                                        .add(
+                                            egui::DragValue::new(&mut t.min_mbps_down)
+                                                .suffix("Mbps")
+                                                .range(0.0..=300.0),
+                                        )
+                                        .changed();
+                                    ui.separator();
+                                }
                                 ui.label("重传 ≤");
                                 changed |= ui
                                     .add(egui::DragValue::new(&mut t.max_retr).range(0..=10000))
@@ -240,9 +247,11 @@ pub fn show(ctx: &egui::Context, app: &mut E02App) {
                                     .changed();
                             });
                             ui.add_space(2.0);
+                            caption(ui, "上行=耳机发往 PC，下行=PC 发往耳机，双向=两方向各测一次");
+                            caption(ui, "吞吐按每秒窗口中位数判定，另加 TCP 重传上限；0=不判");
                             caption(
                                 ui,
-                                "iperf3 上/下行吞吐（窗口中位数）与 TCP 重传阈值；0=不判。                                 需固件集成 iperf3，PC 与设备同网段；未入网时按产线 SSID 推送配置并重连",
+                                "2.4G 单天线理论 72Mbps、健康实测 30Mbps 以上；PC 软热点偏弱，阈值以产线 AP 与金机校准",
                             );
                         }
                     });
