@@ -262,6 +262,16 @@ pub fn parse_wlan_ip_any(output: &str) -> Option<String> {
     parse_wlan_ip(output).or_else(|| parse_wlan_ifconfig(output))
 }
 
+/// 解析固件 camera-factory 5 输出里的 `wifi-rssi:<dBm>`（真机样例：
+/// `wifi-rssi:-30`；探测链（cmd wifi→/proc/net/wireless）全空时的退路）。
+pub fn parse_fw_wifi_rssi(output: &str) -> Option<i32> {
+    let v = output
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("wifi-rssi:"))?
+        .trim();
+    v.split_whitespace().next()?.parse().ok()
+}
+
 /// 解析固件 camera-factory 5 输出里的 `wlan0-ip: <IPv4>`（关联 + DHCP
 /// 成功时固件自己回读打印，可省去轮询 ip 命令；
 /// 真机样例：`wlan0-ip: 10.82.62.192`）。
@@ -477,6 +487,10 @@ mod tests {
         assert_eq!(parse_fw_wlan_ip(fw), Some("10.82.62.192".into()));
         assert_eq!(parse_fw_wlan_ip("wlan0-ip: \n"), None);
         assert_eq!(parse_fw_wlan_ip("no tag"), None);
+        // 固件 RSSI 回读
+        assert_eq!(parse_fw_wifi_rssi(fw), Some(-39));
+        assert_eq!(parse_fw_wifi_rssi("wifi-rssi:-30"), Some(-30));
+        assert_eq!(parse_fw_wifi_rssi("no tag"), None);
     }
 
     #[test]

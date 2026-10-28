@@ -1155,7 +1155,11 @@ fn wifi_flow(tx: &Sender<UiEvent>, wifi: &WifiCfg) -> RunOutcome {
     };
 
     // RSSI/链路速率：只记录不设门（环境不控），极宽松兜底抓天线级故障
-    let rssi = wifi_rssi();
+    let rssi = wifi_rssi().or_else(|| {
+        // MIPS 无 cmd wifi、/proc/net/wireless 也可能空——退回固件 5 的
+        // 回读（join 时输出 wifi-rssi:，真机 2026-10-28 实证）
+        protocol::parse_fw_wifi_rssi(&last5).map(|v| (v, 0))
+    });
 
     // PC 与设备同网段地址 + 空闲端口
     let Some(peer) = ip.parse::<std::net::Ipv4Addr>().ok() else {
