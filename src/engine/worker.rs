@@ -1026,8 +1026,8 @@ fn iperf_once(
 /// 推送产线 WiFi 配置并触发重连（V3.12.3）：本地按设备原格式生成
 /// wpa_supplicant.conf（密码空 = key_mgmt NONE 开放网络）→ adb push 到
 /// /config/IConfig/ → camera-factory 5 走固件既有逻辑按新配置重连。
-/// 输出含 FAIL 视为连接失败。
-fn join_wifi(ssid: &str, psk: &str) -> Result<(), String> {
+/// 返回 5 的输出（关联 + DHCP 成功时固件回读打印 wlan0-ip）。
+fn join_wifi(ssid: &str, psk: &str) -> Result<String, String> {
     let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
     let network = if psk.is_empty() {
         format!(
@@ -1050,13 +1050,14 @@ fn join_wifi(ssid: &str, psk: &str) -> Result<(), String> {
     let _ = std::fs::remove_file(&local); // 推完即删，不留本机痕迹
     pushed.map_err(|e| format!("adb push 配置失败: {e:#}"))?;
     let out = adb::shell("camera-factory 5").map_err(|e| format!("camera-factory 5: {e:#}"))?;
-    if out.contains("FAIL") {
+    // FAIL-BUSY 是 wpa_ctrl 瞬态噪声（真机证明非致命），剔除后才判
+    if out.replace("FAIL-BUSY", "").contains("FAIL") {
         return Err(format!(
             "固件重连失败: {}",
             clip(&runner::one_line(&out), 60)
         ));
     }
-    Ok(())
+    Ok(out)
 }
 
 /// WiFi 流程（深度可配）：
@@ -1086,16 +1087,20 @@ fn wifi_flow(tx: &Sender<UiEvent>, wifi: &WifiCfg) -> RunOutcome {
             "wlan0 未入网，推送产线 SSID {} 并重连...",
             wifi.ssid
         )));
-        if let Err(e) = join_wifi(&wifi.ssid, &wifi.psk) {
-            r.verdict = Verdict::Fail;
-            r.detail = format!("连接 {} 失败: {e}", wifi.ssid);
-            return RunOutcome {
-                result: r,
-                device: base.device,
-            };
+        match join_wifi(&wifi.ssid, &wifi.psk) {
+            // 关联 + DHCP 成功时固件自己回读打印 wlan0-ip，直接采信
+            Ok(out) => ip = protocol::parse_fw_wlan_ip(&out),
+            Err(e) => {
+                r.verdict = Verdict::Fail;
+                r.detail = format!("连接 {} 失败: {e}", wifi.ssid);
+                return RunOutcome {
+                    result: r,
+                    device: base.device,
+                };
+            }
         }
-        // 等 DHCP：2s 一次最多 8 次（慢 AP 也够）
-        for _ in 0..8 {
+        // 等 DHCP（固件已回读则直接跳过）：2s 一次最多 10 次（慢 AP 也够）
+        for _ in 0..10 {
             std::thread::sleep(std::time::Duration::from_secs(2));
             ip = adb::shell("ip -4 addr show wlan0")
                 .ok()
@@ -1583,7 +1588,7 @@ mod tests {
         // wpa_supplicant.conf（产线 SSID 配网）时拷贝留证并创建标记，
         // 模拟"按新配置重连后拿到 DHCP"
         let wifi_case = "#!/bin/sh\ncase \"$*\" in\n\
-             *\"camera-factory 5\"*) printf 'wifi ok\\n';;\n\
+             *\"camera-factory 5\"*) printf 'Successfully initialized wpa_supplicant\\nFAIL-BUSY\\nwlan0-ip: 192.168.3.42\\nwifi-rssi:-39\\n';;\n\
              push*) cp \"$2\" \"$(dirname \"$0\")/pushed.conf\" 2>/dev/null; : > \"$(dirname \"$0\")/wlan-up\"; printf 'ok\\n';;\n\
              *\"ip -4 addr show wlan0\"*) if [ -f \"$(dirname \"$0\")/wlan-up\" ]; then printf 'inet 192.168.3.42/24 brd 192.168.3.255 scope global wlan0\\n'; fi;;\n\
              *\"iperf3 -c\"*) case \"$*\" in\n\
@@ -1638,7 +1643,8 @@ mod tests {
 
         // V3.12.3：配了产线 SSID 且未入网 → adb push 推送 wpa_supplicant.conf
         // （桩拷到 pushed.conf 留证并置 wlan-up 标记模拟重连成功）→
-        // camera-factory 5 → 等 DHCP → 吞吐照常 PASS
+        // camera-factory 5（输出带 FAIL-BUSY 噪声 + 回读 wlan0-ip）→
+        // 直接采信回读 IP → 吞吐照常 PASS
         std::fs::remove_file(base.join("wlan-up")).unwrap();
         std::env::set_var("IPERF3", &iscript);
         std::env::set_var("E02_LOCAL_IP", "192.168.3.10");

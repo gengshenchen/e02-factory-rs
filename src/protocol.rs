@@ -124,7 +124,10 @@ pub fn parse_battery(output: &str) -> String {
 /// 设备命令返回值判定约定（V3.5）：输出含 `FAIL` 即失败，否则通过。
 /// WiFi/录像/拍照共用。
 pub fn output_ok(output: &str) -> bool {
-    !output.contains("FAIL")
+    // FAIL-BUSY 是 wpa_ctrl 的瞬态应答（SCAN 忙），固件无视它继续走完
+    // 关联 + DHCP（2026-10-28 真机：输出带 FAIL-BUSY 但 wlan0-ip 正常
+    // 拿到租约），判定前剔除
+    !output.replace("FAIL-BUSY", "").contains("FAIL")
 }
 
 /// 陀螺仪自检（camera-factory 17）：固件明确回读 `gyroscope-test:true/false`
@@ -236,6 +239,20 @@ pub fn parse_wlan_ip(output: &str) -> Option<String> {
         let ip = tok.split('/').next()?;
         (!ip.starts_with("127.")).then(|| ip.to_string())
     })
+}
+
+/// 解析固件 camera-factory 5 输出里的 `wlan0-ip: <IPv4>`（关联 + DHCP
+/// 成功时固件自己回读打印，可省去轮询 ip 命令；
+/// 真机样例：`wlan0-ip: 10.82.62.192`）。
+pub fn parse_fw_wlan_ip(output: &str) -> Option<String> {
+    let v = output
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("wlan0-ip:"))?
+        .trim();
+    let ip = v.split_whitespace().next()?;
+    ip.parse::<std::net::Ipv4Addr>()
+        .is_ok()
+        .then(|| ip.to_string())
 }
 
 /// 解析 `cmd wifi status` 的 `(RSSI dBm, 链路速率 Mbps)`（探测链首选）。
@@ -429,6 +446,11 @@ mod tests {
         let out = "10: wlan0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500\n    inet 192.168.3.42/24 brd 192.168.3.255 scope global wlan0\n    inet6 fe80::1/64 scope link";
         assert_eq!(parse_wlan_ip(out), Some("192.168.3.42".into()));
         assert_eq!(parse_wlan_ip("no inet here"), None);
+        // 固件 camera-factory 5 回读（真机 2026-10-28 实样）
+        let fw = "Successfully initialized wpa_supplicant\nFAIL-BUSY\nudhcpc (v1.22.1) started\nLease of 10.82.62.192 obtained, lease time 3599\nwlan0-ip: 10.82.62.192\nwifi-rssi:-39";
+        assert_eq!(parse_fw_wlan_ip(fw), Some("10.82.62.192".into()));
+        assert_eq!(parse_fw_wlan_ip("wlan0-ip: \n"), None);
+        assert_eq!(parse_fw_wlan_ip("no tag"), None);
     }
 
     #[test]
@@ -502,6 +524,10 @@ mod tests {
         assert_eq!(parse_battery("nope"), "");
         assert!(output_ok("ok"));
         assert!(!output_ok("...FAIL..."));
+        // FAIL-BUSY 是 wpa_ctrl 瞬态噪声（真机：带着它照样拿到 DHCP），放行
+        assert!(output_ok(
+            "Successfully initialized wpa_supplicant\nFAIL-BUSY\nudhcpc started"
+        ));
         // 陀螺仪：严格等 true（false 不含 FAIL，通用判定会误过）
         assert!(gyro_ok("qmi8658 slave = 0x6a\ngyroscope-test:true"));
         assert!(!gyro_ok("qmi8658 slave = 0x6a\ngyroscope-test:false"));

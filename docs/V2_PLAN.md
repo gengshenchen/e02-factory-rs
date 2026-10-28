@@ -496,6 +496,11 @@ doc_lazy_continuation（clippy deny 级）。
 - 判定：**每秒窗口吞吐中位数**（共享信道瞬时抢道不误杀）≥ 阈值
   （↑10/↓15 Mbps 初值）+ TCP 重传 ≤500（反向从服务端 JSON 补）；边缘
   失败（阈值 50% 裕量内）自动复测一次，仍低才 FAIL；
+- **FAIL-BUSY 噪声剔除**（V3.12.4，真机 2026-10-28 证明）：固件
+  camera-factory 5 的 wpa_ctrl 瞬态应答 FAIL-BUSY（SCAN 忙）非致命——
+  带着它照样完成关联 + DHCP 并回读 `wlan0-ip:`，output_ok 与 join
+  判定先 replace 再查 FAIL；join 后优先采信固件回读的 wlan0-ip，
+  拿不到再 2s×10 轮询 `ip -4 addr show wlan0`；
 - RSSI（`cmd wifi status` → `/proc/net/wireless` 探测链）只记录不设门，
   唯一兜底 <-80dBm 视天线级故障；失败时 ping 网关区分"断连/连通但慢"；
 - 配置 `[wifi.throughput]`：direction/duration_secs/min_mbps_up/
