@@ -933,7 +933,7 @@ fn keys_flow(
 
 /// 单方向 iperf3 测试结果（判定与拼 detail 用）。
 struct DirOutcome {
-    label: &'static str, // ↑ / ↓
+    label: &'static str, // 上行 / 下行（UI 内嵌 CJK 字体无箭头字形，禁用符号）
     mbps: f32,           // 窗口中位数
     need: f32,           // 阈值（0=不判）
     retr: Option<u32>,
@@ -954,7 +954,7 @@ impl DirOutcome {
         }
         if let Some(v) = self.retr {
             if self.retr_max > 0 {
-                s.push_str(&format!(" 重传{v}(≤{})", self.retr_max));
+                s.push_str(&format!(" 重传{v}(上限{})", self.retr_max));
             } else {
                 s.push_str(&format!(" 重传{v}"));
             }
@@ -1199,11 +1199,14 @@ fn wifi_flow(tx: &Sender<UiEvent>, wifi: &WifiCfg) -> RunOutcome {
         }
     }
 
-    // 方向序列：(反向?, 标签, 阈值)
+    // 方向序列：(反向?, 标签, 阈值)；标签与 UI 字体约束一致用中文
     let dirs: &[(bool, &'static str, f32)] = match t.direction {
-        IperfDir::Up => &[(false, "↑", t.min_mbps_up)],
-        IperfDir::Down => &[(true, "↓", t.min_mbps_down)],
-        IperfDir::Both => &[(false, "↑", t.min_mbps_up), (true, "↓", t.min_mbps_down)],
+        IperfDir::Up => &[(false, "上行", t.min_mbps_up)],
+        IperfDir::Down => &[(true, "下行", t.min_mbps_down)],
+        IperfDir::Both => &[
+            (false, "上行", t.min_mbps_up),
+            (true, "下行", t.min_mbps_down),
+        ],
     };
 
     let mut parts = vec![format!("IP {ip}")];

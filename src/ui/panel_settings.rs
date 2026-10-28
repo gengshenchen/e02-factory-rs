@@ -158,94 +158,111 @@ pub fn show(ctx: &egui::Context, app: &mut E02App) {
                         if app.config.wifi.depth == WifiDepth::Throughput {
                             ui.add_space(6.0);
                             let t = &mut app.config.wifi.throughput;
-                            // 方向（V3.12 分段选项卡）+ 单向时长
-                            ui.horizontal(|ui| {
-                                if tab(ui, t.direction == IperfDir::Up, "上行") {
-                                    t.direction = IperfDir::Up;
-                                    changed = true;
-                                }
-                                if tab(ui, t.direction == IperfDir::Down, "下行") {
-                                    t.direction = IperfDir::Down;
-                                    changed = true;
-                                }
-                                if tab(ui, t.direction == IperfDir::Both, "双向") {
-                                    t.direction = IperfDir::Both;
-                                    changed = true;
-                                }
-                                ui.separator();
-                                ui.label("时长");
-                                changed |= ui
-                                    .add(
-                                        egui::DragValue::new(&mut t.duration_secs)
-                                            .suffix("s")
-                                            .range(2..=30),
-                                    )
-                                    .changed();
-                            });
-                            // 阈值：只显示所选方向的吞吐阈值（双向两个都显示），
-                            // 重传上限两方向共用
-                            ui.horizontal(|ui| {
-                                if t.direction != IperfDir::Down {
-                                    ui.label("≥↑");
+                                    // 方向/时长/阈值/复测/端口/SSID 四列网格（V3.12.8）：
+                                    // label 列 + 值列跨行对齐；上/下 tabs 带"只测"
+                                    // 前缀（用户要求点明只测一部分）；≥≤↑↓ 内嵌
+                                    // CJK 字体无字形（豆腐块，fonttools cmap 实证），
+                                    // 一律用中文
+                                    egui::Grid::new("wifi_thr")
+                                .num_columns(4)
+                                .spacing([16.0, 8.0])
+                                .show(ui, |ui| {
+                                    ui.label("方向");
+                                    ui.horizontal(|ui| {
+                                        if tab(ui, t.direction == IperfDir::Up, "只测上行") {
+                                            t.direction = IperfDir::Up;
+                                            changed = true;
+                                        }
+                                        if tab(ui, t.direction == IperfDir::Down, "只测下行") {
+                                            t.direction = IperfDir::Down;
+                                            changed = true;
+                                        }
+                                        if tab(ui, t.direction == IperfDir::Both, "双向") {
+                                            t.direction = IperfDir::Both;
+                                            changed = true;
+                                        }
+                                    });
+                                    ui.label("时长");
                                     changed |= ui
                                         .add(
-                                            egui::DragValue::new(&mut t.min_mbps_up)
-                                                .suffix("Mbps")
-                                                .range(0.0..=300.0),
+                                            egui::DragValue::new(&mut t.duration_secs)
+                                                .suffix("s")
+                                                .range(2..=30),
                                         )
                                         .changed();
-                                    if t.direction == IperfDir::Both {
-                                        ui.separator();
-                                    }
-                                }
-                                if t.direction != IperfDir::Up {
-                                    ui.label("≥↓");
+                                    ui.end_row();
+
+                                    // 阈值：只显示所选方向的吞吐阈值（双向两个都
+                                    // 显示），重传上限两方向共用
+                                    ui.label("阈值");
+                                    ui.horizontal(|ui| {
+                                        if t.direction != IperfDir::Down {
+                                            ui.label("上行");
+                                            changed |= ui
+                                                .add(
+                                                    egui::DragValue::new(&mut t.min_mbps_up)
+                                                        .suffix("Mbps")
+                                                        .range(0.0..=300.0),
+                                                )
+                                                .changed();
+                                            if t.direction == IperfDir::Both {
+                                                ui.separator();
+                                            }
+                                        }
+                                        if t.direction != IperfDir::Up {
+                                            ui.label("下行");
+                                            changed |= ui
+                                                .add(
+                                                    egui::DragValue::new(&mut t.min_mbps_down)
+                                                        .suffix("Mbps")
+                                                        .range(0.0..=300.0),
+                                                )
+                                                .changed();
+                                            ui.separator();
+                                        }
+                                        ui.label("重传");
+                                        changed |= ui
+                                            .add(
+                                                egui::DragValue::new(&mut t.max_retr)
+                                                    .range(0..=10000),
+                                            )
+                                            .changed();
+                                    });
+                                    ui.end_row();
+
+                                    ui.label("复测");
+                                    changed |= ui
+                                        .checkbox(&mut t.retest, "边缘失败自动复测一次")
+                                        .changed();
+                                    ui.label("端口");
                                     changed |= ui
                                         .add(
-                                            egui::DragValue::new(&mut t.min_mbps_down)
-                                                .suffix("Mbps")
-                                                .range(0.0..=300.0),
+                                            egui::DragValue::new(&mut t.server_port)
+                                                .range(0..=65535),
                                         )
                                         .changed();
-                                    ui.separator();
-                                }
-                                ui.label("重传 ≤");
-                                changed |= ui
-                                    .add(egui::DragValue::new(&mut t.max_retr).range(0..=10000))
-                                    .changed();
-                            });
-                            ui.horizontal(|ui| {
-                                changed |= ui
-                                    .checkbox(&mut t.retest, "边缘失败自动复测一次")
-                                    .changed();
-                                ui.separator();
-                                ui.label("端口");
-                                changed |= ui
-                                    .add(egui::DragValue::new(&mut t.server_port).range(0..=65535))
-                                    .changed();
-                            });
-                            ui.add_space(6.0);
-                            // 产线 SSID：耳机 MIPS/uClibc 固件无 Android cmd wifi，
-                            // 未入网时推送 wpa_supplicant.conf 并重连
-                            ui.horizontal(|ui| {
-                                ui.label("产线 SSID");
-                                changed |= ui
-                                    .add(
-                                        egui::TextEdit::singleline(&mut app.config.wifi.ssid)
-                                            .hint_text("耳机已入网则留空")
-                                            .desired_width(150.0),
-                                    )
-                                    .changed();
-                                ui.separator();
-                                ui.label("密码");
-                                changed |= ui
-                                    .add(
-                                        egui::TextEdit::singleline(&mut app.config.wifi.psk)
-                                            .hint_text("开放网络留空")
-                                            .desired_width(110.0),
-                                    )
-                                    .changed();
-                            });
+                                    ui.end_row();
+
+                                    // 产线 SSID：耳机 MIPS/uClibc 固件无 Android
+                                    // cmd wifi，未入网时推送 wpa_supplicant.conf 重连
+                                    ui.label("产线 SSID");
+                                    changed |= ui
+                                        .add(
+                                            egui::TextEdit::singleline(&mut app.config.wifi.ssid)
+                                                .hint_text("耳机已入网则留空")
+                                                .desired_width(150.0),
+                                        )
+                                        .changed();
+                                    ui.label("密码");
+                                    changed |= ui
+                                        .add(
+                                            egui::TextEdit::singleline(&mut app.config.wifi.psk)
+                                                .hint_text("开放网络留空")
+                                                .desired_width(110.0),
+                                        )
+                                        .changed();
+                                    ui.end_row();
+                                });
                             ui.add_space(2.0);
                             caption(ui, "上行=耳机发往 PC，下行=PC 发往耳机，双向=两方向各测一次");
                             caption(ui, "吞吐按每秒窗口中位数判定，另加 TCP 重传上限；0=不判");
