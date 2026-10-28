@@ -236,9 +236,30 @@ pub fn parse_wlan_ip(output: &str) -> Option<String> {
     output.lines().find_map(|l| {
         let rest = l.trim().strip_prefix("inet ")?;
         let tok = rest.split_whitespace().next()?;
+        // busybox ifconfig 的 `inet addr:x.x.x.x` 行让给 parse_wlan_ifconfig，
+        // 此处会截出残值 addr:x.x.x.x
+        if tok.starts_with("addr:") {
+            return None;
+        }
         let ip = tok.split('/').next()?;
         (!ip.starts_with("127.")).then(|| ip.to_string())
     })
+}
+
+/// 解析 `ifconfig wlan0` 的 IPv4（busybox 格式；行样例：
+/// `          inet addr:10.82.62.192  Bcast:10.82.62.255  Mask:...`）。
+pub fn parse_wlan_ifconfig(output: &str) -> Option<String> {
+    output.lines().find_map(|l| {
+        let rest = l.trim().strip_prefix("inet addr:")?;
+        let ip = rest.split_whitespace().next()?;
+        (!ip.starts_with("127.")).then(|| ip.to_string())
+    })
+}
+
+/// ip / ifconfig 双格式合并解析（探测命令 `ip ...; ifconfig ...` 拼接执行，
+/// 真机 busybox 未必编入 ip applet，2026-10-28 轮询全空的教训）。
+pub fn parse_wlan_ip_any(output: &str) -> Option<String> {
+    parse_wlan_ip(output).or_else(|| parse_wlan_ifconfig(output))
 }
 
 /// 解析固件 camera-factory 5 输出里的 `wlan0-ip: <IPv4>`（关联 + DHCP
@@ -446,6 +467,11 @@ mod tests {
         let out = "10: wlan0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500\n    inet 192.168.3.42/24 brd 192.168.3.255 scope global wlan0\n    inet6 fe80::1/64 scope link";
         assert_eq!(parse_wlan_ip(out), Some("192.168.3.42".into()));
         assert_eq!(parse_wlan_ip("no inet here"), None);
+        // busybox ifconfig 格式 + 双命令拼接输出
+        let bb = "wlan0     Link encap:Ethernet  HWaddr AA:BB:CC:DD:EE:FF\n          inet addr:10.82.62.192  Bcast:10.82.62.255  Mask:255.255.255.0";
+        assert_eq!(parse_wlan_ifconfig(bb), Some("10.82.62.192".into()));
+        assert_eq!(parse_wlan_ifconfig("lo ... inet addr:127.0.0.1"), None);
+        assert_eq!(parse_wlan_ip_any(bb), Some("10.82.62.192".into()));
         // 固件 camera-factory 5 回读（真机 2026-10-28 实样）
         let fw = "Successfully initialized wpa_supplicant\nFAIL-BUSY\nudhcpc (v1.22.1) started\nLease of 10.82.62.192 obtained, lease time 3599\nwlan0-ip: 10.82.62.192\nwifi-rssi:-39";
         assert_eq!(parse_fw_wlan_ip(fw), Some("10.82.62.192".into()));

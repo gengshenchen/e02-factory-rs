@@ -1079,9 +1079,16 @@ fn wifi_flow(tx: &Sender<UiEvent>, wifi: &WifiCfg) -> RunOutcome {
     // SSID 时，推送 wpa_supplicant.conf 再跑 camera-factory 5 走固件既有
     // 连接逻辑重连（原 camera-factory 20 直连指令方案已弃，固件侧不动）
     let _ = tx.send(UiEvent::Log("WiFi 吞吐：读取 wlan0 地址...".to_string()));
-    let mut ip = adb::shell("ip -4 addr show wlan0")
-        .ok()
-        .and_then(|o| protocol::parse_wlan_ip(&o));
+    // ip/ifconfig 双探测：busybox 未必编入 ip applet（真机 2026-10-28
+    // 轮询 10 次全空但固件实际已拿到 DHCP 租约），ifconfig 基本必在
+    const PROBE: &str = "ip -4 addr show wlan0 2>/dev/null; ifconfig wlan0 2>/dev/null";
+    let probe_ip = || {
+        adb::shell(PROBE)
+            .ok()
+            .and_then(|o| protocol::parse_wlan_ip_any(&o))
+    };
+    let mut ip = probe_ip();
+    let mut last5 = String::new(); // 最近一次 camera-factory 5 输出（失败归因用）
     if ip.is_none() && !wifi.ssid.is_empty() {
         let _ = tx.send(UiEvent::Log(format!(
             "wlan0 未入网，推送产线 SSID {} 并重连...",
@@ -1089,7 +1096,10 @@ fn wifi_flow(tx: &Sender<UiEvent>, wifi: &WifiCfg) -> RunOutcome {
         )));
         match join_wifi(&wifi.ssid, &wifi.psk) {
             // 关联 + DHCP 成功时固件自己回读打印 wlan0-ip，直接采信
-            Ok(out) => ip = protocol::parse_fw_wlan_ip(&out),
+            Ok(out) => {
+                last5 = out.clone();
+                ip = protocol::parse_fw_wlan_ip(&out);
+            }
             Err(e) => {
                 r.verdict = Verdict::Fail;
                 r.detail = format!("连接 {} 失败: {e}", wifi.ssid);
@@ -1099,14 +1109,31 @@ fn wifi_flow(tx: &Sender<UiEvent>, wifi: &WifiCfg) -> RunOutcome {
                 };
             }
         }
-        // 等 DHCP（固件已回读则直接跳过）：2s 一次最多 10 次（慢 AP 也够）
-        for _ in 0..10 {
-            std::thread::sleep(std::time::Duration::from_secs(2));
-            ip = adb::shell("ip -4 addr show wlan0")
-                .ok()
-                .and_then(|o| protocol::parse_wlan_ip(&o));
-            if ip.is_some() {
+        // 等 DHCP（固件已回读则直接跳过）；5 可能因 wpa BUSY 竞态提前
+        // 返回（输出无 wlan0-ip、连接仍在途）——轮询一轮没拿到就重跑
+        // 一次 5 再等一轮（等价产线手动重试，真机验证有效）
+        for round in 0..2 {
+            for _ in 0..10 {
+                if ip.is_some() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                ip = probe_ip();
+            }
+            if ip.is_some() || round == 1 {
                 break;
+            }
+            let _ = tx.send(UiEvent::Log(
+                "仍未入网，重跑 camera-factory 5...".to_string(),
+            ));
+            match adb::shell("camera-factory 5") {
+                Ok(out) => {
+                    last5 = out.clone();
+                    ip = protocol::parse_fw_wlan_ip(&out);
+                }
+                Err(e) => {
+                    last5 = format!("执行失败: {e:#}");
+                }
             }
         }
     }
@@ -1116,8 +1143,9 @@ fn wifi_flow(tx: &Sender<UiEvent>, wifi: &WifiCfg) -> RunOutcome {
             "驱动通过，但 wlan0 无 IPv4（未入网/未拿到 DHCP？设置页配产线 SSID 可自动连接）".into()
         } else {
             format!(
-                "驱动通过，已推送 {} 配置重连，wlan0 仍未拿到 IPv4",
-                wifi.ssid
+                "驱动通过，已推送 {} 配置重连，wlan0 仍未拿到 IPv4（5 输出: {}）",
+                wifi.ssid,
+                clip(&runner::one_line(&last5), 60)
             )
         };
         return RunOutcome {
