@@ -182,25 +182,35 @@ pub fn show(ctx: &egui::Context, app: &mut E02App) {
                             );
                             ui.add_space(6.0);
                             let t = &mut app.config.wifi.throughput;
-                            ui.horizontal(|ui| {
-                                ui.label("方向");
-                                if tab(ui, t.direction == IperfDir::Up, "只测上行") {
-                                    t.direction = IperfDir::Up;
-                                    changed = true;
-                                }
-                                if tab(ui, t.direction == IperfDir::Down, "只测下行") {
-                                    t.direction = IperfDir::Down;
-                                    changed = true;
-                                }
-                                if tab(ui, t.direction == IperfDir::Both, "双向") {
-                                    t.direction = IperfDir::Both;
-                                    changed = true;
-                                }
-                            });
+                            // 方向行独立网格但钉住标签列宽（58 = 4 字标签宽，
+                            // 与下方参数网格一致），选项卡起点对齐控件列
+                            egui::Grid::new("wifi_dir")
+                                .num_columns(2)
+                                .spacing([16.0, 8.0])
+                                .min_col_width(58.0)
+                                .show(ui, |ui| {
+                                    ui.label("方向");
+                                    ui.horizontal(|ui| {
+                                        if tab(ui, t.direction == IperfDir::Up, "只测上行") {
+                                            t.direction = IperfDir::Up;
+                                            changed = true;
+                                        }
+                                        if tab(ui, t.direction == IperfDir::Down, "只测下行") {
+                                            t.direction = IperfDir::Down;
+                                            changed = true;
+                                        }
+                                        if tab(ui, t.direction == IperfDir::Both, "双向") {
+                                            t.direction = IperfDir::Both;
+                                            changed = true;
+                                        }
+                                    });
+                                    ui.end_row();
+                                });
                             ui.add_space(4.0);
                             egui::Grid::new("wifi_thr")
                                 .num_columns(3)
                                 .spacing([16.0, 8.0])
+                                .min_col_width(58.0)
                                 .show(ui, |ui| {
                                     ui.label("每次时长");
                                     changed |= ui
@@ -249,7 +259,7 @@ pub fn show(ctx: &egui::Context, app: &mut E02App) {
                                     changed |= ui
                                         .checkbox(&mut t.retest, "边缘失败自动复测一次")
                                         .changed();
-                                    caption(ui, "边缘=未达阈值但其一半以上");
+                                    caption(ui, "边缘=未达阈值但其一半以上；连接失败同复测");
                                     ui.end_row();
 
                                     ui.label("端口");

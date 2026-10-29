@@ -969,16 +969,23 @@ impl DirOutcome {
 /// 起一次服务端（-1 单测自退）+ 设备端客户端，返回结果摘要。
 ///
 /// 服务端在 PC 线程里跑（exec::output 带超时与全局停止），反向测试的
-/// 重传数发生在 PC 发送端，从服务端 JSON 补齐。
+/// 重传数发生在 PC 发送端，从服务端 JSON 补齐。端口每次独立取空闲
+/// （server_port=0 时）：真机 18:44 案例里上行无线瞬断卡死、服务端
+/// 20s 超时被杀后端口残留，下行复用同端口 bind 失败被秒拒——
+/// 每方向各拿各的端口后这类残留互不传染。
 fn iperf_once(
     tx: &Sender<UiEvent>,
     host: &str,
     t: &ThroughputCfg,
     local: std::net::Ipv4Addr,
-    port: u16,
     reverse: bool,
 ) -> Result<protocol::IperfSummary, String> {
     let label = if reverse { "下行" } else { "上行" };
+    let port = if t.server_port == 0 {
+        free_port().unwrap_or(19703)
+    } else {
+        t.server_port
+    };
     let _ = tx.send(UiEvent::Log(format!(
         "iperf3 {label}：{local}:{port} {}s",
         t.duration_secs
@@ -1003,13 +1010,32 @@ fn iperf_once(
     if reverse {
         client.push_str(" -R");
     }
+    // 客户端专用超时 = 时长 + 缓冲：不再走 60s 单项超时白等
+    // （瞬断/被拦时 adb 挂满一分钟才被杀，整项直接超时）
+    let client_secs = t.duration_secs as u64 + 12;
     // 固件把 iperf3 放在系统目录（PATH 可达；固件侧无 which 指令），裸名执行
-    let out = adb::shell(&format!("iperf3 {client}")).map_err(|e| format!("adb: {e:#}"))?;
+    let out = adb::shell_timeout(
+        &format!("iperf3 {client}"),
+        Duration::from_secs(client_secs),
+    )
+    .map_err(|e| {
+        let es = format!("{e:#}");
+        if es.contains("超时") {
+            format!("命令 {client_secs}s 未返回（疑无线瞬断或 PC 防火墙拦 {local}:{port} 入站）")
+        } else {
+            format!("adb: {es}")
+        }
+    })?;
     let srv = server.join().ok().flatten();
 
     let mut sum = protocol::parse_iperf3_json(&out).ok_or_else(|| {
         if out.contains("not found") {
             "固件未集成 iperf3（PATH 直接执行失败）".to_string()
+        } else if out.contains("connected\":[]") || out.contains("unable to connect") {
+            format!(
+                "设备连不上 PC 服务器 {local}:{port}（疑端口未监听/防火墙）: {}",
+                clip(&runner::one_line(&out), 60)
+            )
         } else {
             format!("iperf3 输出无法解析: {}", clip(&runner::one_line(&out), 80))
         }
@@ -1161,7 +1187,7 @@ fn wifi_flow(tx: &Sender<UiEvent>, wifi: &WifiCfg) -> RunOutcome {
         protocol::parse_fw_wifi_rssi(&last5).map(|v| (v, 0))
     });
 
-    // PC 与设备同网段地址 + 空闲端口
+    // PC 与设备同网段地址
     let Some(peer) = ip.parse::<std::net::Ipv4Addr>().ok() else {
         r.verdict = Verdict::Fail;
         r.detail = format!("驱动 ok，IP {ip}；地址无法解析");
@@ -1178,12 +1204,6 @@ fn wifi_flow(tx: &Sender<UiEvent>, wifi: &WifiCfg) -> RunOutcome {
             device: base.device,
         };
     };
-    let port = if t.server_port == 0 {
-        free_port().unwrap_or(19703)
-    } else {
-        t.server_port
-    };
-
     // PC 侧 iperf3 预检：随包分发缺失时明确报错，别让客户端玄学解析失败
     let host = player::resolve_tool(player::exe_dir().as_deref(), "IPERF3", "iperf3");
     match std::process::Command::new(&host).arg("--version").output() {
@@ -1212,37 +1232,46 @@ fn wifi_flow(tx: &Sender<UiEvent>, wifi: &WifiCfg) -> RunOutcome {
     let mut parts = vec![format!("IP {ip}")];
     let mut all_ok = true;
     for &(rev, label, need) in dirs {
-        let first = iperf_once(tx, &host, t, local, port, rev);
-        let mut o = match first {
-            Ok(sum) => DirOutcome {
+        let run = || iperf_once(tx, &host, t, local, rev);
+        let outcome =
+            |sum: protocol::IperfSummary, retr_fallback: Option<u32>, retested: bool| DirOutcome {
                 label,
                 mbps: sum.mbps_median,
                 need,
-                retr: sum.retransmits,
+                retr: sum.retransmits.or(retr_fallback),
                 retr_max: t.max_retr,
-                retested: false,
-            },
+                retested,
+            };
+        // 命令级失败（超时/连不上）开了复测就换端口再试一次：
+        // 共享 2.4G 无线瞬断、端口残留这类一次性的坑不该直接判死
+        let mut o = match run() {
+            Ok(sum) => outcome(sum, None, false),
             Err(msg) => {
-                all_ok = false;
-                parts.push(format!("{label} 测试失败：{msg}"));
-                continue;
+                if !t.retest {
+                    all_ok = false;
+                    parts.push(format!("{label} 测试失败：{msg}"));
+                    continue;
+                }
+                let _ = tx.send(UiEvent::Log(format!("{label} 失败，自动复测一次...")));
+                match run() {
+                    Ok(sum) => outcome(sum, None, true),
+                    Err(msg2) => {
+                        all_ok = false;
+                        parts.push(format!("{label} 测试失败：{msg2}"));
+                        continue;
+                    }
+                }
             }
         };
-        // 边缘失败自动复测一次（共享 2.4G 下瞬时抢道不冤枉良品）
-        if !o.pass() && t.retest {
+        // 边缘失败自动复测一次（共享 2.4G 下瞬时抢道不冤枉良品；
+        // 命令失败复测过的方向不再重复复测）
+        if !o.pass() && t.retest && !o.retested {
             let marginal = (o.need > 0.0 && o.mbps >= o.need * 0.5)
                 || o.retr.is_some_and(|v| v <= o.retr_max * 2);
             if marginal {
                 let _ = tx.send(UiEvent::Log(format!("{label} 边缘失败，复测一次...")));
-                if let Ok(sum) = iperf_once(tx, &host, t, local, port, rev) {
-                    o = DirOutcome {
-                        label,
-                        mbps: sum.mbps_median,
-                        need,
-                        retr: sum.retransmits.or(o.retr),
-                        retr_max: t.max_retr,
-                        retested: true,
-                    };
+                if let Ok(sum) = run() {
+                    o = outcome(sum, o.retr, true);
                 }
             }
         }
@@ -1628,7 +1657,7 @@ mod tests {
              *\"ip -4 addr show wlan0\"*) if [ -f \"$(dirname \"$0\")/wlan-up\" ]; then printf 'inet 192.168.3.42/24 brd 192.168.3.255 scope global wlan0\\n'; fi;;\n\
              *\"iperf3 -c\"*) case \"$*\" in\n\
                *\"-R\"*) printf '%s' '{\"intervals\":[{\"sum\":{\"bits_per_second\":30e6}}],\"end\":{\"sum\":{\"bits_per_second\":29e6}}}';;\n\
-               *) printf '%s' '{\"intervals\":[{\"sum\":{\"bits_per_second\":20e6}},{\"sum\":{\"bits_per_second\":24e6}},{\"sum\":{\"bits_per_second\":22e6}}],\"end\":{\"sum_sent\":{\"bits_per_second\":22e6,\"retransmits\":36},\"sum_received\":{\"bits_per_second\":21.9e6}}} ';;\n\
+               *) if [ -f \"$(dirname \"$0\")/drop-first\" ]; then rm -f \"$(dirname \"$0\")/drop-first\"; printf '%s' '{\"start\":{\"connected\":[]},\"error\":\"unable to connect to server\"}'; else printf '%s' '{\"intervals\":[{\"sum\":{\"bits_per_second\":20e6}},{\"sum\":{\"bits_per_second\":24e6}},{\"sum\":{\"bits_per_second\":22e6}}],\"end\":{\"sum_sent\":{\"bits_per_second\":22e6,\"retransmits\":36},\"sum_received\":{\"bits_per_second\":21.9e6}}} '; fi;;\n\
              esac;;\n\
              *\"ip route\"*) printf 'default via 192.168.1.1 dev wlan0\\n';;\n\
              *\"ping\"*) printf '%s\\n%s\\n' \
@@ -1669,6 +1698,28 @@ mod tests {
             &media,
             &reports,
             cfg,
+            wifi_case,
+            || unreachable!(),
+        );
+        std::env::remove_var("IPERF3");
+        std::env::remove_var("E02_LOCAL_IP");
+        assert_eq!((vs[0].1, n), (Verdict::Pass, 0));
+
+        // V3.12.11：上行首跑连不上（connected:[] 命令级失败）→ 开了复测
+        // 换端口再试成功 → 整项仍 PASS（真机 18:44 无线瞬断案例的回归；
+        // 无复测逻辑时首跑 Err 会直接 FAIL，PASS 即证明失败复测生效）
+        std::fs::write(base.join("wlan-up"), b"").unwrap();
+        std::fs::write(base.join("drop-first"), b"").unwrap();
+        std::env::set_var("IPERF3", &iscript);
+        std::env::set_var("E02_LOCAL_IP", "192.168.3.10");
+        let mut flaky_cfg = Config::default();
+        flaky_cfg.wifi.depth = crate::config::WifiDepth::Throughput;
+        let (vs, n) = scenario(
+            &wscript,
+            items(TestItem::Wifi),
+            &media,
+            &reports,
+            flaky_cfg,
             wifi_case,
             || unreachable!(),
         );

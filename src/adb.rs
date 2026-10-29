@@ -16,11 +16,24 @@ fn adb_path() -> String {
 /// 执行 `adb shell <cmd>`，返回去除首尾空白与 `\r` 的 stdout。
 /// 受全局默认超时约束（见 [`exec::set_default_timeout`]）。
 pub fn shell(cmd: &str) -> Result<String> {
-    let out = exec::output(
-        Command::new(adb_path()).arg("shell").arg(cmd),
-        exec::default_timeout(),
-    )
-    .with_context(|| format!("执行 adb shell {cmd} 失败（adb 是否在 PATH？）"))?;
+    shell_inner(cmd, exec::default_timeout())
+}
+
+/// 同 [`shell`] 但自带专用超时（iperf3 客户端按测试时长收紧，
+/// 不吃 60s 单项超时：瞬断/被拦时白等一分钟才被杀）。
+pub fn shell_timeout(cmd: &str, timeout: std::time::Duration) -> Result<String> {
+    shell_inner(cmd, Some(timeout))
+}
+
+fn shell_inner(cmd: &str, timeout: Option<std::time::Duration>) -> Result<String> {
+    let out = match exec::output(Command::new(adb_path()).arg("shell").arg(cmd), timeout) {
+        Ok(o) => o,
+        // NotFound 才提示 PATH（真机 18:44 超时错误也挂着这提示，误导排查）
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            bail!("执行 adb shell {cmd} 失败（adb 是否在 PATH？可设 ADB 环境变量指定）")
+        }
+        Err(e) => return Err(anyhow::Error::from(e).context(format!("执行 adb shell {cmd} 失败"))),
+    };
     if !out.status.success() {
         bail!(
             "adb shell {cmd} 退出码 {:?}: {}",
