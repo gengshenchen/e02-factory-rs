@@ -136,7 +136,8 @@ pub fn show(ctx: &egui::Context, app: &mut E02App) {
 
                     ui.add_space(12.0);
 
-                    // —— WiFi 测试深度 ——
+                    // —— WiFi 测试深度（V3.12.9 拆三卡：深度 / 吞吐参数 /
+                    // 产线配网；参数一参数一行，控件右侧灰字说明含义）——
                     theme::card().show(ui, |ui| {
                         card_begin(ui);
                         card_head(ui, "WiFi 测试深度", None);
@@ -155,16 +156,28 @@ pub fn show(ctx: &egui::Context, app: &mut E02App) {
                             }
                         });
                         changed |= app.config.wifi.depth != depth_before;
-                        if app.config.wifi.depth == WifiDepth::Throughput {
-                            ui.add_space(6.0);
+                        ui.add_space(2.0);
+                        caption(
+                            ui,
+                            if app.config.wifi.depth == WifiDepth::Throughput {
+                                "连上 AP 后用 iperf3 实测吞吐并按阈值判定"
+                            } else {
+                                "只验证无线驱动初始化，不测速率"
+                            },
+                        );
+                    });
+
+                    if app.config.wifi.depth == WifiDepth::Throughput {
+                        // —— 吞吐测试参数：两列网格（标签列 + 控件列），
+                        // 一参数一行；阈值始终双方向都显示（只测单方向时
+                        // 另一方向不参与判定），含义写在行内灰字 ——
+                        theme::card().show(ui, |ui| {
+                            card_begin(ui);
+                            card_head(ui, "吞吐测试参数", None);
+                            ui.add_space(4.0);
                             let t = &mut app.config.wifi.throughput;
-                                    // 方向/时长/阈值/复测/端口/SSID 四列网格（V3.12.8）：
-                                    // label 列 + 值列跨行对齐；上/下 tabs 带"只测"
-                                    // 前缀（用户要求点明只测一部分）；≥≤↑↓ 内嵌
-                                    // CJK 字体无字形（豆腐块，fonttools cmap 实证），
-                                    // 一律用中文
-                                    egui::Grid::new("wifi_thr")
-                                .num_columns(4)
+                            egui::Grid::new("wifi_thr")
+                                .num_columns(2)
                                 .spacing([16.0, 8.0])
                                 .show(ui, |ui| {
                                     ui.label("方向");
@@ -182,96 +195,123 @@ pub fn show(ctx: &egui::Context, app: &mut E02App) {
                                             changed = true;
                                         }
                                     });
-                                    ui.label("时长");
-                                    changed |= ui
-                                        .add(
-                                            egui::DragValue::new(&mut t.duration_secs)
-                                                .suffix("s")
-                                                .range(2..=30),
-                                        )
-                                        .changed();
                                     ui.end_row();
 
-                                    // 阈值：只显示所选方向的吞吐阈值（双向两个都
-                                    // 显示），重传上限两方向共用
-                                    ui.label("阈值");
+                                    ui.label("每次时长");
                                     ui.horizontal(|ui| {
-                                        if t.direction != IperfDir::Down {
-                                            ui.label("上行");
-                                            changed |= ui
-                                                .add(
-                                                    egui::DragValue::new(&mut t.min_mbps_up)
-                                                        .suffix("Mbps")
-                                                        .range(0.0..=300.0),
-                                                )
-                                                .changed();
-                                            if t.direction == IperfDir::Both {
-                                                ui.separator();
-                                            }
-                                        }
-                                        if t.direction != IperfDir::Up {
-                                            ui.label("下行");
-                                            changed |= ui
-                                                .add(
-                                                    egui::DragValue::new(&mut t.min_mbps_down)
-                                                        .suffix("Mbps")
-                                                        .range(0.0..=300.0),
-                                                )
-                                                .changed();
-                                            ui.separator();
-                                        }
-                                        ui.label("重传");
+                                        changed |= ui
+                                            .add(
+                                                egui::DragValue::new(&mut t.duration_secs)
+                                                    .suffix("s")
+                                                    .range(2..=30),
+                                            )
+                                            .changed();
+                                        caption(ui, "每个方向单次测试时长");
+                                    });
+                                    ui.end_row();
+
+                                    ui.label("上行阈值");
+                                    ui.horizontal(|ui| {
+                                        changed |= ui
+                                            .add(
+                                                egui::DragValue::new(&mut t.min_mbps_up)
+                                                    .suffix("Mbps")
+                                                    .range(0.0..=300.0),
+                                            )
+                                            .changed();
+                                        caption(ui, "耳机发往电脑，低于此值判不合格；0 不判");
+                                    });
+                                    ui.end_row();
+
+                                    ui.label("下行阈值");
+                                    ui.horizontal(|ui| {
+                                        changed |= ui
+                                            .add(
+                                                egui::DragValue::new(&mut t.min_mbps_down)
+                                                    .suffix("Mbps")
+                                                    .range(0.0..=300.0),
+                                            )
+                                            .changed();
+                                        caption(ui, "电脑发往耳机，低于此值判不合格；0 不判");
+                                    });
+                                    ui.end_row();
+
+                                    ui.label("重传上限");
+                                    ui.horizontal(|ui| {
                                         changed |= ui
                                             .add(
                                                 egui::DragValue::new(&mut t.max_retr)
                                                     .range(0..=10000),
                                             )
                                             .changed();
+                                        caption(ui, "单方向 TCP 重传总数超过判不合格");
                                     });
                                     ui.end_row();
 
                                     ui.label("复测");
-                                    changed |= ui
-                                        .checkbox(&mut t.retest, "边缘失败自动复测一次")
-                                        .changed();
-                                    ui.label("端口");
-                                    changed |= ui
-                                        .add(
-                                            egui::DragValue::new(&mut t.server_port)
-                                                .range(0..=65535),
-                                        )
-                                        .changed();
+                                    ui.horizontal(|ui| {
+                                        changed |= ui
+                                            .checkbox(&mut t.retest, "边缘失败自动复测一次")
+                                            .changed();
+                                        caption(ui, "边缘=未达阈值但其一半以上");
+                                    });
                                     ui.end_row();
 
-                                    // 产线 SSID：耳机 MIPS/uClibc 固件无 Android
-                                    // cmd wifi，未入网时推送 wpa_supplicant.conf 重连
+                                    ui.label("端口");
+                                    ui.horizontal(|ui| {
+                                        changed |= ui
+                                            .add(
+                                                egui::DragValue::new(&mut t.server_port)
+                                                    .range(0..=65535),
+                                            )
+                                            .changed();
+                                        caption(ui, "电脑侧 iperf3 服务器端口");
+                                    });
+                                    ui.end_row();
+                                });
+                            ui.add_space(2.0);
+                            caption(
+                                ui,
+                                "上行=耳机发往电脑，下行=电脑发往耳机；吞吐取每秒速率的中位数",
+                            );
+                            caption(ui, "2.4G 单天线理论 72Mbps；阈值以产线 AP 与金机实测校准");
+                        });
+
+                        ui.add_space(12.0);
+
+                        // —— 产线配网：耳机 MIPS/uClibc 固件无 Android cmd
+                        // wifi，未入网时推送 wpa_supplicant.conf 重连 ——
+                        theme::card().show(ui, |ui| {
+                            card_begin(ui);
+                            card_head(ui, "产线配网", None);
+                            ui.add_space(4.0);
+                            egui::Grid::new("wifi_join")
+                                .num_columns(2)
+                                .spacing([16.0, 8.0])
+                                .show(ui, |ui| {
                                     ui.label("产线 SSID");
                                     changed |= ui
                                         .add(
                                             egui::TextEdit::singleline(&mut app.config.wifi.ssid)
                                                 .hint_text("耳机已入网则留空")
-                                                .desired_width(150.0),
+                                                .desired_width(190.0),
                                         )
                                         .changed();
+                                    ui.end_row();
                                     ui.label("密码");
                                     changed |= ui
                                         .add(
                                             egui::TextEdit::singleline(&mut app.config.wifi.psk)
                                                 .hint_text("开放网络留空")
-                                                .desired_width(110.0),
+                                                .desired_width(190.0),
                                         )
                                         .changed();
                                     ui.end_row();
                                 });
                             ui.add_space(2.0);
-                            caption(ui, "上行=耳机发往 PC，下行=PC 发往耳机，双向=两方向各测一次");
-                            caption(ui, "吞吐按每秒窗口中位数判定，另加 TCP 重传上限；0=不判");
-                            caption(
-                                ui,
-                                "2.4G 单天线理论 72Mbps、健康实测 30Mbps 以上；PC 软热点偏弱，阈值以产线 AP 与金机校准",
-                            );
-                        }
-                    });
+                            caption(ui, "耳机未入网时推送此网络并触发重连；已入网则直接测吞吐");
+                        });
+                    }
 
                     ui.add_space(12.0);
 
