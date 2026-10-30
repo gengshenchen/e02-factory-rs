@@ -1101,9 +1101,9 @@ fn wifi_flow(tx: &Sender<UiEvent>, wifi: &WifiCfg) -> RunOutcome {
     let t = &wifi.throughput;
 
     // 设备 IP：join + DHCP 成功即连通性证明（ping 已退役为失败归因用）。
-    // MIPS/uClibc 固件没有 Android 的 cmd wifi——wlan0 未入网且配了产线
-    // SSID 时，推送 wpa_supplicant.conf 再跑 camera-factory 5 走固件既有
-    // 连接逻辑重连（原 camera-factory 20 直连指令方案已弃，固件侧不动）
+    // MIPS/uClibc 固件没有 Android 的 cmd wifi——配了产线 SSID 就推送
+    // wpa_supplicant.conf 再跑 camera-factory 5 走固件既有连接逻辑重连
+    // （原 camera-factory 20 直连指令方案已弃，固件侧不动）
     let _ = tx.send(UiEvent::Log("WiFi 吞吐：读取 wlan0 地址...".to_string()));
     // ip/ifconfig 双探测：busybox 未必编入 ip applet（真机 2026-10-28
     // 轮询 10 次全空但固件实际已拿到 DHCP 租约），ifconfig 基本必在
@@ -1114,12 +1114,21 @@ fn wifi_flow(tx: &Sender<UiEvent>, wifi: &WifiCfg) -> RunOutcome {
             .and_then(|o| protocol::parse_wlan_ip_any(&o))
     };
     let mut ip = probe_ip();
+    // 重连前的旧地址：5 撞 wpa BUSY 提前返回的窗口里 wlan0 可能还挂着
+    // 旧 AP 的地址，采信陈旧 IP 会让 iperf 打错网段（42s 超时收场）——
+    // 轮询只接受变化后的地址；固件回读 wlan0-ip 不设此限（同网重连
+    // 拿回同址是正常的），5 重跑兜底也能带回读
+    let old_ip = ip.clone();
     let mut last5 = String::new(); // 最近一次 camera-factory 5 输出（失败归因用）
-    if ip.is_none() && !wifi.ssid.is_empty() {
-        let _ = tx.send(UiEvent::Log(format!(
-            "wlan0 未入网，推送产线 SSID {} 并重连...",
-            wifi.ssid
-        )));
+                                   // V3.12.12：配了产线 SSID 就每次吞吐前强制推送重连，不再只在未入网
+                                   // 时才接管——设备可能还挂在别的 AP 上（真机 2026-10-30：HEC 同 SSID
+                                   // 三台 AP 跨信道，测试中漫游正是下行首跑卡死 42s 的来源）；留空才
+                                   // 维持"用当前网络直接测"
+    if !wifi.ssid.is_empty() {
+        let _ = tx.send(UiEvent::Log(match &old_ip {
+            Some(old) => format!("已入网({old})，按产线 SSID {} 重连...", wifi.ssid),
+            None => format!("wlan0 未入网，推送产线 SSID {} 并重连...", wifi.ssid),
+        }));
         match join_wifi(&wifi.ssid, &wifi.psk) {
             // 关联 + DHCP 成功时固件自己回读打印 wlan0-ip，直接采信
             Ok(out) => {
@@ -1144,7 +1153,10 @@ fn wifi_flow(tx: &Sender<UiEvent>, wifi: &WifiCfg) -> RunOutcome {
                     break;
                 }
                 std::thread::sleep(std::time::Duration::from_secs(2));
-                ip = probe_ip();
+                let p = probe_ip();
+                if p != old_ip {
+                    ip = p; // 与旧地址相同 = 陈旧窗口，继续等
+                }
             }
             if ip.is_some() || round == 1 {
                 break;
@@ -1756,6 +1768,74 @@ mod tests {
         assert!(pushed.contains("ssid=\"line-ap\""));
         assert!(pushed.contains("psk=\"12345678\""));
         assert!(pushed.contains("key_mgmt=WPA-PSK"));
+
+        // V3.12.12：已入网（wlan-up 在，probe 有 IP）但配了产线 SSID →
+        // 仍强制推送重连，不再是"已入网就直接测"（真机 2026-10-30：
+        // 设备挂在别的 AP 上不切走，测的还是旧网）。桩的 5 无条件回读
+        // wlan0-ip（同址重连场景，回读不设限直接采信）→ PASS +
+        // pushed.conf 换成了新 SSID 证明重连确实发生
+        std::fs::remove_file(base.join("pushed.conf")).unwrap();
+        std::env::set_var("IPERF3", &iscript);
+        std::env::set_var("E02_LOCAL_IP", "192.168.3.10");
+        let mut cfg = Config::default();
+        cfg.wifi.depth = crate::config::WifiDepth::Throughput;
+        cfg.wifi.ssid = "phone-ap".into();
+        cfg.wifi.psk = "12345678".into();
+        let (vs, n) = scenario(
+            &wscript,
+            items(TestItem::Wifi),
+            &media,
+            &reports,
+            cfg,
+            wifi_case,
+            || unreachable!(),
+        );
+        std::env::remove_var("IPERF3");
+        std::env::remove_var("E02_LOCAL_IP");
+        assert_eq!((vs[0].1, n), (Verdict::Pass, 0));
+        assert!(std::fs::read_to_string(base.join("pushed.conf"))
+            .unwrap()
+            .contains("ssid=\"phone-ap\""));
+
+        // V3.12.12 陈旧窗口：5 撞 BUSY 提前返回（无 wlan0-ip 回读），
+        // 前两轮探测仍吐旧网地址（设备还没断开），第三轮才见新网地址
+        // ——与旧地址相同的探测不得采信。probe.n 恰为 4（首查 1 + 轮询
+        // 3：陈旧×2 后新址×1）即证明等到了地址变化；若采信陈旧，第 2
+        // 次探测就停了
+        std::fs::remove_file(base.join("pushed.conf")).unwrap();
+        let stale_case = "#!/bin/sh\ncase \"$*\" in\n\
+             *\"camera-factory 5\"*) if [ -f \"$(dirname \"$0\")/pushed.conf\" ]; then printf 'FAIL-BUSY\\nwifi-rssi:-41\\n'; else printf 'ok\\n'; fi;;\n\
+             push*) cp \"$2\" \"$(dirname \"$0\")/pushed.conf\" 2>/dev/null; printf 'ok\\n';;\n\
+             *\"ip -4 addr show wlan0\"*) d=\"$(dirname \"$0\")\"; n=$(cat \"$d/probe.n\" 2>/dev/null || echo 0); n=$((n+1)); echo $n > \"$d/probe.n\"; if [ \"$n\" -ge 4 ]; then printf 'inet 192.168.43.7/24 brd 192.168.43.255 scope global wlan0\\n'; else printf 'inet 192.168.3.42/24 brd 192.168.3.255 scope global wlan0\\n'; fi;;\n\
+             *\"iperf3 -c\"*) case \"$*\" in\n\
+               *\"-R\"*) printf '%s' '{\"intervals\":[{\"sum\":{\"bits_per_second\":30e6}}],\"end\":{\"sum\":{\"bits_per_second\":29e6}}}';;\n\
+               *) printf '%s' '{\"intervals\":[{\"sum\":{\"bits_per_second\":22e6}}],\"end\":{\"sum_sent\":{\"bits_per_second\":22e6,\"retransmits\":36}}} ';;\n\
+             esac;;\n\
+             *) printf 'ok\\n';;\nesac\n";
+        std::env::set_var("IPERF3", &iscript);
+        std::env::set_var("E02_LOCAL_IP", "192.168.43.10");
+        let mut stale_cfg = Config::default();
+        stale_cfg.wifi.depth = crate::config::WifiDepth::Throughput;
+        stale_cfg.wifi.ssid = "phone-ap".into();
+        stale_cfg.wifi.psk = "12345678".into();
+        let (vs, n) = scenario(
+            &wscript,
+            items(TestItem::Wifi),
+            &media,
+            &reports,
+            stale_cfg,
+            stale_case,
+            || unreachable!(),
+        );
+        std::env::remove_var("IPERF3");
+        std::env::remove_var("E02_LOCAL_IP");
+        assert_eq!((vs[0].1, n), (Verdict::Pass, 0));
+        assert_eq!(
+            std::fs::read_to_string(base.join("probe.n"))
+                .unwrap()
+                .trim(),
+            "4"
+        );
 
         // —— V3.5 麦克风主/副两段判定 ——
         let (vs, n) = scenario(

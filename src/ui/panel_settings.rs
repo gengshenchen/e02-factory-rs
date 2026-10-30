@@ -283,7 +283,7 @@ pub fn show(ctx: &egui::Context, app: &mut E02App) {
                         ui.add_space(12.0);
 
                         // —— 产线配网：耳机 MIPS/uClibc 固件无 Android cmd
-                        // wifi，未入网时推送 wpa_supplicant.conf 重连 ——
+                        // wifi，配了 SSID 即推送 wpa_supplicant.conf 重连 ——
                         theme::card().show(ui, |ui| {
                             card_begin(ui);
                             card_head(ui, "产线配网", None);
@@ -296,7 +296,7 @@ pub fn show(ctx: &egui::Context, app: &mut E02App) {
                                     changed |= ui
                                         .add(
                                             egui::TextEdit::singleline(&mut app.config.wifi.ssid)
-                                                .hint_text("耳机已入网则留空")
+                                                .hint_text("留空 = 用耳机当前网络")
                                                 .desired_width(190.0),
                                         )
                                         .changed();
@@ -312,7 +312,7 @@ pub fn show(ctx: &egui::Context, app: &mut E02App) {
                                     ui.end_row();
                                 });
                             ui.add_space(2.0);
-                            caption(ui, "耳机未入网时推送此网络并触发重连；已入网则直接测吞吐");
+                            caption(ui, "填了即每次吞吐前推送重连，保证测的是这台 AP；留空则用耳机当前网络");
                         });
                     }
 
