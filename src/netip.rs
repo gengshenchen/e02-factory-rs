@@ -11,6 +11,28 @@ pub fn same_network(a: Ipv4Addr, b: Ipv4Addr, mask: Ipv4Addr) -> bool {
     (u32::from(a) & u32::from(mask)) == (u32::from(b) & u32::from(mask))
 }
 
+/// 本机非环回 IPv4 清单（V3.12.13 诊断用）：`(接口名, 地址, 掩码)`。
+/// 同网段匹配失败时把清单摆进日志/详情，现场一眼看出 PC 与设备各在哪。
+pub fn ipv4_list() -> Vec<(String, Ipv4Addr, Ipv4Addr)> {
+    let Ok(ifs) = if_addrs::get_if_addrs() else {
+        return Vec::new();
+    };
+    ifs.iter()
+        .filter(|i| !i.is_loopback())
+        .filter_map(|i| match i.addr {
+            if_addrs::IfAddr::V4(ref v4) => {
+                let mask = if v4.netmask.is_unspecified() {
+                    Ipv4Addr::new(255, 255, 255, 0)
+                } else {
+                    v4.netmask
+                };
+                Some((i.name.clone(), v4.ip, mask))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 /// 找本机与 `peer` 同网段的 IPv4 地址。
 ///
 /// if-addrs 在个别 Windows 版本取不到掩码时按 /24 兜底（产线局域网
@@ -19,20 +41,9 @@ pub fn local_ip_reaching(peer: Ipv4Addr) -> Option<Ipv4Addr> {
     if let Ok(forced) = std::env::var("E02_LOCAL_IP") {
         return forced.trim().parse().ok();
     }
-    let ifs = if_addrs::get_if_addrs().ok()?;
-    ifs.iter()
-        .filter(|i| !i.is_loopback())
-        .find_map(|i| match i.addr {
-            if_addrs::IfAddr::V4(ref v4) => {
-                let mask = if v4.netmask.is_unspecified() {
-                    Ipv4Addr::new(255, 255, 255, 0)
-                } else {
-                    v4.netmask
-                };
-                same_network(v4.ip, peer, mask).then_some(v4.ip)
-            }
-            _ => None,
-        })
+    ipv4_list()
+        .into_iter()
+        .find_map(|(_, ip, mask)| same_network(ip, peer, mask).then_some(ip))
 }
 
 #[cfg(test)]

@@ -286,6 +286,25 @@ pub fn parse_fw_wlan_ip(output: &str) -> Option<String> {
         .then(|| ip.to_string())
 }
 
+/// 解析关联 SSID 探测输出（V3.12.13，命令 `wpa_cli status; iwconfig`）。
+/// wpa_cli 行如 `ssid=karl11`（未关联时无此行或空值）；iwconfig 行如
+/// `ESSID:"karl11"`（off/any 视为未关联）。wpa_cli 优先。
+pub fn parse_assoc_ssid(output: &str) -> Option<String> {
+    for l in output.lines().map(str::trim) {
+        if let Some(v) = l.strip_prefix("ssid=") {
+            let v = v.trim();
+            if !v.is_empty() {
+                return Some(v.to_string());
+            }
+        }
+    }
+    let l = output.lines().find(|l| l.contains("ESSID:"))?;
+    let i = l.find('"')? + 1;
+    let j = l[i..].find('"')? + i;
+    let v = &l[i..j];
+    (!v.is_empty() && v != "off" && v != "any").then(|| v.to_string())
+}
+
 /// 解析 `cmd wifi status` 的 `(RSSI dBm, 链路速率 Mbps)`（探测链首选）。
 /// 样例：`... Supplicant state: COMPLETED, RSSI: -52, Link speed: 72Mbps, ...`
 pub fn parse_cmd_wifi_status(output: &str) -> Option<(i32, u32)> {
@@ -491,6 +510,14 @@ mod tests {
         assert_eq!(parse_fw_wifi_rssi(fw), Some(-39));
         assert_eq!(parse_fw_wifi_rssi("wifi-rssi:-30"), Some(-30));
         assert_eq!(parse_fw_wifi_rssi("no tag"), None);
+
+        let wpa = "Selected interface 'wlan0'\nbssid=aa:bb:cc:dd:ee:ff\nfreq=2412\nssid=karl11\nid=0\nmode=station\nwpa_state=COMPLETED";
+        assert_eq!(parse_assoc_ssid(wpa).as_deref(), Some("karl11"));
+        let iw = "wlan0     IEEE 802.11bgn  ESSID:\"karl11\"  Nickname:\"Wi-Fi\"\n          Mode:Managed  Frequency:2.412 GHz  Access Point: AA:BB:CC:DD:EE:FF";
+        assert_eq!(parse_assoc_ssid(iw).as_deref(), Some("karl11"));
+        assert_eq!(parse_assoc_ssid("wlan0 IEEE 802.11bgn ESSID:off/any"), None);
+        assert_eq!(parse_assoc_ssid("wpa_state=SCANNING"), None);
+        assert_eq!(parse_assoc_ssid(""), None);
     }
 
     #[test]

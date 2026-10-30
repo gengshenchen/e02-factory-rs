@@ -1086,6 +1086,15 @@ fn join_wifi(ssid: &str, psk: &str) -> Result<String, String> {
     Ok(out)
 }
 
+/// 读设备当前关联的 SSID（V3.12.13）：wpa_cli 优先、iwconfig 兜底；
+/// MIPS 固件两者都可能没有，读不到返回 None（命令缺失时尾部 `; true`
+/// 兜住退出码，adb::shell 才不会当失败丢输出）。
+fn assoc_ssid() -> Option<String> {
+    adb::shell("wpa_cli -i wlan0 status 2>/dev/null; iwconfig wlan0 2>/dev/null; true")
+        .ok()
+        .and_then(|o| protocol::parse_assoc_ssid(&o))
+}
+
 /// WiFi 流程（深度可配）：
 /// - driver：只跑 camera-factory 5 驱动检查；
 /// - throughput：驱动过后跑 iperf3 上/下行吞吐与 TCP 重传（V3.12；
@@ -1114,63 +1123,118 @@ fn wifi_flow(tx: &Sender<UiEvent>, wifi: &WifiCfg) -> RunOutcome {
             .and_then(|o| protocol::parse_wlan_ip_any(&o))
     };
     let mut ip = probe_ip();
-    // 重连前的旧地址：5 撞 wpa BUSY 提前返回的窗口里 wlan0 可能还挂着
-    // 旧 AP 的地址，采信陈旧 IP 会让 iperf 打错网段（42s 超时收场）——
-    // 轮询只接受变化后的地址；固件回读 wlan0-ip 不设此限（同网重连
-    // 拿回同址是正常的），5 重跑兜底也能带回读
+    // 重连前的旧地址：5 撞 wpa BUSY 提前返回时固件回读打印的是重连前
+    // 旧态（真机 2026-10-30 17:01：回读出 HEC 旧址 192.168.1.27 被采信，
+    // 拿去对 PC 网段误报"PC 无同网段"）——强制重连后首轮只接受**变化后**
+    // 的地址；等满一轮再重跑 5 的回读才视为新态（届时固件重连已落地）
     let old_ip = ip.clone();
     let mut last5 = String::new(); // 最近一次 camera-factory 5 输出（失败归因用）
                                    // V3.12.12：配了产线 SSID 就每次吞吐前强制推送重连，不再只在未入网
                                    // 时才接管——设备可能还挂在别的 AP 上（真机 2026-10-30：HEC 同 SSID
                                    // 三台 AP 跨信道，测试中漫游正是下行首跑卡死 42s 的来源）；留空才
-                                   // 维持"用当前网络直接测"
+                                   // 维持"用当前网络直接测"。V3.12.13：能读到关联 SSID 且已是配置的
+                                   // AP 时跳过重连（产线常态省 ~10s），重连完再验证真的换了网
+    let mut rejoined = false;
     if !wifi.ssid.is_empty() {
-        let _ = tx.send(UiEvent::Log(match &old_ip {
-            Some(old) => format!("已入网({old})，按产线 SSID {} 重连...", wifi.ssid),
-            None => format!("wlan0 未入网，推送产线 SSID {} 并重连...", wifi.ssid),
+        let assoc = assoc_ssid();
+        let _ = tx.send(UiEvent::Log(match &assoc {
+            Some(s) => format!("耳机当前关联 SSID: {s}"),
+            None => "关联 SSID 未读到（wpa_cli/iwconfig 不可用）".to_string(),
         }));
-        match join_wifi(&wifi.ssid, &wifi.psk) {
-            // 关联 + DHCP 成功时固件自己回读打印 wlan0-ip，直接采信
-            Ok(out) => {
-                last5 = out.clone();
-                ip = protocol::parse_fw_wlan_ip(&out);
-            }
-            Err(e) => {
-                r.verdict = Verdict::Fail;
-                r.detail = format!("连接 {} 失败: {e}", wifi.ssid);
-                return RunOutcome {
-                    result: r,
-                    device: base.device,
-                };
-            }
-        }
-        // 等 DHCP（固件已回读则直接跳过）；5 可能因 wpa BUSY 竞态提前
-        // 返回（输出无 wlan0-ip、连接仍在途）——轮询一轮没拿到就重跑
-        // 一次 5 再等一轮（等价产线手动重试，真机验证有效）
-        for round in 0..2 {
-            for _ in 0..10 {
-                if ip.is_some() {
-                    break;
+        if assoc.as_deref() == Some(wifi.ssid.as_str()) && ip.is_some() {
+            let _ = tx.send(UiEvent::Log(format!(
+                "已连在配置的 {} 上，跳过重连",
+                wifi.ssid
+            )));
+        } else {
+            rejoined = true;
+            let _ = tx.send(UiEvent::Log(match &old_ip {
+                Some(old) => {
+                    format!("已入网({old})，推送 {} 配置并重连...", wifi.ssid)
                 }
-                std::thread::sleep(std::time::Duration::from_secs(2));
-                let p = probe_ip();
-                if p != old_ip {
-                    ip = p; // 与旧地址相同 = 陈旧窗口，继续等
-                }
-            }
-            if ip.is_some() || round == 1 {
-                break;
-            }
-            let _ = tx.send(UiEvent::Log(
-                "仍未入网，重跑 camera-factory 5...".to_string(),
-            ));
-            match adb::shell("camera-factory 5") {
+                None => format!("wlan0 未入网，推送产线 SSID {} 并重连...", wifi.ssid),
+            }));
+            match join_wifi(&wifi.ssid, &wifi.psk) {
+                // 关联 + DHCP 成功时固件自己回读打印 wlan0-ip——但强制
+                // 重连场景首轮回读可能仍是旧态（见 old_ip 注释）：与旧
+                // 地址相同先不采信，置空交给下面的轮询/重跑 5 分辨
                 Ok(out) => {
                     last5 = out.clone();
-                    ip = protocol::parse_fw_wlan_ip(&out);
+                    let _ = tx.send(UiEvent::Log(format!(
+                        "camera-factory 5 返回: {}",
+                        clip(&runner::one_line(&out), 70)
+                    )));
+                    ip = match protocol::parse_fw_wlan_ip(&out) {
+                        Some(v) if old_ip.as_deref() == Some(v.as_str()) => {
+                            let _ = tx.send(UiEvent::Log(format!(
+                                "回读 {v} 与重连前相同，先不采信（等地址变化或重跑 5）"
+                            )));
+                            None
+                        }
+                        rb => rb,
+                    };
                 }
                 Err(e) => {
-                    last5 = format!("执行失败: {e:#}");
+                    r.verdict = Verdict::Fail;
+                    r.detail = format!("连接 {} 失败: {e}", wifi.ssid);
+                    return RunOutcome {
+                        result: r,
+                        device: base.device,
+                    };
+                }
+            }
+            // 等 DHCP；一轮没拿到就重跑一次 5 再等一轮（等价产线手动
+            // 重试，真机验证有效）。重跑后的回读视为新态：等满 20s 固件
+            // 重连已实际完成，此时同址 = 同网重连同址，正常
+            for round in 0..2 {
+                for i in 0..10 {
+                    if ip.is_some() {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    let p = probe_ip();
+                    let _ = tx.send(UiEvent::Log(match (&p, &old_ip) {
+                        (Some(p), Some(old)) if p == old => {
+                            format!("等地址({}/10): {p}（未变化，继续等）", i + 1)
+                        }
+                        (Some(p), _) => format!("等地址({}/10): {p}", i + 1),
+                        (None, _) => format!("等地址({}/10): 无", i + 1),
+                    }));
+                    if p != old_ip {
+                        ip = p; // 与旧地址相同 = 陈旧窗口，继续等
+                    }
+                }
+                if ip.is_some() || round == 1 {
+                    break;
+                }
+                let _ = tx.send(UiEvent::Log(
+                    "仍未入网，重跑 camera-factory 5...".to_string(),
+                ));
+                match adb::shell("camera-factory 5") {
+                    Ok(out) => {
+                        last5 = out.clone();
+                        ip = protocol::parse_fw_wlan_ip(&out);
+                    }
+                    Err(e) => {
+                        last5 = format!("执行失败: {e:#}");
+                    }
+                }
+            }
+            // 能读到关联 SSID 就验证换网结果（读不到只能靠地址变化侧面判）
+            if ip.is_some() {
+                if let Some(s) = assoc_ssid() {
+                    let _ = tx.send(UiEvent::Log(format!("重连后关联 SSID: {s}")));
+                    if s != wifi.ssid {
+                        r.verdict = Verdict::Fail;
+                        r.detail = format!(
+                            "重连后仍关联在 {s}，未连上配置的 {}（检查该热点是否 2.4G、密码是否正确）",
+                            wifi.ssid
+                        );
+                        return RunOutcome {
+                            result: r,
+                            device: base.device,
+                        };
+                    }
                 }
             }
         }
@@ -1179,11 +1243,16 @@ fn wifi_flow(tx: &Sender<UiEvent>, wifi: &WifiCfg) -> RunOutcome {
         r.verdict = Verdict::Fail;
         r.detail = if wifi.ssid.is_empty() {
             "驱动通过，但 wlan0 无 IPv4（未入网/未拿到 DHCP？设置页配产线 SSID 可自动连接）".into()
-        } else {
+        } else if rejoined {
             format!(
                 "驱动通过，已推送 {} 配置重连，wlan0 仍未拿到 IPv4（5 输出: {}）",
                 wifi.ssid,
                 clip(&runner::one_line(&last5), 60)
+            )
+        } else {
+            format!(
+                "驱动通过，已关联 {} 但 wlan0 无 IPv4（DHCP 未完成？）",
+                wifi.ssid
             )
         };
         return RunOutcome {
@@ -1191,6 +1260,13 @@ fn wifi_flow(tx: &Sender<UiEvent>, wifi: &WifiCfg) -> RunOutcome {
             device: base.device,
         };
     };
+    // 强制重连后地址没变：目标网与旧网同网段（正常）或压根没换网（异常）
+    // ——留痕日志，配合下面 PC 网段核对一起定位
+    if rejoined && old_ip.as_deref() == Some(ip.as_str()) {
+        let _ = tx.send(UiEvent::Log(format!(
+            "注意：地址仍为 {ip}（新旧网段相同属正常，否则疑未换网成功）"
+        )));
+    }
 
     // RSSI/链路速率：只记录不设门（环境不控），极宽松兜底抓天线级故障
     let rssi = wifi_rssi().or_else(|| {
@@ -1209,13 +1285,37 @@ fn wifi_flow(tx: &Sender<UiEvent>, wifi: &WifiCfg) -> RunOutcome {
         };
     };
     let Some(local) = netip::local_ip_reaching(peer) else {
+        // 诊断：把 PC 各网卡网段摆出来（真机 17:01 案例：耳机其实还挂
+        // 在 HEC(192.168.1.27)、PC 已切到手机热点网段，两边对不上才报
+        // "PC 无同网段"——清单让人一眼看出各在哪边）
+        let ifs: Vec<String> = netip::ipv4_list()
+            .into_iter()
+            .map(|(n, a, m)| format!("{n}={a}/{m}"))
+            .collect();
+        let listed = if ifs.is_empty() {
+            "无 IPv4 网卡".to_string()
+        } else {
+            ifs.join(", ")
+        };
+        let _ = tx.send(UiEvent::Log(format!("PC 网卡: {listed}")));
+        let stale = if rejoined && old_ip.as_deref() == Some(ip.as_str()) {
+            format!(
+                "；地址与重连前相同，疑耳机未连上 {}（热点是否 2.4G？密码对吗？）",
+                wifi.ssid
+            )
+        } else {
+            String::new()
+        };
         r.verdict = Verdict::Fail;
-        r.detail = format!("驱动 ok，IP {ip}；PC 无同网段地址（检查 PC 是否接入设备所在网段）");
+        r.detail = format!("驱动 ok，IP {ip}；PC 无同网段地址（PC 网卡: {listed}）{stale}");
         return RunOutcome {
             result: r,
             device: base.device,
         };
     };
+    let _ = tx.send(UiEvent::Log(format!(
+        "PC 本地地址 {local}（与设备 {ip} 同网段）"
+    )));
     // PC 侧 iperf3 预检：随包分发缺失时明确报错，别让客户端玄学解析失败
     let host = player::resolve_tool(player::exe_dir().as_deref(), "IPERF3", "iperf3");
     match std::process::Command::new(&host).arg("--version").output() {
@@ -1769,14 +1869,23 @@ mod tests {
         assert!(pushed.contains("psk=\"12345678\""));
         assert!(pushed.contains("key_mgmt=WPA-PSK"));
 
-        // V3.12.12：已入网（wlan-up 在，probe 有 IP）但配了产线 SSID →
-        // 仍强制推送重连，不再是"已入网就直接测"（真机 2026-10-30：
-        // 设备挂在别的 AP 上不切走，测的还是旧网）。桩的 5 无条件回读
-        // wlan0-ip（同址重连场景，回读不设限直接采信）→ PASS +
-        // pushed.conf 换成了新 SSID 证明重连确实发生
+        // V3.12.12：已入网（probe 有旧网 IP）但配了产线 SSID → 仍强制
+        // 推送重连，不再是"已入网就直接测"（真机 2026-10-30：设备挂在
+        // 别的 AP 上不切走，测的还是旧网）。swap 桩：重连（push）后 5
+        // 回读新网地址 192.168.43.9（≠ 旧 192.168.3.42，直接采信）→
+        // PASS + pushed.conf 换成了新 SSID 证明重连确实发生
         std::fs::remove_file(base.join("pushed.conf")).unwrap();
+        let swap_case = "#!/bin/sh\nd=\"$(dirname \"$0\")\"\ncase \"$*\" in\n\
+             *\"camera-factory 5\"*) if [ -f \"$d/phone\" ]; then printf 'Successfully initialized wpa_supplicant\\nwlan0-ip: 192.168.43.9\\nwifi-rssi:-45\\n'; else printf 'ok\\n'; fi;;\n\
+             push*) cp \"$2\" \"$d/pushed.conf\" 2>/dev/null; : > \"$d/phone\"; : > \"$d/wlan-up\"; printf 'ok\\n';;\n\
+             *\"ip -4 addr show wlan0\"*) if [ -f \"$d/phone\" ]; then printf 'inet 192.168.43.9/24 brd 192.168.43.255 scope global wlan0\\n'; elif [ -f \"$d/wlan-up\" ]; then printf 'inet 192.168.3.42/24 brd 192.168.3.255 scope global wlan0\\n'; fi;;\n\
+             *\"iperf3 -c\"*) case \"$*\" in\n\
+               *\"-R\"*) printf '%s' '{\"intervals\":[{\"sum\":{\"bits_per_second\":30e6}}],\"end\":{\"sum\":{\"bits_per_second\":29e6}}}';;\n\
+               *) printf '%s' '{\"intervals\":[{\"sum\":{\"bits_per_second\":22e6}}],\"end\":{\"sum_sent\":{\"bits_per_second\":22e6,\"retransmits\":36}}} ';;\n\
+             esac;;\n\
+             *) printf 'ok\\n';;\nesac\n";
         std::env::set_var("IPERF3", &iscript);
-        std::env::set_var("E02_LOCAL_IP", "192.168.3.10");
+        std::env::set_var("E02_LOCAL_IP", "192.168.43.10");
         let mut cfg = Config::default();
         cfg.wifi.depth = crate::config::WifiDepth::Throughput;
         cfg.wifi.ssid = "phone-ap".into();
@@ -1787,7 +1896,7 @@ mod tests {
             &media,
             &reports,
             cfg,
-            wifi_case,
+            swap_case,
             || unreachable!(),
         );
         std::env::remove_var("IPERF3");
@@ -1836,6 +1945,52 @@ mod tests {
                 .trim(),
             "4"
         );
+
+        // V3.12.13 关联 SSID 验证：assoc.ssid 文件控制 wpa_cli 回什么。
+        // ① 设备 stuck 在 HEC（重连后仍 ssid=HEC ≠ 配置 phone-ap）→
+        //    明确 FAIL"未连上配置的 AP"，而不是拿旧网地址误报 PC 网段错
+        // ② 已关联配置的 AP（ssid=phone-ap 且有 IP）→ 跳过重连（无 push）
+        let assoc_case = "#!/bin/sh\nd=\"$(dirname \"$0\")\"\ncase \"$*\" in\n\
+             *wpa_cli*) s=$(cat \"$d/assoc.ssid\" 2>/dev/null || echo none); if [ \"$s\" = \"none\" ]; then printf 'wpa_state=SCANNING\\n'; else printf \"ssid=$s\\nwpa_state=COMPLETED\\n\"; fi;;\n\
+             *\"camera-factory 5\"*) if [ -f \"$d/pushed.conf\" ]; then printf 'Successfully initialized wpa_supplicant\\nwlan0-ip: 192.168.43.9\\nwifi-rssi:-45\\n'; else printf 'ok\\n'; fi;;\n\
+             push*) cp \"$2\" \"$d/pushed.conf\" 2>/dev/null; : > \"$d/wlan-up\"; printf 'ok\\n';;\n\
+             *\"ip -4 addr show wlan0\"*) if [ -f \"$d/pushed.conf\" ]; then printf 'inet 192.168.43.9/24 brd 192.168.43.255 scope global wlan0\\n'; elif [ -f \"$d/wlan-up\" ]; then printf 'inet 192.168.3.42/24 brd 192.168.3.255 scope global wlan0\\n'; fi;;\n\
+             *\"iperf3 -c\"*) printf '%s' '{\"intervals\":[{\"sum\":{\"bits_per_second\":22e6}}],\"end\":{\"sum_sent\":{\"bits_per_second\":22e6,\"retransmits\":36}}} ';;\n\
+             *) printf 'ok\\n';;\nesac\n";
+        std::fs::remove_file(base.join("pushed.conf")).unwrap();
+        std::fs::write(base.join("assoc.ssid"), "HEC").unwrap();
+        std::env::set_var("IPERF3", &iscript);
+        std::env::set_var("E02_LOCAL_IP", "192.168.43.10");
+        let mut assoc_cfg = Config::default();
+        assoc_cfg.wifi.depth = crate::config::WifiDepth::Throughput;
+        assoc_cfg.wifi.ssid = "phone-ap".into();
+        assoc_cfg.wifi.psk = "12345678".into();
+        let (vs, n) = scenario(
+            &wscript,
+            items(TestItem::Wifi),
+            &media,
+            &reports,
+            assoc_cfg.clone(),
+            assoc_case,
+            || unreachable!(),
+        );
+        assert_eq!((vs[0].1, n), (Verdict::Fail, 0)); // 未换网成功要 FAIL
+
+        std::fs::remove_file(base.join("pushed.conf")).unwrap();
+        std::fs::write(base.join("assoc.ssid"), "phone-ap").unwrap();
+        let (vs, n) = scenario(
+            &wscript,
+            items(TestItem::Wifi),
+            &media,
+            &reports,
+            assoc_cfg,
+            assoc_case,
+            || unreachable!(),
+        );
+        std::env::remove_var("IPERF3");
+        std::env::remove_var("E02_LOCAL_IP");
+        assert_eq!((vs[0].1, n), (Verdict::Pass, 0)); // 已在配置 AP 上
+        assert!(!base.join("pushed.conf").exists()); // 跳过重连 = 没 push
 
         // —— V3.5 麦克风主/副两段判定 ——
         let (vs, n) = scenario(
