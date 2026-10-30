@@ -948,15 +948,24 @@ impl DirOutcome {
         thr_ok && retr_ok
     }
     fn detail(&self) -> String {
+        // 文案自解释（真机反馈"上限500什么意思/是不是每秒"）：
+        // Mbps 本就是每秒兆比特，仍显式标注"每秒速率中位数"；
+        // 重传计"次"、上限标"不超过"。（内嵌 CJK 字体无 ≥≤ 字形，
+        // 只能用 ASCII+CJK+全角标点）
         let mut s = format!("{}{:.1}Mbps", self.label, self.mbps);
         if self.need > 0.0 {
-            s.push_str(&format!("(阈值{:.0})", self.need));
+            s.push_str(&format!(
+                "(每秒速率中位数，阈值{:.0}，低于判不合格)",
+                self.need
+            ));
+        } else if self.retr.is_some() {
+            s.push_str("(每秒速率中位数)");
         }
         if let Some(v) = self.retr {
             if self.retr_max > 0 {
-                s.push_str(&format!(" 重传{v}(上限{})", self.retr_max));
+                s.push_str(&format!(" 重传{v}次(不超过{}合格)", self.retr_max));
             } else {
-                s.push_str(&format!(" 重传{v}"));
+                s.push_str(&format!(" 重传{v}次"));
             }
         }
         if self.retested {
@@ -1135,13 +1144,15 @@ fn wifi_flow(tx: &Sender<UiEvent>, wifi: &WifiCfg) -> RunOutcome {
                                    // 维持"用当前网络直接测"。V3.12.13：能读到关联 SSID 且已是配置的
                                    // AP 时跳过重连（产线常态省 ~10s），重连完再验证真的换了网
     let mut rejoined = false;
+    // 关联 SSID 恒探测（不只配了 SSID 才探）：换网判定要用，结果行
+    // 也要带"连的哪台 AP"（真机反馈报告看不出连的哪个 AP）
+    let mut assoc_seen = assoc_ssid();
+    let _ = tx.send(UiEvent::Log(match &assoc_seen {
+        Some(s) => format!("耳机当前关联 SSID: {s}"),
+        None => "关联 SSID 未读到（wpa_cli/iwconfig 不可用）".to_string(),
+    }));
     if !wifi.ssid.is_empty() {
-        let assoc = assoc_ssid();
-        let _ = tx.send(UiEvent::Log(match &assoc {
-            Some(s) => format!("耳机当前关联 SSID: {s}"),
-            None => "关联 SSID 未读到（wpa_cli/iwconfig 不可用）".to_string(),
-        }));
-        if assoc.as_deref() == Some(wifi.ssid.as_str()) && ip.is_some() {
+        if assoc_seen.as_deref() == Some(wifi.ssid.as_str()) && ip.is_some() {
             let _ = tx.send(UiEvent::Log(format!(
                 "已连在配置的 {} 上，跳过重连",
                 wifi.ssid
@@ -1223,6 +1234,7 @@ fn wifi_flow(tx: &Sender<UiEvent>, wifi: &WifiCfg) -> RunOutcome {
             // 能读到关联 SSID 就验证换网结果（读不到只能靠地址变化侧面判）
             if ip.is_some() {
                 if let Some(s) = assoc_ssid() {
+                    assoc_seen = Some(s.clone());
                     let _ = tx.send(UiEvent::Log(format!("重连后关联 SSID: {s}")));
                     if s != wifi.ssid {
                         r.verdict = Verdict::Fail;
@@ -1341,7 +1353,10 @@ fn wifi_flow(tx: &Sender<UiEvent>, wifi: &WifiCfg) -> RunOutcome {
         ],
     };
 
-    let mut parts = vec![format!("IP {ip}")];
+    let mut parts = vec![match &assoc_seen {
+        Some(ap) => format!("IP {ip}（AP {ap}）"),
+        None => format!("IP {ip}（AP 未读到）"),
+    }];
     let mut all_ok = true;
     for &(rev, label, need) in dirs {
         let run = || iperf_once(tx, &host, t, local, rev);
