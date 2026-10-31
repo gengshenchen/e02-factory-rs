@@ -1,6 +1,6 @@
 [package]
 name = "e02-factory-rs"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 description = "E02 工厂测试上位机（跨平台，Rust 重写）"
 authors = ["gengshenchen <karlchen.me@outlook.com>"]
