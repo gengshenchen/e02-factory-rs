@@ -169,9 +169,15 @@ pub fn show(ctx: &egui::Context, app: &mut E02App) {
 
                     if app.config.wifi.depth == WifiDepth::Throughput {
                         // —— 吞吐测试参数（V3.12.10 三列网格：标签 | 控件 | 说明）：
-                        // 控件左缘与灰字起点跨行对齐（真机反馈行内灰字参差）；
-                        // 方向选项卡较宽，独立成行免得把说明列推出卡外；
-                        // 卡首提醒同 AP 前提（跨 AP 空口两跳，速率虚低）——
+                        // 控件左缘与灰字起点跨行对齐（真机反馈行内灰字参差）。
+                        // V3.12.15 方向行并回同一网格（此前独立小网格导致行距
+                        // 与标签间距和参数行不一致，真机截图实测标签到选项卡
+                        // 空 61px vs 参数行 16px），说明列不被挤出；选项卡串
+                        // 不能包在 ui.horizontal 里——其期望高固定取
+                        // interact_size.y(18px)，比选项卡矮 12px，子区居中后
+                        // 向下生长会把整串按钮压低 6px（标签则精确居中），
+                        // 故用 allocate_ui 指定与选项卡同高的单元格。
+                        // 卡首提醒同 AP 前提——
                         theme::card().show(ui, |ui| {
                             card_begin(ui);
                             card_head(ui, "吞吐测试参数", None);
@@ -182,15 +188,13 @@ pub fn show(ctx: &egui::Context, app: &mut E02App) {
                             );
                             ui.add_space(6.0);
                             let t = &mut app.config.wifi.throughput;
-                            // 方向行独立网格但钉住标签列宽（58 = 4 字标签宽，
-                            // 与下方参数网格一致），选项卡起点对齐控件列
-                            egui::Grid::new("wifi_dir")
-                                .num_columns(2)
+                            egui::Grid::new("wifi_thr")
+                                .num_columns(3)
                                 .spacing([16.0, 8.0])
                                 .min_col_width(58.0)
                                 .show(ui, |ui| {
-                                    ui.label("方向");
-                                    ui.horizontal(|ui| {
+                                    ui.label("测试方向");
+                                    ui.allocate_ui([56.0, 30.0].into(), |ui| {
                                         if tab(ui, t.direction == IperfDir::Up, "只测上行") {
                                             t.direction = IperfDir::Up;
                                             changed = true;
@@ -204,14 +208,9 @@ pub fn show(ctx: &egui::Context, app: &mut E02App) {
                                             changed = true;
                                         }
                                     });
+                                    caption(ui, "双向=上、下行各测一次");
                                     ui.end_row();
-                                });
-                            ui.add_space(4.0);
-                            egui::Grid::new("wifi_thr")
-                                .num_columns(3)
-                                .spacing([16.0, 8.0])
-                                .min_col_width(58.0)
-                                .show(ui, |ui| {
+
                                     ui.label("每次时长");
                                     changed |= ui
                                         .add(
@@ -257,9 +256,9 @@ pub fn show(ctx: &egui::Context, app: &mut E02App) {
 
                                     ui.label("复测");
                                     changed |= ui
-                                        .checkbox(&mut t.retest, "边缘失败自动复测一次")
+                                        .checkbox(&mut t.retest, "自动复测一次")
                                         .changed();
-                                    caption(ui, "边缘=未达阈值但其一半以上；连接失败同复测");
+                                    caption(ui, "差一点或测试没跑成时触发，以复测结果为准");
                                     ui.end_row();
 
                                     ui.label("端口");
@@ -276,6 +275,11 @@ pub fn show(ctx: &egui::Context, app: &mut E02App) {
                             caption(
                                 ui,
                                 "上行=耳机发往电脑，下行=电脑发往耳机；吞吐取每秒速率的中位数",
+                            );
+                            caption(
+                                ui,
+                                "复测：速率差一点（未达标但超过阈值的一半，或重传超上限但未超一倍）\
+                                 或测试没跑成时，自动重测一次，结果以复测为准",
                             );
                             caption(ui, "2.4G 单天线理论 72Mbps；阈值以产线 AP 与金机实测校准");
                         });
