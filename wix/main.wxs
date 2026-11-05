@@ -10,7 +10,9 @@
   放不下中文。源文件本身须声明 UTF-8：注释里的中文按 UTF-8 存盘，若声明
   windows-1252，0x8D/0x8F 等字节在 1252 无定义，candle 解析 XML 直接失败
   （v0.3.0 首发两连挂的真凶之一）。
+  - 标准安装向导 UI（V3.12.16）：WixUI_InstallDir 对话框组，装完有完成页
 -->
+
 <Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
   <Product Id="*" Name="E02 Factory Test" Language="1033"
            Version="$(var.Version)"
@@ -26,6 +28,21 @@
 
     <Icon Id="AppIcon" SourceFile="assets\icon.ico" />
     <Property Id="ARPPRODUCTICON" Value="AppIcon" />
+
+    <!-- 安装向导（V3.12.16 真机反馈：双击 MSI 后 UAC → 静默进度条 → 直接
+         退出，"没有提示安装成功"）。此前 wxs 无 <UI> 段，MSI 走基本 UI 才
+         静默。引用 WixUI_InstallDir 标准对话框组：欢迎 → 选目录 → 确认
+         安装 → 完成页（ExitDlg 有明确 "Installation Wizard Completed"）。
+         WIXUI_INSTALLDIR 属性把目录页接回本包的 INSTALLDIR 属性。
+         选 InstallDir 组还因为天然不含 License 页（许可文案未定稿）。
+         对话框文案取 WixUIExtension 内置 en-us（cargo-wix 调 light 默认
+         -ext WixUIExtension -ext WixUtilExtension，链接期可解析；
+         本地化 zh-CN 需 -cultures:zh-cn 且 Product Language 改 2052，
+         后续产线有需要再做）。 -->
+    <Property Id="WIXUI_INSTALLDIR" Value="INSTALLDIR" />
+    <UI>
+      <UIRef Id="WixUI_InstallDir" />
+    </UI>
 
     <Directory Id="TARGETDIR" Name="SourceDir">
       <Directory Id="ProgramFiles64Folder">
