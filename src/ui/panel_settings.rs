@@ -54,6 +54,36 @@ fn tab(ui: &mut egui::Ui, active: bool, text: &str) -> bool {
     .clicked()
 }
 
+/// 台账落盘 + 结果日志（V3.13 台账卡）。
+fn save_ledger(app: &mut E02App, ok_msg: String) {
+    let path = crate::ledger::path_of(&app.config);
+    match app.ledger_view.save(&path) {
+        Ok(()) => app.push_log(format!("{ok_msg}（{}）", path.display())),
+        Err(e) => app.push_log(format!("台账保存失败: {e}")),
+    }
+}
+
+/// 台账导出 CSV（V3.13）：落到台账同目录，UTF-8 BOM，Excel 直开。
+fn export_csv(app: &mut E02App) {
+    let path = crate::ledger::path_of(&app.config)
+        .parent()
+        .map(|d| {
+            d.join(format!(
+                "台账-{}.csv",
+                chrono::Local::now().format("%Y%m%d-%H%M%S")
+            ))
+        })
+        .unwrap_or_else(|| "台账.csv".into());
+    match std::fs::write(&path, app.ledger_view.to_csv()) {
+        Ok(()) => app.push_log(format!(
+            "台账已导出 {} 台: {}",
+            app.ledger_view.len(),
+            path.display()
+        )),
+        Err(e) => app.push_log(format!("台账导出失败: {e}")),
+    }
+}
+
 pub fn show(ctx: &egui::Context, app: &mut E02App) {
     if !app.settings_open {
         return;
@@ -388,6 +418,66 @@ pub fn show(ctx: &egui::Context, app: &mut E02App) {
                             .changed();
                         ui.add_space(2.0);
                         caption(ui, "检测到 USB 设备上线即开始；测试中拔出立即中止");
+                    });
+
+                    ui.add_space(12.0);
+
+                    // —— 设备绑定台账（V3.13）：SN 未烧写不可作键，报告键=
+                    // 蓝牙 MAC；台账记"蓝牙↔WiFi"绑定，防工厂烧错地址 ——
+                    theme::card().show(ui, |ui| {
+                        card_begin(ui);
+                        card_head(
+                            ui,
+                            "设备绑定台账",
+                            Some(format!("{} 台", app.ledger_view.len())),
+                        );
+                        ui.add_space(4.0);
+                        caption(ui, "同机复测放行；不同设备同蓝牙或同 WiFi 地址判 FAIL");
+                        if !app.config.binding.enable {
+                            caption(ui, "校验当前已关闭（config: binding.enable = false）");
+                        }
+                        ui.add_space(6.0);
+                        if app.ledger_view.is_empty() {
+                            caption(ui, "尚无记录；测过一台且蓝牙/WiFi 地址都读到后入账");
+                        } else {
+                            egui::Grid::new("ledger_grid")
+                                .num_columns(5)
+                                .spacing([16.0, 6.0])
+                                .show(ui, |ui| {
+                                    // recent 返回克隆，行内"删"可安全改台账
+                                    for rec in app.ledger_view.recent(5) {
+                                        ui.label(&rec.bt_mac);
+                                        ui.label(&rec.wifi_mac);
+                                        ui.label(format!("{} 次", rec.tests));
+                                        let verdict =
+                                            if rec.last_verdict.is_empty() { "—" } else { &rec.last_verdict };
+                                        ui.label(verdict);
+                                        if ui.button("删").clicked() {
+                                            app.ledger_view.remove(&rec.bt_mac);
+                                            save_ledger(app, format!("已删台账记录 {}", rec.bt_mac));
+                                        }
+                                        ui.end_row();
+                                    }
+                                });
+                            ui.add_space(2.0);
+                            caption(ui, "最近 5 台（按最近测试倒序）；全量看导出的 CSV");
+                        }
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("导出 CSV").clicked() && !app.ledger_view.is_empty() {
+                                export_csv(app);
+                            }
+                            // 两步确认（V3.13）：清空是破坏性操作
+                            if app.ledger_clear_armed {
+                                if ui.add(theme::danger("确认清空？")).clicked() {
+                                    app.ledger_view.clear();
+                                    app.ledger_clear_armed = false;
+                                    save_ledger(app, "台账已清空".into());
+                                }
+                            } else if ui.button("清空台账").clicked() {
+                                app.ledger_clear_armed = true;
+                            }
+                        });
                     });
                     ui.add_space(4.0);
                 });

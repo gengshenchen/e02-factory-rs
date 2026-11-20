@@ -49,6 +49,8 @@ impl Verdict {
 }
 
 /// 测试项：与 camera-factory 子命令对应（V3.5：充电并入电池、陀螺仪走 17）。
+/// Binding（V3.13）为虚拟项——不发设备命令，蓝牙与 WiFi 地址齐备后由
+/// worker 查绑定台账产生结果行，故不进 ALL（设置/CLI 不可勾选）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
 pub enum TestItem {
     Video,
@@ -62,6 +64,8 @@ pub enum TestItem {
     MicSpeaker,
     Keys,
     Gyro,
+    /// MAC 绑定台账校验（虚拟项，worker 内联执行）
+    Binding,
 }
 
 impl TestItem {
@@ -93,6 +97,7 @@ impl TestItem {
             TestItem::MicSpeaker => "麦克风测试",
             TestItem::Keys => "按键测试",
             TestItem::Gyro => "陀螺仪测试",
+            TestItem::Binding => "MAC 绑定",
         }
     }
 
@@ -110,6 +115,7 @@ impl TestItem {
             TestItem::MicSpeaker => "mic",
             TestItem::Keys => "keys",
             TestItem::Gyro => "gyro",
+            TestItem::Binding => "binding",
         }
     }
 

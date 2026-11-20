@@ -23,6 +23,8 @@ pub struct BatchOutcome {
 pub fn run_auto(item: TestItem) -> RunOutcome {
     let mut r = TestResult::new(item);
     let device = match item {
+        // 虚拟项：由 worker 查台账内联产生结果，不经此执行设备命令
+        TestItem::Binding => unreachable!("虚拟项不发设备命令"),
         TestItem::DeviceInfo => {
             match exec(&CameraFactory::DeviceInfo.device_cmd()).and_then(|out| {
                 protocol::parse_device_info(&out)

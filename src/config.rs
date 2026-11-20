@@ -175,6 +175,33 @@ pub struct ConnCfg {
     pub auto_start: bool,
 }
 
+/// 设备绑定台账（V3.13）：SN 未烧写（全厂默认 00001）不可作报告键/设备
+/// 标识，报告文件名改用蓝牙 MAC；台账记录"蓝牙 MAC ↔ WiFi MAC"绑定，
+/// 防工厂烧错地址（多台机器同蓝牙 MAC）。同对复测放行，同址不同对告警。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BindingCfg {
+    /// 启用绑定校验（关闭后不产生"MAC 绑定"结果行，报告键仍为蓝牙 MAC）
+    #[serde(default = "d_binding_enable")]
+    pub enable: bool,
+    /// 台账文件路径；缺省 = 数据目录 ledger.json（config.toml 同目录）。
+    /// 多台测试 PC 共账时指到共享盘。
+    #[serde(default)]
+    pub ledger_path: Option<String>,
+}
+
+fn d_binding_enable() -> bool {
+    true
+}
+
+impl Default for BindingCfg {
+    fn default() -> Self {
+        Self {
+            enable: d_binding_enable(),
+            ledger_path: None,
+        }
+    }
+}
+
 /// 工位档案：启用的测试项（slug 列表，顺序即执行顺序参考）。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Profile {
@@ -198,6 +225,9 @@ pub struct Config {
     /// 连接/在位监测（V3.8）
     #[serde(default)]
     pub conn: ConnCfg,
+    /// 设备绑定台账（V3.13）
+    #[serde(default)]
+    pub binding: BindingCfg,
 }
 
 fn d_station() -> String {
@@ -233,6 +263,7 @@ impl Default for Config {
             keys: KeysCfg::default(),
             timeouts: TimeoutsCfg::default(),
             conn: ConnCfg::default(),
+            binding: BindingCfg::default(),
         }
     }
 }

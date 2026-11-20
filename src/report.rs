@@ -5,7 +5,7 @@
 //! 每项耗时。报告中心（今日统计 + 历史浏览）解析同格式——格式由本
 //! 模块单向生成，自产自销，不再附带 JSON（V2 预留的 MES 对接暂无需求）。
 
-use crate::engine::{TestResult, Verdict};
+use crate::engine::{TestItem, TestResult, Verdict};
 use crate::protocol::DeviceInfo;
 use chrono::{DateTime, Local, Utc};
 use std::path::{Path, PathBuf};
@@ -103,11 +103,15 @@ pub fn sanitize(text: &str) -> String {
         .collect()
 }
 
-/// 写入报告，返回路径。文件名规则（V3.2 产线反馈：同机重测要更新同一份报告）：
-/// - SN 已知：`e02-<日期>-<SN>.txt` —— 同机同日一份，重测/单项补测覆盖更新；
-/// - SN 未知：`e02-<日期>-<时分秒>-unknown.txt` —— 带时间戳，多台未知机不互踩。
+/// 写入报告，返回路径。文件名规则（V3.13 设备身份改蓝牙 MAC；V3.2 同机
+/// 重测更新同一份的语义保留）：
+/// - 蓝牙 MAC 已知：`e02-<日期>-<蓝牙MAC>.txt` —— 同机同日一份，重测/单项
+///   补测覆盖更新（SN 未烧写全厂默认 00001，不能再作键，多台会互踩）；
+/// - 蓝牙 MAC 未知：`e02-<日期>-<时分秒>-unknown.txt` —— 带时间戳不互踩；
+/// - 绑定冲突（MAC 绑定判 FAIL）：追加 `-冲突<时分秒>`，冲突机不覆盖
+///   台账原机的报告。
 ///
-/// SN 中途解析到后文件名变化，旧文件由调用方（worker）删除。
+/// 蓝牙 MAC 中途解析到后文件名变化，旧文件由调用方（worker）删除。
 pub fn write_report(
     dir: &Path,
     meta: &ReportMeta,
@@ -116,30 +120,43 @@ pub fn write_report(
     finished: bool,
 ) -> Option<PathBuf> {
     std::fs::create_dir_all(dir).ok()?;
-    let path = dir.join(file_name(meta, device));
+    let path = dir.join(file_name(meta, device, results));
     std::fs::write(&path, render_text(meta, device, results, finished)).ok()?;
     Some(path)
 }
 
 /// 报告文件名（meta.started 为 `yyyymmdd-hhmmss`，长度不足时整体兜底）。
-fn file_name(meta: &ReportMeta, device: &DeviceInfo) -> String {
+fn file_name(meta: &ReportMeta, device: &DeviceInfo, results: &[TestResult]) -> String {
     let ts = &meta.started;
     let (day, hms) = if ts.len() == 15 {
         (&ts[..8], &ts[9..])
     } else {
         (ts.as_str(), "unknown")
     };
-    let tail = if device.sn.is_empty() {
+    let tail = if device.bt_mac.is_empty() {
         format!("{hms}-unknown")
     } else {
-        sanitize_sn(&device.sn)
+        let mac = sanitize_token(&device.bt_mac);
+        if binding_conflict(results) {
+            format!("{mac}-冲突{hms}")
+        } else {
+            mac
+        }
     };
     format!("e02-{day}-{tail}.txt")
 }
 
-/// SN 作文件名成分：非 `[A-Za-z0-9._-]` 字符替换为 `_`（防路径穿越/非法文件名字符）。
-fn sanitize_sn(sn: &str) -> String {
-    let s: String = sn
+/// 绑定冲突（V3.13）：MAC 绑定行判 FAIL（同址不同对），报告文件名加后缀。
+fn binding_conflict(results: &[TestResult]) -> bool {
+    results
+        .iter()
+        .any(|r| r.item == TestItem::Binding && r.verdict == Verdict::Fail)
+}
+
+/// 文件名成分清洗：非 `[A-Za-z0-9._-]` 字符替换为 `_`
+/// （防路径穿越/非法文件名字符；MAC 冒号也在替换之列）。
+fn sanitize_token(s: &str) -> String {
+    let s: String = s
         .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
@@ -294,10 +311,10 @@ mod tests {
     }
 
     #[test]
-    fn filename_is_per_unit_per_day() {
+    fn filename_keys_on_bt_mac() {
         let dir = std::env::temp_dir().join(format!("e02-report-{}", std::process::id()));
         let r = result(TestItem::Wifi, Verdict::Pass);
-        // SN 未解析到 → 日期+时分秒+unknown
+        // 蓝牙 MAC 未解析到 → 日期+时分秒+unknown（多台未知机不互踩）
         let p1 = write_report(
             &dir,
             &meta(),
@@ -307,43 +324,49 @@ mod tests {
         )
         .unwrap();
         assert!(p1.ends_with("e02-20261022-103012-unknown.txt"));
-        // SN 解析到 → 同机同日一份
+        // 蓝牙 MAC 已知 → 同机同日一份（V3.13 键改蓝牙 MAC；SN 仅留证不作键）
         let dev = DeviceInfo {
+            bt_mac: "0012A3B4C5D6".into(),
             sn: "SN 123".into(),
             ..Default::default()
         };
-        let p2 = write_report(&dir, &meta(), &dev, &[r], true).unwrap();
-        assert!(p2.ends_with("e02-20261022-SN_123.txt"));
+        let p2 = write_report(&dir, &meta(), &dev, std::slice::from_ref(&r), true).unwrap();
+        assert!(p2.ends_with("e02-20261022-0012A3B4C5D6.txt"));
         // 同机同日再写 → 同一路径（重测覆盖更新）
         let p3 = write_report(&dir, &meta(), &dev, &[], true).unwrap();
         assert_eq!(p2, p3);
-        // SN 含路径字符 → 替换为 _（防目录穿越）
-        let p4 = write_report(
+        // 绑定冲突 → 追加 -冲突+时分秒，冲突机不覆盖原机报告
+        let mut bind = TestResult::new(TestItem::Binding);
+        bind.verdict = Verdict::Fail;
+        let p4 = write_report(&dir, &meta(), &dev, &[r, bind], true).unwrap();
+        assert!(p4.ends_with("e02-20261022-0012A3B4C5D6-冲突103012.txt"));
+        // MAC 含冒号/路径字符 → 替换为 _（防目录穿越/非法文件名）
+        let p5 = write_report(
             &dir,
             &meta(),
             &DeviceInfo {
-                sn: "../x".into(),
+                bt_mac: "00:11/../x".into(),
                 ..Default::default()
             },
             &[],
             true,
         )
         .unwrap();
-        assert!(p4.ends_with("e02-20261022-.._x.txt"));
+        assert!(p5.ends_with("e02-20261022-00_11_.._x.txt"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn scan_stats_and_listing_by_day() {
         let dir = std::env::temp_dir().join(format!("e02-stats-{}", std::process::id()));
-        // 当日三台（两 PASS 一 FAIL，SN 各异），他日一台不计数
-        for (sn, verdict) in [
-            ("SN1", Verdict::Pass),
-            ("SN2", Verdict::Pass),
-            ("SN3", Verdict::Fail),
+        // 当日三台（两 PASS 一 FAIL，蓝牙 MAC 各异），他日一台不计数
+        for (bt, verdict) in [
+            ("BT1", Verdict::Pass),
+            ("BT2", Verdict::Pass),
+            ("BT3", Verdict::Fail),
         ] {
             let dev = DeviceInfo {
-                sn: sn.into(),
+                bt_mac: bt.into(),
                 ..Default::default()
             };
             let r = result(TestItem::Wifi, verdict);
@@ -357,7 +380,7 @@ mod tests {
             &dir,
             &other_day,
             &DeviceInfo {
-                sn: "SN9".into(),
+                bt_mac: "BT9".into(),
                 ..Default::default()
             },
             &[result(TestItem::Wifi, Verdict::Pass)],
@@ -375,8 +398,8 @@ mod tests {
         // 列表新→旧：同日按文件名倒序，最多取 2
         let list = list_reports(&dir, 2);
         assert_eq!(list.len(), 2);
-        assert!(list[0].ends_with("e02-20261022-SN3.txt"));
-        assert!(list[1].ends_with("e02-20261022-SN2.txt"));
+        assert!(list[0].ends_with("e02-20261022-BT3.txt"));
+        assert!(list[1].ends_with("e02-20261022-BT2.txt"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

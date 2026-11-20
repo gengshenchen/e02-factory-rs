@@ -9,6 +9,7 @@ mod config;
 mod devwatch;
 mod engine;
 mod exec;
+mod ledger;
 mod netip;
 mod paths;
 mod player;

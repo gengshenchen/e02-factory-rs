@@ -7,6 +7,7 @@ use crate::engine::events::{UiEvent, UiResponse};
 use crate::engine::runner::{self, RunOutcome};
 use crate::engine::{TestItem, TestResult, Verdict};
 use crate::exec;
+use crate::ledger::{self, BindCheck, Ledger};
 use crate::netip;
 use crate::player;
 use crate::protocol::{self, CameraFactory, DeviceInfo};
@@ -21,9 +22,11 @@ use std::time::{Duration, Instant, SystemTime};
 /// → 电池 → 陀螺仪；人工项——录像（长动作先启动、回放判定）→ 拍照 →
 /// 指示灯 → 麦克风 → 按键（操作员收尾）。run_sequence 内仍会按
 /// is_manual 稳定排序：自动项先行，人工项按此相对顺序殿后。
-pub const BATCH_ORDER: [TestItem; 11] = [
+pub const BATCH_ORDER: [TestItem; 12] = [
     TestItem::DeviceInfo,
     TestItem::BtMac,
+    // 虚拟项（紧随蓝牙 MAC：地址两半齐备即校验）
+    TestItem::Binding,
     TestItem::Wifi,
     TestItem::SdCard,
     TestItem::Battery,
@@ -97,6 +100,21 @@ pub fn run_sequence(
     let mut device = base.device;
     let mut results = base.results;
     results.sort_by_key(|r| batch_pos(r.item)); // 底稿按批序归位，报告行序稳定
+                                                // 绑定台账（V3.13）：蓝牙与 WiFi 地址齐备后校验一次（含单项补测——
+                                                // 底稿 device 已带两地址时开测即校验）。冲突判 FAIL 但不中止：剩余项
+                                                // 测完留完整报告（产线返修定位需要），冲突机不动台账、报告文件名加
+                                                // "-冲突"后缀避免覆盖原机报告。台账每次变更前从磁盘重读：设置窗可
+                                                // 在测试中开合，避免收尾回填覆盖中途的删/清操作。
+    let ledger_path = ledger::path_of(cfg);
+    let mut binding_done = false;
+    maybe_bind(
+        cfg.binding.enable,
+        &mut binding_done,
+        &ledger_path,
+        &device,
+        &mut results,
+        tx,
+    );
     let _ = tx.send(UiEvent::Log(format!(
         "序列开始，工位 {}，共 {} 项（自动 {} + 人工 {}），单项超时 {}",
         cfg.station,
@@ -133,6 +151,14 @@ pub fn run_sequence(
         )));
         if let Some(d) = &dev {
             device.merge(d.clone());
+            maybe_bind(
+                cfg.binding.enable,
+                &mut binding_done,
+                &ledger_path,
+                &device,
+                &mut results,
+                tx,
+            );
         }
         let _ = tx.send(UiEvent::Result(result.clone(), dev));
         upsert(&mut results, result);
@@ -165,6 +191,18 @@ pub fn run_sequence(
         }
     }
     exec::set_default_timeout(prev_timeout);
+    // 测后回填整机判定（台账"最近判定"列；bind 入过账的机器才会命中）
+    if cfg.binding.enable && !device.bt_mac.is_empty() {
+        let mut ledger = Ledger::load(&ledger_path);
+        ledger.set_verdict(
+            &device.bt_mac,
+            report::overall(&results, true),
+            &report::time_str(SystemTime::now()),
+        );
+        if let Err(e) = ledger.save(&ledger_path) {
+            let _ = tx.send(UiEvent::Log(format!("台账保存失败: {e}")));
+        }
+    }
     write_update(
         reports_dir,
         &meta(cfg, started_wall, started),
@@ -192,6 +230,61 @@ fn write_update(
     }
     *written = path.clone();
     path
+}
+
+/// 绑定校验执行一次（V3.13）：蓝牙与 WiFi 地址都齐备且本轮未校验过。
+/// 结果行进序列/报告；台账即时落盘（应用随时可能被关），变更前重读
+/// 磁盘（设置窗可能在测试中改台账）。
+fn maybe_bind(
+    enable: bool,
+    done: &mut bool,
+    ledger_path: &Path,
+    device: &DeviceInfo,
+    results: &mut Vec<TestResult>,
+    tx: &Sender<UiEvent>,
+) {
+    if *done || !enable || device.bt_mac.is_empty() || device.wifi_mac.is_empty() {
+        return;
+    }
+    *done = true;
+    let now = report::time_str(SystemTime::now());
+    let mut ledger = Ledger::load(ledger_path);
+    let mut r = TestResult::new(TestItem::Binding);
+    match ledger.bind(&device.bt_mac, &device.wifi_mac, &device.sn, &now) {
+        BindCheck::New => {
+            r.verdict = Verdict::Pass;
+            r.detail = "新设备入账".into();
+        }
+        BindCheck::Retest { tests } => {
+            r.verdict = Verdict::Pass;
+            r.detail = format!("同机复测（第 {tests} 次）");
+        }
+        BindCheck::BtConflict { other } => {
+            r.verdict = Verdict::Fail;
+            r.detail = format!(
+                "该蓝牙地址已绑定 WiFi {}（首见 {}，已测 {} 次），不同设备烧了同一蓝牙地址",
+                other.wifi_mac, other.first_seen, other.tests
+            );
+        }
+        BindCheck::WifiConflict { other } => {
+            r.verdict = Verdict::Fail;
+            r.detail = format!(
+                "该 WiFi 地址已绑定蓝牙 {}（首见 {}，已测 {} 次），不同设备烧了同一 WiFi 地址",
+                other.bt_mac, other.first_seen, other.tests
+            );
+        }
+    }
+    if let Err(e) = ledger.save(ledger_path) {
+        let _ = tx.send(UiEvent::Log(format!("台账保存失败: {e}")));
+    }
+    let _ = tx.send(UiEvent::Log(format!(
+        "【{}】{} {}",
+        r.item.label(),
+        r.verdict.label(),
+        clip(&r.detail, 100)
+    )));
+    let _ = tx.send(UiEvent::Result(r.clone(), None));
+    upsert(results, r);
 }
 
 /// 秒数 → 超时选项（0 = 不限制）。
@@ -1613,6 +1706,8 @@ mod tests {
             vec![
                 TestItem::DeviceInfo,
                 TestItem::BtMac,
+                // 虚拟项：蓝牙 MAC 解析到即查台账（V3.13）
+                TestItem::Binding,
                 TestItem::Wifi,
                 TestItem::SdCard,
                 TestItem::Battery,
@@ -1637,18 +1732,19 @@ mod tests {
         assert!(text.contains("指示灯测试:PASS"));
         assert!(text.contains("工位: complete"));
         assert!(text.contains("汇总: 4 项，PASS 4，FAIL 0，跳过 0"));
-        // SN 进文件名（V3）；SN 未知期间的旧文件应已删除
+        // 蓝牙 MAC 未解析到 → unknown 兜底文件名（V3.13 键改蓝牙 MAC，
+        // SN 仅正文留证）；同序列重写只留一份
         assert!(report
             .file_name()
             .unwrap()
             .to_string_lossy()
-            .ends_with("-002.txt"));
+            .ends_with("-unknown.txt"));
         let txts = std::fs::read_dir(&reports)
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| e.file_name().to_string_lossy().contains("-002"))
+            .filter(|e| e.file_name().to_string_lossy().contains("-unknown"))
             .count();
-        assert_eq!(txts, 1, "同一序列 SN 变化只留最终文件");
+        assert_eq!(txts, 1, "同一序列只留最终文件");
 
         // —— V2.1 按键引导：三场景（顺序执行，防 ADB 环境变量竞争）——
         let kscript = base.join("adb-keys");
@@ -2447,8 +2543,8 @@ mod tests {
         }
         let report = handle.join().unwrap().expect("补测应产出报告");
         assert_eq!(verdicts, vec![(TestItem::Wifi, Verdict::Pass)]);
-        // 同 SN 同日文件：整机报告被重写，不是另散一份单项报告
-        assert!(report.to_string_lossy().contains("SNM"), "{report:?}");
+        // 蓝牙 MAC 未解析到 → unknown 兜底文件名；整机报告被重写，不散页
+        assert!(report.to_string_lossy().contains("unknown"), "{report:?}");
         let text = std::fs::read_to_string(&report).unwrap();
         assert!(text.contains("sn-address:SNM"), "{text}");
         assert!(text.contains("设备信息:PASS"), "{text}"); // 底稿项保留
@@ -2457,6 +2553,105 @@ mod tests {
         assert!(text.contains("汇总: 2 项，PASS 2"), "{text}");
         assert!(text.contains("结果: PASS"), "{text}"); // 补测通过整机翻 PASS
         std::env::remove_var("ADB");
+        crate::exec::clear_abort();
+        let _ = std::fs::remove_dir_all(&base_dir);
+    }
+
+    /// 绑定台账三段（V3.13）：新机入账 → 同蓝牙不同 WiFi 判冲突（文件名加
+    /// "-冲突"后缀、不动台账）→ 原对复测放行计数。台账指到临时目录，
+    /// 不污染真实数据目录。
+    #[test]
+    fn binding_ledger_new_conflict_retest() {
+        let _g = crate::exec::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::exec::clear_abort();
+        let base_dir = std::env::temp_dir().join(format!("e02-bind-{}", std::process::id()));
+        let reports = base_dir.join("reports");
+        std::fs::create_dir_all(&reports).unwrap();
+        let ledger_path = base_dir.join("ledger.json");
+        // 假 adb：3 回 SN+WiFi（WiFi 由环境变量切换机型），10 回蓝牙 MAC
+        let script = base_dir.join("adb-bind");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\ncase \"$*\" in\n\
+             *\"camera-factory 3\"*) printf 'sn-address:00001\\nwifi-mac:%s\\n' \"$WIFI_MAC\";;\n\
+             *\"camera-factory 10\"*) printf 'MAC:0011A3B4C5D6\\n';;\n\
+             *) printf 'ok\\n';;\nesac\n",
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::env::set_var("ADB", &script);
+
+        let run = |wifi: &str| -> (Option<PathBuf>, Vec<(TestItem, Verdict)>) {
+            std::env::set_var("WIFI_MAC", wifi);
+            let mut cfg = Config::default();
+            cfg.binding.ledger_path = Some(ledger_path.to_string_lossy().into_owned());
+            let items = vec![TestItem::DeviceInfo, TestItem::BtMac];
+            let (tx, rx) = mpsc::channel();
+            let (_mtx, mrx) = mpsc::channel();
+            let (m, r) = (base_dir.join("media"), reports.clone());
+            let handle = thread::spawn(move || {
+                run_sequence(&items, &tx, &mrx, &m, &r, &cfg, RunBase::default())
+            });
+            let mut verdicts = Vec::new();
+            while let Ok(ev) = rx.recv_timeout(Duration::from_secs(30)) {
+                if let UiEvent::Result(res, _) = ev {
+                    verdicts.push((res.item, res.verdict));
+                }
+            }
+            (handle.join().unwrap(), verdicts)
+        };
+
+        // 1) 新机：绑定 PASS 入账，报告以蓝牙 MAC 为键
+        let (p1, v1) = run("00:60:A7:0B:9C:F2");
+        let p1 = p1.expect("新机应产出报告");
+        assert!(
+            p1.to_string_lossy().ends_with("-0011A3B4C5D6.txt"),
+            "{p1:?}"
+        );
+        assert!(v1.contains(&(TestItem::Binding, Verdict::Pass)), "{v1:?}");
+        let text1 = std::fs::read_to_string(&p1).unwrap();
+        assert!(text1.contains("MAC 绑定:PASS 新设备入账"), "{text1}");
+        assert!(text1.contains("结果: PASS"), "{text1}");
+        let l = Ledger::load(&ledger_path);
+        assert_eq!(l.len(), 1);
+
+        // 2) 同蓝牙不同 WiFi：判 FAIL 告警，文件名加 -冲突，台账不动
+        let (p2, v2) = run("00:60:A7:0B:9C:99");
+        let p2 = p2.expect("冲突机也应产出报告（其余项测完留证）");
+        let name2 = p2.to_string_lossy();
+        assert!(name2.contains("0011A3B4C5D6-冲突"), "{name2}");
+        assert_ne!(p1, p2, "冲突机不得覆盖原机报告");
+        assert!(v2.contains(&(TestItem::Binding, Verdict::Fail)), "{v2:?}");
+        let text2 = std::fs::read_to_string(&p2).unwrap();
+        assert!(text2.contains("MAC 绑定:FAIL"), "{text2}");
+        assert!(
+            text2.contains("该蓝牙地址已绑定 WiFi 00:60:A7:0B:9C:F2"),
+            "{text2}"
+        );
+        assert!(text2.contains("结果: FAIL"), "{text2}");
+        assert_eq!(Ledger::load(&ledger_path).len(), 1, "冲突不入账");
+
+        // 3) 原对复测：放行，计数累加，整机翻回 PASS
+        let (p3, v3) = run("00:60:A7:0B:9C:F2");
+        assert_eq!(p3.as_ref(), Some(&p1), "同机复测覆盖同一份报告");
+        assert!(v3.contains(&(TestItem::Binding, Verdict::Pass)), "{v3:?}");
+        let text3 = std::fs::read_to_string(&p1).unwrap();
+        assert!(
+            text3.contains("MAC 绑定:PASS 同机复测（第 2 次）"),
+            "{text3}"
+        );
+        assert!(text3.contains("结果: PASS"), "{text3}");
+        let l = Ledger::load(&ledger_path);
+        assert_eq!(l.recent(5)[0].tests, 2);
+        assert_eq!(l.recent(5)[0].last_verdict, "PASS");
+
+        std::env::remove_var("ADB");
+        std::env::remove_var("WIFI_MAC");
         crate::exec::clear_abort();
         let _ = std::fs::remove_dir_all(&base_dir);
     }

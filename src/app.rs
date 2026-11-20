@@ -123,6 +123,10 @@ pub struct E02App {
     pub report_sel: Option<PathBuf>,
     /// 报告中心：选中文件内容缓存（路径, 文本）
     report_text: Option<(PathBuf, String)>,
+    /// 台账卡快照（V3.13）：设置窗打开时从磁盘加载，卡内增删后同步
+    pub ledger_view: crate::ledger::Ledger,
+    /// 台账"清空"两步确认状态（true = 已点一次，按钮显示"确认清空？"）
+    pub ledger_clear_armed: bool,
     event_rx: Option<Receiver<UiEvent>>,
     /// 在位监测线程事件（V3.8）
     dev_rx: Receiver<DevState>,
@@ -166,6 +170,8 @@ impl E02App {
             report_list: Vec::new(),
             report_sel: None,
             report_text: None,
+            ledger_view: crate::ledger::Ledger::default(),
+            ledger_clear_armed: false,
             event_rx: None,
             dev_rx,
             manual_tx: None,
@@ -680,6 +686,10 @@ impl eframe::App for E02App {
                             self.report_open = true;
                         }
                         if ui.button("设置").clicked() {
+                            // 台账快照随开窗刷新（V3.13：worker 落盘后这里取最新）
+                            self.ledger_view =
+                                crate::ledger::Ledger::load(&crate::ledger::path_of(&self.config));
+                            self.ledger_clear_armed = false;
                             self.settings_open = true;
                         }
                         // 设备在位指示（V3.8）：灰=未连接 绿=在线 琥珀=多台
