@@ -337,8 +337,19 @@ impl Config {
         }
         let text =
             std::fs::read_to_string(path).with_context(|| format!("读取 {}", path.display()))?;
-        let cfg: Config =
+        let mut cfg: Config =
             toml::from_str(&text).with_context(|| format!("解析 {} 失败", path.display()))?;
+        // 迁移（V3.14.2）：早期未发布版把 E02E 误建成内置工位档、且当时
+        // 写出的整机档不含 esim——加载时清残留，防止工位档案里一直显示
+        // e02e、E02E 在整机工位跑不到 IMEI/CCID。下次设置改动落盘即固化。
+        if cfg.profiles.remove("e02e").is_some() && cfg.station == "e02e" {
+            cfg.station = "complete".into();
+        }
+        if let Some(complete) = cfg.profiles.get_mut("complete") {
+            if !complete.items.iter().any(|s| s == "esim") {
+                complete.items.push("esim".into());
+            }
+        }
         if !cfg.profiles.contains_key(&cfg.station) {
             anyhow::bail!(
                 "配置工位 `{}` 不存在（可选: {}）",
@@ -409,6 +420,29 @@ mod tests {
         let items = hand.active_items();
         assert!(items.contains(&TestItem::DeviceInfo));
         assert!(items.contains(&TestItem::BtMac));
+    }
+
+    #[test]
+    fn v3141_e02e_station_migrated_on_load() {
+        // 早期未发布版写出的现场：e02e 工位档 + 整机档缺 esim → 加载即迁移
+        let dir = std::env::temp_dir().join(format!("e02-cfg-mig-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("config.toml");
+        std::fs::write(
+            &p,
+            "station = \"e02e\"\n\
+             [profiles.e02e]\nitems = [\"info\", \"btmac\", \"gyro\", \"esim\"]\n\
+             [profiles.complete]\nitems = [\"info\", \"btmac\", \"wifi\"]\n",
+        )
+        .unwrap();
+        let cfg = Config::load(&p).unwrap();
+        assert!(!cfg.profiles.contains_key("e02e"), "e02e 工位档应被清掉");
+        assert_eq!(cfg.station, "complete");
+        assert!(
+            cfg.active_items().contains(&TestItem::Esim),
+            "整机档应补上 esim"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
