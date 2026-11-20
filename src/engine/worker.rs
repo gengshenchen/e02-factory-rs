@@ -161,7 +161,9 @@ pub fn run_sequence(
             "【{}】{} {}",
             item.label(),
             result.verdict.label(),
-            clip(&result.detail, 100)
+            // 240 容得下 WiFi 全文（IP+AP+双向速率+重传 ~190 字符，V3.15.2：
+            // 曾截 100 导致"打印不全"；原始命令输出在 detail 拼装时另有窄截）
+            clip(&result.detail, 240)
         )));
         if let Some(d) = &dev {
             device.merge(d.clone());
@@ -318,7 +320,7 @@ fn maybe_bind(
         "【{}】{} {}",
         r.item.label(),
         r.verdict.label(),
-        clip(&r.detail, 100)
+        clip(&r.detail, 240) // 与结果行同宽（V3.15.2）：冲突详情不再截半句
     )));
     let _ = tx.send(UiEvent::Result(r.clone(), None));
     upsert(results, r);

@@ -45,21 +45,19 @@ pub fn show(ui: &mut egui::Ui, app: &mut E02App) {
         });
     });
     ui.add_space(6.0);
+    // 弃 show_rows（V3.15.2）：它按"每行等高"排布，而结果行放宽截断后
+    // 长行（WiFi 全文 ~240 字符）会在面板宽度内折行占多行高，等高假设
+    // 会让行与行叠画。普通 show 逐行排布，折行行高自然撑开。
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .stick_to_bottom(true)
-        .show_rows(
-            ui,
-            ui.text_style_height(&egui::TextStyle::Monospace),
-            app.log.len(),
-            |ui, range| {
-                for line in app.log.range(range) {
-                    ui.label(
-                        egui::RichText::new(line.as_str())
-                            .monospace()
-                            .color(theme::ON_DARK),
-                    );
-                }
-            },
-        );
+        .show(ui, |ui| {
+            for line in app.log.iter() {
+                ui.label(
+                    egui::RichText::new(line.as_str())
+                        .monospace()
+                        .color(theme::ON_DARK),
+                );
+            }
+        });
 }
