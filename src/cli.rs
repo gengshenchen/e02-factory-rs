@@ -182,6 +182,8 @@ fn test_cmd(
     if let Some(p) = report_path {
         let meta = report::ReportMeta {
             station: cfg.station.clone(),
+            // CLI 无交互切换：按已读设备信息识别型号（识别不到 E02）
+            model: crate::config::ModelKind::detect(&batch.device.t32_ver).unwrap_or_default(),
             started: report::time_str(started_wall),
             elapsed_secs: started.elapsed().as_secs(),
         };

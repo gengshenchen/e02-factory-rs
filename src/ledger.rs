@@ -21,8 +21,13 @@ use std::path::{Path, PathBuf};
 pub struct LedgerRecord {
     /// 蓝牙 MAC（台账主键；报告文件名同款）
     pub bt_mac: String,
-    /// 绑定的 WiFi MAC
-    pub wifi_mac: String,
+    /// 绑定值（绑定对的另一半）：E02 = WiFi MAC；E02E = IMEI（V3.14）。
+    /// serde alias 兼容 V3.13 旧字段名 wifi_mac，升级不丢已测台账。
+    #[serde(alias = "wifi_mac")]
+    pub partner: String,
+    /// 型号（E02/E02E；空 = V3.13 旧账，视作 E02）
+    #[serde(default)]
+    pub model: String,
     /// 最近一次回读的 SN（仅留证，不作键）
     #[serde(default)]
     pub sn: String,
@@ -44,10 +49,10 @@ pub enum BindCheck {
     New,
     /// 同机复测（tests 为含本次的累计次数）
     Retest { tests: u32 },
-    /// 该蓝牙 MAC 已绑定别的 WiFi（other = 台账里既有那条）
+    /// 该蓝牙 MAC 已绑定别的值（other = 台账里既有那条）
     BtConflict { other: LedgerRecord },
-    /// 该 WiFi MAC 已绑定别的蓝牙
-    WifiConflict { other: LedgerRecord },
+    /// 该绑定值（WiFi/IMEI）已绑定别的蓝牙（对称检查）
+    PartnerConflict { other: LedgerRecord },
 }
 
 /// 台账（蓝牙 MAC → 记录）。记录量 = 产线产量，整文件读写足够。
@@ -103,11 +108,12 @@ impl Ledger {
     }
 
     /// 校验并入账（同机复测试数 +1、新机插一条；冲突不动台账）。
-    /// 调用方保证 bt/wifi 非空（两地址由设备信息/蓝牙两项解析齐备）。
-    pub fn bind(&mut self, bt: &str, wifi: &str, sn: &str, now: &str) -> BindCheck {
-        let (bt, wifi) = (bt.trim().to_uppercase(), wifi.trim().to_uppercase());
+    /// partner = 绑定对另一半：E02 为 WiFi MAC，E02E 为 IMEI（V3.14）。
+    /// 调用方保证 bt/partner 非空（由设备信息/蓝牙/eSIM 项解析齐备）。
+    pub fn bind(&mut self, bt: &str, partner: &str, model: &str, sn: &str, now: &str) -> BindCheck {
+        let (bt, partner) = (bt.trim().to_uppercase(), partner.trim().to_uppercase());
         if let Some(rec) = self.devices.get_mut(&bt) {
-            if rec.wifi_mac == wifi {
+            if rec.partner == partner {
                 rec.tests += 1;
                 rec.last_seen = now.into();
                 if !sn.trim().is_empty() {
@@ -117,14 +123,20 @@ impl Ledger {
             }
             return BindCheck::BtConflict { other: rec.clone() };
         }
-        if let Some(other) = self.devices.values().find(|r| r.wifi_mac == wifi).cloned() {
-            return BindCheck::WifiConflict { other };
+        if let Some(other) = self
+            .devices
+            .values()
+            .find(|r| r.partner == partner)
+            .cloned()
+        {
+            return BindCheck::PartnerConflict { other };
         }
         self.devices.insert(
             bt.clone(),
             LedgerRecord {
                 bt_mac: bt,
-                wifi_mac: wifi,
+                partner,
+                model: model.into(),
                 sn: sn.trim().to_uppercase(),
                 first_seen: now.into(),
                 last_seen: now.into(),
@@ -156,14 +168,22 @@ impl Ledger {
 
     /// 导出 CSV（UTF-8 BOM，Excel 双击直开）。表头中文与 config 注释同级语义。
     pub fn to_csv(&self) -> String {
-        let mut s = String::from("\u{FEFF}蓝牙MAC,WiFi MAC,SN,首测,最近,测试次数,最近判定\n");
+        let mut s =
+            String::from("\u{FEFF}蓝牙MAC,绑定值(WiFi/IMEI),型号,SN,首测,最近,测试次数,最近判定\n");
         let mut recs: Vec<&LedgerRecord> = self.devices.values().collect();
         recs.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
         for r in recs {
-            // MAC/SN/时间均为 ASCII 安全字符，无引号转义需求
+            // MAC/IMEI/SN/时间均为 ASCII 安全字符，无引号转义需求
             s.push_str(&format!(
-                "{},{},{},{},{},{},{}\n",
-                r.bt_mac, r.wifi_mac, r.sn, r.first_seen, r.last_seen, r.tests, r.last_verdict
+                "{},{},{},{},{},{},{},{}\n",
+                r.bt_mac,
+                r.partner,
+                r.model,
+                r.sn,
+                r.first_seen,
+                r.last_seen,
+                r.tests,
+                r.last_verdict
             ));
         }
         s
@@ -179,18 +199,18 @@ mod tests {
         let mut l = Ledger::default();
         // 新机入账（SN 留证）
         assert_eq!(
-            l.bind("0011A3B4C5D6", "00:60:A7:0B:9C:F2", "00001", "t1"),
+            l.bind("0011A3B4C5D6", "00:60:A7:0B:9C:F2", "E02", "00001", "t1"),
             BindCheck::New
         );
         // 同对再现 = 同机复测，计数累加
         assert_eq!(
-            l.bind("0011a3b4c5d6", "00:60:a7:0b:9c:f2", "", "t2"),
+            l.bind("0011a3b4c5d6", "00:60:a7:0b:9c:f2", "E02", "", "t2"),
             BindCheck::Retest { tests: 2 }
         );
-        // 同蓝牙不同 WiFi = 烧错地址，冲突且不动台账
+        // 同蓝牙不同绑定值 = 烧错地址，冲突且不动台账
         let before = l.clone();
         assert!(matches!(
-            l.bind("0011A3B4C5D6", "00:60:A7:0B:9C:99", "", "t3"),
+            l.bind("0011A3B4C5D6", "00:60:A7:0B:9C:99", "E02", "", "t3"),
             BindCheck::BtConflict { .. }
         ));
         assert_eq!(l, before);
@@ -198,21 +218,41 @@ mod tests {
     }
 
     #[test]
-    fn wifi_conflict_symmetric() {
+    fn partner_conflict_symmetric() {
         let mut l = Ledger::default();
-        l.bind("0011A3B4C5D6", "00:60:A7:0B:9C:F2", "", "t1");
-        // 不同蓝牙占同一 WiFi 地址同样告警
+        l.bind("0011A3B4C5D6", "00:60:A7:0B:9C:F2", "E02", "", "t1");
+        // 不同蓝牙占同一绑定值同样告警
         assert!(matches!(
-            l.bind("9999A3B4C5D6", "00:60:A7:0B:9C:F2", "", "t2"),
-            BindCheck::WifiConflict { .. }
+            l.bind("9999A3B4C5D6", "00:60:A7:0B:9C:F2", "E02", "", "t2"),
+            BindCheck::PartnerConflict { .. }
         ));
         assert_eq!(l.len(), 1); // 冲突不入账
+    }
+
+    /// E02E 绑定对 = 蓝牙↔IMEI（V3.14）：同引擎换 partner 字段即可。
+    #[test]
+    fn esim_binds_bt_to_imei() {
+        let mut l = Ledger::default();
+        assert_eq!(
+            l.bind("0011A3B4C5D6", "860123456789012", "E02E", "", "t1"),
+            BindCheck::New
+        );
+        // 同蓝牙不同 IMEI（双机同蓝牙地址）冲突
+        assert!(matches!(
+            l.bind("0011A3B4C5D6", "860999999999999", "E02E", "", "t2"),
+            BindCheck::BtConflict { .. }
+        ));
+        // 同对复测放行
+        assert_eq!(
+            l.bind("0011A3B4C5D6", "860123456789012", "E02E", "", "t3"),
+            BindCheck::Retest { tests: 2 }
+        );
     }
 
     #[test]
     fn verdict_roundtrip_and_remove() {
         let mut l = Ledger::default();
-        l.bind("0011A3B4C5D6", "AA", "", "t1");
+        l.bind("0011A3B4C5D6", "AA", "E02", "", "t1");
         l.set_verdict("0011A3B4C5D6", "FAIL", "t2");
         assert_eq!(l.recent(5)[0].last_verdict, "FAIL");
         assert_eq!(l.recent(5)[0].last_seen, "t2");
@@ -226,7 +266,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("e02-ledger-{}", std::process::id()));
         let path = dir.join("sub").join("ledger.json"); // save 需自建目录
         let mut l = Ledger::default();
-        l.bind("0011A3B4C5D6", "AA", "00001", "t1");
+        l.bind("0011A3B4C5D6", "AA", "E02", "00001", "t1");
         l.save(&path).unwrap();
         let loaded = Ledger::load(&path);
         assert_eq!(loaded, l);
@@ -234,12 +274,34 @@ mod tests {
         std::fs::write(&path, "{broken").unwrap();
         assert!(Ledger::load(&path).is_empty());
         // CSV：BOM + 表头 + 倒序（最近在前）
-        l.bind("9999A3B4C5D6", "BB", "", "t2");
+        l.bind("9999A3B4C5D6", "BB", "E02E", "", "t2");
         let csv = l.to_csv();
         assert!(csv.starts_with('\u{FEFF}'));
-        assert!(csv.contains("蓝牙MAC,WiFi MAC,SN,首测,最近,测试次数,最近判定"));
+        assert!(csv.contains("蓝牙MAC,绑定值(WiFi/IMEI),型号,SN"));
         let b = csv.lines().nth(1).unwrap();
-        assert!(b.starts_with("9999A3B4C5D6"), "{csv}");
+        assert!(b.starts_with("9999A3B4C5D6,BB,E02E"), "{csv}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// V3.13 旧台账（字段名 wifi_mac、无 model）升级加载不丢账（alias）。
+    #[test]
+    fn v313_ledger_migrates_via_alias() {
+        let old = r#"{"devices":{"0011A3B4C5D6":{"bt_mac":"0011A3B4C5D6","wifi_mac":"AA","sn":"00001","first_seen":"t1","last_seen":"t1","tests":3,"last_verdict":"PASS"}}}"#;
+        let dir = std::env::temp_dir().join(format!("e02-ledger-old-{}", std::process::id()));
+        let path = dir.join("ledger.json");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, old).unwrap();
+        let mut l = Ledger::load(&path);
+        assert_eq!(l.len(), 1);
+        let rec = l.recent(1)[0].clone();
+        assert_eq!(rec.partner, "AA"); // 旧 wifi_mac 读进 partner
+        assert_eq!(rec.model, ""); // 旧账无型号 → 视作 E02
+        assert_eq!(rec.tests, 3);
+        // 同对复测在升级后照常累加
+        assert_eq!(
+            l.bind("0011A3B4C5D6", "AA", "E02", "", "t2"),
+            BindCheck::Retest { tests: 4 }
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

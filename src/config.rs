@@ -175,6 +175,71 @@ pub struct ConnCfg {
     pub auto_start: bool,
 }
 
+/// 产品型号（V3.14）：绑定对与测试项按型号区分。
+/// E02 = WiFi 型（蓝牙↔WiFi MAC 绑定）；E02E = eSIM 型（无 WiFi 模组，
+/// 蓝牙↔IMEI 绑定，`camera-factory 20` 读 IMEI/CCID，测陀螺仪/IMEI/CCID）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ModelKind {
+    #[default]
+    E02,
+    #[serde(rename = "E02E")]
+    E02e,
+}
+
+impl ModelKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            ModelKind::E02 => "E02",
+            ModelKind::E02e => "E02E",
+        }
+    }
+
+    /// 报告文件名前缀（e02e- 与 e02- 前缀互不覆盖）。
+    pub fn file_prefix(self) -> &'static str {
+        match self {
+            ModelKind::E02 => "e02",
+            ModelKind::E02e => "e02e",
+        }
+    }
+
+    pub fn has_wifi(self) -> bool {
+        matches!(self, ModelKind::E02)
+    }
+
+    /// 按固件名识别型号：`soft-ware:E02E-1.0.1` 前缀匹配，长前缀优先
+    /// （E02E 先于 E02，否则 E02 恒中）。
+    pub fn detect(soft_ver: &str) -> Option<ModelKind> {
+        let v = soft_ver.trim().to_ascii_uppercase();
+        [ModelKind::E02e, ModelKind::E02]
+            .into_iter()
+            .find(|m| v.starts_with(m.label()))
+    }
+}
+
+/// 型号配置（V3.14）：默认自动按固件名识别；可关自动改手动锁定。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ModelCfg {
+    /// 自动识别（设备信息读到 soft-ware 后切换型号；识别不到维持现状）
+    #[serde(default = "d_model_auto")]
+    pub auto: bool,
+    /// 手动锁定型号（auto=false 时生效；不锁则用默认 E02）
+    #[serde(default)]
+    pub locked: Option<ModelKind>,
+}
+
+fn d_model_auto() -> bool {
+    true
+}
+
+impl Default for ModelCfg {
+    fn default() -> Self {
+        Self {
+            auto: d_model_auto(),
+            locked: None,
+        }
+    }
+}
+
 /// 设备绑定台账（V3.13）：SN 未烧写（全厂默认 00001）不可作报告键/设备
 /// 标识，报告文件名改用蓝牙 MAC；台账记录"蓝牙 MAC ↔ WiFi MAC"绑定，
 /// 防工厂烧错地址（多台机器同蓝牙 MAC）。同对复测放行，同址不同对告警。
@@ -228,6 +293,9 @@ pub struct Config {
     /// 设备绑定台账（V3.13）
     #[serde(default)]
     pub binding: BindingCfg,
+    /// 型号（V3.14：E02 WiFi 型 / E02E eSIM 型）
+    #[serde(default)]
+    pub model: ModelCfg,
 }
 
 fn d_station() -> String {
@@ -245,10 +313,26 @@ fn d_profiles() -> BTreeMap<String, Profile> {
                 .collect(),
         },
     );
+    // 全测工位只含 E02 可用项（V3.14：imei/ccid 为 E02E 专属，混入必 FAIL）
     m.insert(
         "complete".into(),
         Profile {
-            items: TestItem::ALL.iter().map(|i| i.slug().to_string()).collect(),
+            items: TestItem::ALL
+                .iter()
+                .filter(|i| i.available_for(ModelKind::E02))
+                .map(|i| i.slug().to_string())
+                .collect(),
+        },
+    );
+    // E02E（eSIM 型）产线模板（V3.14）：陀螺仪 + IMEI + CCID，
+    // info/btmac 为身份来源（绑定对 = 蓝牙↔IMEI）
+    m.insert(
+        "e02e".into(),
+        Profile {
+            items: vec!["info", "btmac", "gyro", "imei", "ccid"]
+                .into_iter()
+                .map(String::from)
+                .collect(),
         },
     );
     m
@@ -264,6 +348,7 @@ impl Default for Config {
             timeouts: TimeoutsCfg::default(),
             conn: ConnCfg::default(),
             binding: BindingCfg::default(),
+            model: ModelCfg::default(),
         }
     }
 }
@@ -327,7 +412,13 @@ mod tests {
     fn builtin_profiles_and_items() {
         let cfg = Config::builtin();
         assert_eq!(cfg.station, "complete");
-        assert_eq!(cfg.active_items().len(), TestItem::ALL.len());
+        // 全测工位 = E02 可用项全集（V3.14：imei/ccid 为 E02E 专属）
+        let e02_all = TestItem::ALL
+            .iter()
+            .filter(|i| i.available_for(ModelKind::E02))
+            .count();
+        assert_eq!(cfg.active_items().len(), e02_all);
+        assert!(!cfg.active_items().contains(&TestItem::Imei));
         let mut module = Config::builtin();
         module.station = "module".into();
         // 模组工位无电池/按键/MIC/录像/陀螺仪
@@ -335,6 +426,23 @@ mod tests {
         assert!(!items.contains(&TestItem::Battery));
         assert!(!items.contains(&TestItem::Keys));
         assert!(items.contains(&TestItem::Wifi));
+        // E02E 工位模板（V3.14）：陀螺仪 + IMEI + CCID + 身份来源项
+        let mut e02e = Config::builtin();
+        e02e.station = "e02e".into();
+        let items = e02e.active_items();
+        assert!(items.contains(&TestItem::Gyro));
+        assert!(items.contains(&TestItem::Imei));
+        assert!(items.contains(&TestItem::Ccid));
+        assert!(!items.contains(&TestItem::Wifi)); // E02E 无 WiFi 模组
+    }
+
+    #[test]
+    fn model_detect_longest_prefix_wins() {
+        use super::ModelKind;
+        assert_eq!(ModelKind::detect("E02E-1.0.1"), Some(ModelKind::E02e));
+        assert_eq!(ModelKind::detect("e02-1.0.1"), Some(ModelKind::E02));
+        assert_eq!(ModelKind::detect(" E02E-V2 "), Some(ModelKind::E02e));
+        assert_eq!(ModelKind::detect("E03-9.9"), None);
     }
 
     #[test]

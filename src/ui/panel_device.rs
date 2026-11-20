@@ -16,8 +16,15 @@ pub fn show(ui: &mut egui::Ui, app: &E02App) {
         .spacing([10.0, 8.0])
         .show(ui, |ui| {
             field(ui, "SN", &app.device.sn, true);
-            field(ui, "WiFi MAC", &app.device.wifi_mac, false);
-            field(ui, "蓝牙 MAC", &app.device.bt_mac, false);
+            // 身份字段按型号切换（V3.14）：E02E 无 WiFi 模组，展示 IMEI/CCID
+            if app.model.has_wifi() {
+                field(ui, "WiFi MAC", &app.device.wifi_mac, false);
+                field(ui, "蓝牙 MAC", &app.device.bt_mac, false);
+            } else {
+                field(ui, "蓝牙 MAC", &app.device.bt_mac, false);
+                field(ui, "IMEI", &app.device.imei, false);
+                field(ui, "CCID", &app.device.ccid, false);
+            }
             field(ui, "软件版本", &app.device.t32_ver, false);
             field(ui, "硬件版本", &app.device.hardware_ver, false);
             field(ui, "电池", &app.device.battery, false);

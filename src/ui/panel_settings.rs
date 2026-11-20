@@ -133,7 +133,56 @@ pub fn show(ctx: &egui::Context, app: &mut E02App) {
 
                     ui.add_space(12.0);
 
-                    // —— 测试项：三列勾选 ——
+                    // —— 型号（V3.14）：E02 WiFi 型 / E02E eSIM 型；绑定对、
+                    // 可测项、设备栏字段按型号切换 ——
+                    theme::card().show(ui, |ui| {
+                        card_begin(ui);
+                        card_head(
+                            ui,
+                            "产品型号",
+                            Some(
+                                if app.config.model.auto {
+                                    "自动"
+                                } else {
+                                    "锁定"
+                                }
+                                .into(),
+                            ),
+                        );
+                        ui.add_space(4.0);
+                        let auto = app.config.model.auto;
+                        changed |= ui
+                            .checkbox(&mut app.config.model.auto, "自动识别（按固件名）")
+                            .changed();
+                        ui.horizontal(|ui| {
+                            for (kind, name) in [
+                                (crate::config::ModelKind::E02, "E02（WiFi）"),
+                                (crate::config::ModelKind::E02e, "E02E（eSIM）"),
+                            ] {
+                                // 自动模式下选项卡展示识别结果；点击即转锁定
+                                let active = if auto {
+                                    app.model == kind
+                                } else {
+                                    app.config.model.locked == Some(kind)
+                                };
+                                if tab(ui, active, name) {
+                                    app.config.model.auto = false;
+                                    app.config.model.locked = Some(kind);
+                                    app.model = kind;
+                                    changed = true;
+                                }
+                            }
+                        });
+                        ui.add_space(2.0);
+                        caption(
+                            ui,
+                            "E02E 无 WiFi 模组：隐藏 WiFi 项与配网卡，绑定对 = 蓝牙↔IMEI",
+                        );
+                    });
+
+                    ui.add_space(12.0);
+
+                    // —— 测试项：三列勾选（按型号过滤不可用项）——
                     theme::card().show(ui, |ui| {
                         card_begin(ui);
                         card_head(ui, "测试项", None);
@@ -145,7 +194,13 @@ pub fn show(ctx: &egui::Context, app: &mut E02App) {
                                 .num_columns(3)
                                 .spacing([24.0, 8.0])
                                 .show(ui, |ui| {
-                                    for (idx, item) in TestItem::ALL.iter().enumerate() {
+                                    // 不可用项（E02E 的 WiFi、E02 的 IMEI/CCID）不展示，
+                                    // 避免勾了必 FAIL
+                                    let avail: Vec<&TestItem> = TestItem::ALL
+                                        .iter()
+                                        .filter(|i| i.available_for(app.model))
+                                        .collect();
+                                    for (idx, item) in avail.iter().enumerate() {
                                         let slug = item.slug().to_string();
                                         let mut on = profile.items.contains(&slug);
                                         if ui.checkbox(&mut on, item.label()).changed() {
@@ -168,6 +223,8 @@ pub fn show(ctx: &egui::Context, app: &mut E02App) {
 
                     // —— WiFi 测试深度（V3.12.9 拆三卡：深度 / 吞吐参数 /
                     // 产线配网；参数一参数一行，控件右侧灰字说明含义）——
+                    // E02E 无 WiFi 模组（V3.14）：深度/吞吐/配网整组隐藏
+                    if app.model.has_wifi() {
                     theme::card().show(ui, |ui| {
                         card_begin(ui);
                         card_head(ui, "WiFi 测试深度", None);
@@ -349,6 +406,7 @@ pub fn show(ctx: &egui::Context, app: &mut E02App) {
                             caption(ui, "填了即每次吞吐前推送重连，保证测的是这台 AP；留空则用耳机当前网络");
                         });
                     }
+                    }
 
                     ui.add_space(12.0);
 
@@ -447,7 +505,7 @@ pub fn show(ctx: &egui::Context, app: &mut E02App) {
                                     // recent 返回克隆，行内"删"可安全改台账
                                     for rec in app.ledger_view.recent(5) {
                                         ui.label(&rec.bt_mac);
-                                        ui.label(&rec.wifi_mac);
+                                        ui.label(&rec.partner);
                                         ui.label(format!("{} 次", rec.tests));
                                         let verdict =
                                             if rec.last_verdict.is_empty() { "—" } else { &rec.last_verdict };

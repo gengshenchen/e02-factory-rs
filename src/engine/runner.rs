@@ -70,6 +70,48 @@ pub fn run_auto(item: TestItem) -> RunOutcome {
             }
             Err(e) => fail(&mut r, e),
         },
+        // E02E eSIM（V3.14）：20 一条命令同印 IMEI 与 CCID；两项各跑一次
+        // 保持项独立（只读命令，无副作用）。任一项都把读到的两个字段
+        // merge 进设备信息（绑定对 = 蓝牙↔IMEI）。
+        TestItem::Imei | TestItem::Ccid => {
+            let what = if matches!(item, TestItem::Imei) {
+                "IMEI"
+            } else {
+                "CCID"
+            };
+            let parsed = exec(&CameraFactory::CcidImei.device_cmd()).and_then(|out| {
+                match protocol::parse_device_info(&out) {
+                    Ok(info) => Ok((info, out)),
+                    Err(e) => Err(format!("{e:#}（原始输出: {}）", one_line(&out))),
+                }
+            });
+            match parsed {
+                Ok((info, out)) => {
+                    let val = if matches!(item, TestItem::Imei) {
+                        &info.imei
+                    } else {
+                        &info.ccid
+                    };
+                    let valid = if matches!(item, TestItem::Imei) {
+                        protocol::imei_valid(val)
+                    } else {
+                        protocol::ccid_valid(val)
+                    };
+                    if valid {
+                        r.verdict = Verdict::Pass;
+                        r.detail = val.clone();
+                    } else if val.is_empty() {
+                        r.verdict = Verdict::Fail;
+                        r.detail = format!("输出中未读到{what}: {}", one_line(&out));
+                    } else {
+                        r.verdict = Verdict::Fail;
+                        r.detail = format!("{what} 格式异常: {val}");
+                    }
+                    Some(info)
+                }
+                Err(e) => fail(&mut r, e),
+            }
+        }
         TestItem::SdCard => match exec(&CameraFactory::SdCard.device_cmd()) {
             Ok(out) => {
                 r.verdict = bool_verdict(protocol::sdcard_ok(&out));

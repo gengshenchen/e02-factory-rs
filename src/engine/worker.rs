@@ -2,7 +2,7 @@
 //! 经 [`UiEvent`] 回传状态；人工判定阻塞等待 [`UiResponse`]。
 
 use crate::adb;
-use crate::config::{Config, IperfDir, KeysCfg, ThroughputCfg, WifiCfg};
+use crate::config::{Config, IperfDir, KeysCfg, ModelKind, ThroughputCfg, WifiCfg};
 use crate::engine::events::{UiEvent, UiResponse};
 use crate::engine::runner::{self, RunOutcome};
 use crate::engine::{TestItem, TestResult, Verdict};
@@ -105,6 +105,8 @@ pub fn run_sequence(
                                                 // 测完留完整报告（产线返修定位需要），冲突机不动台账、报告文件名加
                                                 // "-冲突"后缀避免覆盖原机报告。台账每次变更前从磁盘重读：设置窗可
                                                 // 在测试中开合，避免收尾回填覆盖中途的删/清操作。
+                                                // 型号（V3.14）：自动按固件名识别，设备信息读到 soft-ware 后切换
+    let mut model = current_model(cfg, &device);
     let ledger_path = ledger::path_of(cfg);
     let mut binding_done = false;
     maybe_bind(
@@ -112,6 +114,7 @@ pub fn run_sequence(
         &mut binding_done,
         &ledger_path,
         &device,
+        model,
         &mut results,
         tx,
     );
@@ -151,11 +154,22 @@ pub fn run_sequence(
         )));
         if let Some(d) = &dev {
             device.merge(d.clone());
+            // 型号切换（设备信息带回固件名）：绑定对与报告前缀随型号走
+            let detected = current_model(cfg, &device);
+            if detected != model {
+                model = detected;
+                let _ = tx.send(UiEvent::Log(format!(
+                    "识别到型号 {}（soft-ware: {}）",
+                    model.label(),
+                    clip(&device.t32_ver, 40)
+                )));
+            }
             maybe_bind(
                 cfg.binding.enable,
                 &mut binding_done,
                 &ledger_path,
                 &device,
+                model,
                 &mut results,
                 tx,
             );
@@ -166,7 +180,7 @@ pub fn run_sequence(
         // 重测覆盖更新，SN 中途解析到后改名并删旧文件（V3.2）
         let _ = write_update(
             reports_dir,
-            &meta(cfg, started_wall, started),
+            &meta(cfg, model, started_wall, started),
             &device,
             &results,
             false,
@@ -205,7 +219,7 @@ pub fn run_sequence(
     }
     write_update(
         reports_dir,
-        &meta(cfg, started_wall, started),
+        &meta(cfg, model, started_wall, started),
         &device,
         &results,
         true,
@@ -232,7 +246,8 @@ fn write_update(
     path
 }
 
-/// 绑定校验执行一次（V3.13）：蓝牙与 WiFi 地址都齐备且本轮未校验过。
+/// 绑定校验执行一次（V3.13；V3.14 型号化绑定对）：蓝牙 MAC 与绑定对
+/// 另一半（E02=WiFi MAC，E02E=IMEI）都齐备且本轮未校验过。
 /// 结果行进序列/报告；台账即时落盘（应用随时可能被关），变更前重读
 /// 磁盘（设置窗可能在测试中改台账）。
 fn maybe_bind(
@@ -240,17 +255,24 @@ fn maybe_bind(
     done: &mut bool,
     ledger_path: &Path,
     device: &DeviceInfo,
+    model: ModelKind,
     results: &mut Vec<TestResult>,
     tx: &Sender<UiEvent>,
 ) {
-    if *done || !enable || device.bt_mac.is_empty() || device.wifi_mac.is_empty() {
+    let partner_kind = if model.has_wifi() { "WiFi" } else { "IMEI" };
+    let partner = if model.has_wifi() {
+        device.wifi_mac.as_str()
+    } else {
+        device.imei.as_str()
+    };
+    if *done || !enable || device.bt_mac.is_empty() || partner.is_empty() {
         return;
     }
     *done = true;
     let now = report::time_str(SystemTime::now());
     let mut ledger = Ledger::load(ledger_path);
     let mut r = TestResult::new(TestItem::Binding);
-    match ledger.bind(&device.bt_mac, &device.wifi_mac, &device.sn, &now) {
+    match ledger.bind(&device.bt_mac, partner, model.label(), &device.sn, &now) {
         BindCheck::New => {
             r.verdict = Verdict::Pass;
             r.detail = "新设备入账".into();
@@ -262,15 +284,15 @@ fn maybe_bind(
         BindCheck::BtConflict { other } => {
             r.verdict = Verdict::Fail;
             r.detail = format!(
-                "该蓝牙地址已绑定 WiFi {}（首见 {}，已测 {} 次），不同设备烧了同一蓝牙地址",
-                other.wifi_mac, other.first_seen, other.tests
+                "该蓝牙地址已绑定{} {}（首见 {}，已测 {} 次），不同设备烧了同一蓝牙地址",
+                partner_kind, other.partner, other.first_seen, other.tests
             );
         }
-        BindCheck::WifiConflict { other } => {
+        BindCheck::PartnerConflict { other } => {
             r.verdict = Verdict::Fail;
             r.detail = format!(
-                "该 WiFi 地址已绑定蓝牙 {}（首见 {}，已测 {} 次），不同设备烧了同一 WiFi 地址",
-                other.bt_mac, other.first_seen, other.tests
+                "该{}已绑定蓝牙 {}（首见 {}，已测 {} 次），不同设备烧了同一地址",
+                partner_kind, other.bt_mac, other.first_seen, other.tests
             );
         }
     }
@@ -287,6 +309,17 @@ fn maybe_bind(
     upsert(results, r);
 }
 
+/// 当前型号（V3.14）：手动锁定（auto=false）优先；否则按固件名识别，
+/// 识别不到维持默认 E02。
+fn current_model(cfg: &Config, device: &DeviceInfo) -> ModelKind {
+    if !cfg.model.auto {
+        if let Some(m) = cfg.model.locked {
+            return m;
+        }
+    }
+    ModelKind::detect(&device.t32_ver).unwrap_or_default()
+}
+
 /// 秒数 → 超时选项（0 = 不限制）。
 fn timeout_opt(secs: u64) -> Option<Duration> {
     (secs > 0).then(|| Duration::from_secs(secs))
@@ -300,9 +333,15 @@ fn timeout_desc(secs: u64) -> String {
     }
 }
 
-fn meta(cfg: &Config, started_wall: SystemTime, started: Instant) -> report::ReportMeta {
+fn meta(
+    cfg: &Config,
+    model: ModelKind,
+    started_wall: SystemTime,
+    started: Instant,
+) -> report::ReportMeta {
     report::ReportMeta {
         station: cfg.station.clone(),
+        model,
         started: report::time_str(started_wall),
         elapsed_secs: started.elapsed().as_secs(),
     }
@@ -2630,7 +2669,7 @@ mod tests {
         let text2 = std::fs::read_to_string(&p2).unwrap();
         assert!(text2.contains("MAC 绑定:FAIL"), "{text2}");
         assert!(
-            text2.contains("该蓝牙地址已绑定 WiFi 00:60:A7:0B:9C:F2"),
+            text2.contains("该蓝牙地址已绑定WiFi 00:60:A7:0B:9C:F2"),
             "{text2}"
         );
         assert!(text2.contains("结果: FAIL"), "{text2}");
@@ -2652,6 +2691,121 @@ mod tests {
 
         std::env::remove_var("ADB");
         std::env::remove_var("WIFI_MAC");
+        crate::exec::clear_abort();
+        let _ = std::fs::remove_dir_all(&base_dir);
+    }
+
+    /// E02E（eSIM 型，V3.14）全链：固件名自动识别型号 → 蓝牙↔IMEI 绑定
+    /// （不同 IMEI 判冲突）→ IMEI/CCID 走 camera-factory 20 → 报告
+    /// e02e- 前缀 + E02E 标题。假 adb 同前，20 的值由环境变量切换。
+    #[test]
+    fn e02e_model_flow_and_imei_binding() {
+        let _g = crate::exec::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::exec::clear_abort();
+        let base_dir = std::env::temp_dir().join(format!("e02-e02e-{}", std::process::id()));
+        let reports = base_dir.join("reports");
+        std::fs::create_dir_all(&reports).unwrap();
+        let ledger_path = base_dir.join("ledger.json");
+        let script = base_dir.join("adb-e02e");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\ncase \"$*\" in\n\
+             *\"camera-factory 3\"*) printf 'sn-address:00001\\nsoft-ware:E02E-1.0.1\\n';;\n\
+             *\"camera-factory 10\"*) printf 'MAC:0011A3B4C5D6\\n';;\n\
+             *\"camera-factory 17\"*) printf 'qmi8658 slave = 0x6a\\ngyroscope-test:true\\n';;\n\
+             *\"camera-factory 20\"*) printf 'imei:%s\\nccid:%s\\n' \"$E_IMEI\" \"$E_CCID\";;\n\
+             *) printf 'ok\\n';;\nesac\n",
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::env::set_var("ADB", &script);
+
+        let run = |imei: &str| -> (Option<PathBuf>, Vec<(TestItem, Verdict)>) {
+            std::env::set_var("E_IMEI", imei);
+            std::env::set_var("E_CCID", "89860115123456789012");
+            let mut cfg = Config::default();
+            cfg.binding.ledger_path = Some(ledger_path.to_string_lossy().into_owned());
+            // e02e 产线模板的项集（陀螺仪 + IMEI + CCID + 身份来源）
+            let items = vec![
+                TestItem::DeviceInfo,
+                TestItem::BtMac,
+                TestItem::Gyro,
+                TestItem::Imei,
+                TestItem::Ccid,
+            ];
+            let (tx, rx) = mpsc::channel();
+            let (_mtx, mrx) = mpsc::channel();
+            let (m, r) = (base_dir.join("media"), reports.clone());
+            let handle = thread::spawn(move || {
+                run_sequence(&items, &tx, &mrx, &m, &r, &cfg, RunBase::default())
+            });
+            let mut verdicts = Vec::new();
+            while let Ok(ev) = rx.recv_timeout(Duration::from_secs(30)) {
+                if let UiEvent::Result(res, _) = ev {
+                    verdicts.push((res.item, res.verdict));
+                }
+            }
+            (handle.join().unwrap(), verdicts)
+        };
+
+        // 1) 新机：型号自动识别为 E02E，蓝牙↔IMEI 入账，报告 e02e- 前缀
+        let (p1, v1) = run("864192051234567");
+        let p1 = p1.expect("E02E 新机应产出报告");
+        let name1 = p1.to_string_lossy();
+        assert!(name1.contains("e02e-"), "{name1}");
+        assert!(name1.ends_with("-0011A3B4C5D6.txt"), "{name1}");
+        assert!(v1.contains(&(TestItem::Binding, Verdict::Pass)), "{v1:?}");
+        assert!(v1.contains(&(TestItem::Imei, Verdict::Pass)), "{v1:?}");
+        assert!(v1.contains(&(TestItem::Ccid, Verdict::Pass)), "{v1:?}");
+        assert!(v1.contains(&(TestItem::Gyro, Verdict::Pass)), "{v1:?}");
+        let text1 = std::fs::read_to_string(&p1).unwrap();
+        assert!(text1.contains("E02E 工厂测试报告"), "{text1}");
+        assert!(text1.contains("MAC 绑定:PASS 新设备入账"), "{text1}");
+        assert!(text1.contains("imei:864192051234567"), "{text1}");
+        assert!(text1.contains("ccid:89860115123456789012"), "{text1}");
+        assert!(text1.contains("IMEI:PASS"), "{text1}");
+        assert!(text1.contains("CCID:PASS"), "{text1}");
+        assert!(text1.contains("陀螺仪测试:PASS"), "{text1}");
+        assert!(text1.contains("结果: PASS"), "{text1}");
+        let rec = Ledger::load(&ledger_path).recent(5)[0].clone();
+        assert_eq!(rec.partner, "864192051234567", "E02E 绑定对 = 蓝牙↔IMEI");
+        assert_eq!(rec.model, "E02E");
+
+        // 2) 同蓝牙不同 IMEI：判冲突（绑定对是 IMEI 不是 WiFi），台账不动
+        let (p2, v2) = run("864192051234999");
+        let p2 = p2.expect("冲突机也应产出报告");
+        let name2 = p2.to_string_lossy();
+        assert!(name2.contains("0011A3B4C5D6-冲突"), "{name2}");
+        assert_ne!(p1, p2, "冲突机不得覆盖原机报告");
+        assert!(v2.contains(&(TestItem::Binding, Verdict::Fail)), "{v2:?}");
+        let text2 = std::fs::read_to_string(&p2).unwrap();
+        assert!(
+            text2.contains("该蓝牙地址已绑定IMEI 864192051234567"),
+            "{text2}"
+        );
+        assert!(text2.contains("结果: FAIL"), "{text2}");
+        assert_eq!(Ledger::load(&ledger_path).len(), 1, "冲突不入账");
+
+        // 3) 原对复测：放行计数，报告覆盖同份
+        let (p3, v3) = run("864192051234567");
+        assert_eq!(p3.as_ref(), Some(&p1), "同机复测覆盖同一份报告");
+        assert!(v3.contains(&(TestItem::Binding, Verdict::Pass)), "{v3:?}");
+        let text3 = std::fs::read_to_string(&p1).unwrap();
+        assert!(
+            text3.contains("MAC 绑定:PASS 同机复测（第 2 次）"),
+            "{text3}"
+        );
+        let l = Ledger::load(&ledger_path);
+        assert_eq!(l.recent(5)[0].tests, 2);
+
+        std::env::remove_var("ADB");
+        std::env::remove_var("E_IMEI");
+        std::env::remove_var("E_CCID");
         crate::exec::clear_abort();
         let _ = std::fs::remove_dir_all(&base_dir);
     }

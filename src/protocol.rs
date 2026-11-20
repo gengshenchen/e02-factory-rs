@@ -27,6 +27,9 @@ pub enum CameraFactory {
     Gyro = 17,
     /// 时间校准（配合宿主机 date -s 下发时间后执行）
     TimeSync = 19,
+    /// 打印 CCID 与 IMEI（V3.14 E02E eSIM 型；输出按 `imei:`/`ccid:` 前缀
+    /// 解析，格式真机联调时校准）
+    CcidImei = 20,
 }
 
 impl CameraFactory {
@@ -49,10 +52,16 @@ pub struct DeviceInfo {
     pub t32_ver: String,
     pub hardware_ver: String,
     pub battery: String,
+    /// eSIM 型（E02E）IMEI，`camera-factory 20` 读（V3.14）
+    #[serde(default)]
+    pub imei: String,
+    /// eSIM 型（E02E）CCID，`camera-factory 20` 读（V3.14）
+    #[serde(default)]
+    pub ccid: String,
 }
 
 impl DeviceInfo {
-    /// 用非空字段覆盖合并（camera-factory 3 与 10 返回的字段子集不同）。
+    /// 用非空字段覆盖合并（camera-factory 3 / 10 / 20 返回的字段子集不同）。
     pub fn merge(&mut self, other: DeviceInfo) {
         let DeviceInfo {
             sn,
@@ -61,6 +70,8 @@ impl DeviceInfo {
             t32_ver,
             hardware_ver,
             battery,
+            imei,
+            ccid,
         } = other;
         for (dst, src) in [
             (&mut self.sn, sn),
@@ -69,6 +80,8 @@ impl DeviceInfo {
             (&mut self.t32_ver, t32_ver),
             (&mut self.hardware_ver, hardware_ver),
             (&mut self.battery, battery),
+            (&mut self.imei, imei),
+            (&mut self.ccid, ccid),
         ] {
             if !src.is_empty() {
                 *dst = src;
@@ -94,16 +107,43 @@ pub fn parse_device_info(output: &str) -> Result<DeviceInfo> {
             info.bt_mac = v.trim().to_uppercase();
         } else if let Some(v) = line.strip_prefix("Battery voltage:") {
             info.battery = v.trim().to_string();
+        } else if let Some(v) = ci_prefix(line, "imei:") {
+            info.imei = v.trim().to_string();
+        } else if let Some(v) = ci_prefix(line, "ccid:") {
+            info.ccid = v.trim().to_string();
         }
     }
     let has_any = !(info.sn.is_empty()
         && info.wifi_mac.is_empty()
         && info.bt_mac.is_empty()
-        && info.t32_ver.is_empty());
+        && info.t32_ver.is_empty()
+        && info.imei.is_empty()
+        && info.ccid.is_empty());
     if !has_any {
         bail!("输出中未找到任何设备信息字段: {output:?}");
     }
     Ok(info)
+}
+
+/// 大小写不敏感的行前缀（imei:/ccid: 固件大小写未定，联调前放宽）。
+fn ci_prefix<'a>(line: &'a str, prefix: &str) -> Option<&'a str> {
+    if line.len() >= prefix.len() && line[..prefix.len()].eq_ignore_ascii_case(prefix) {
+        Some(&line[prefix.len()..])
+    } else {
+        None
+    }
+}
+
+/// IMEI 格式（V3.14 E02E）：纯数字 14–16 位（标称 15；容差到联调校准）。
+pub fn imei_valid(s: &str) -> bool {
+    let s = s.trim();
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) && (14..=16).contains(&s.len())
+}
+
+/// CCID 格式（V3.14 E02E）：纯数字 18–22 位（标称 19/20；容差到联调校准）。
+pub fn ccid_valid(s: &str) -> bool {
+    let s = s.trim();
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) && (18..=22).contains(&s.len())
 }
 
 /// 电池测试（camera-factory 12，V3.5）：收集输出中含 电压/电流 关键词的行，
@@ -449,6 +489,41 @@ mod tests {
     fn parse_bt_mac_line() {
         let d = parse_device_info("MAC:0012a3b4c5d6").unwrap();
         assert_eq!(d.bt_mac, "0012A3B4C5D6");
+    }
+
+    /// V3.14 E02E：`camera-factory 20` 一次打印 CCID 与 IMEI（用户口述，
+    /// 具体格式真机联调时校准），按 imei:/ccid: 前缀解析、大小写不敏感。
+    #[test]
+    fn parse_ccid_imei_and_validity() {
+        assert_eq!(CameraFactory::CcidImei.device_cmd(), "camera-factory 20");
+        // 常规大小写
+        let d = parse_device_info("imei:864192051234567\nccid:89860115123456789012\n").unwrap();
+        assert_eq!(d.imei, "864192051234567");
+        assert_eq!(d.ccid, "89860115123456789012");
+        // 大写前缀（固件大小写未定，ci_prefix 放宽）
+        let d = parse_device_info("IMEI:864192051234568\r\nCCID:89860115123456789013\r\n").unwrap();
+        assert_eq!(d.imei, "864192051234568");
+        assert_eq!(d.ccid, "89860115123456789013");
+        // 只有 imei/ccid 也算有效输出（has_any）
+        assert!(parse_device_info("").is_err());
+        // IMEI 校验：标称 15 位，容差 14–16
+        assert!(imei_valid("864192051234567"));
+        assert!(imei_valid(" 864192051234567 "));
+        assert!(!imei_valid("8641920512345")); // 13 位
+        assert!(imei_valid("86419205123456")); // 14 位（下界）
+        assert!(imei_valid("8641920512345678")); // 16 位（上界）
+        assert!(!imei_valid("86419205123456789")); // 17 位
+        assert!(!imei_valid("86419205123456a")); // 含字母
+        assert!(!imei_valid(""));
+        // CCID 校验：标称 19/20 位，容差 18–22
+        assert!(ccid_valid("8986011512345678901")); // 19 位
+        assert!(ccid_valid("89860115123456789012")); // 20 位
+        assert!(!ccid_valid("89860115123456789")); // 17 位
+        assert!(ccid_valid("898601151234567890")); // 18 位（下界）
+        assert!(ccid_valid("8986011512345678901234")); // 22 位（上界）
+        assert!(!ccid_valid("89860115123456789012345")); // 23 位
+        assert!(!ccid_valid("89860115123456789a"));
+        assert!(!ccid_valid(""));
     }
 
     #[test]

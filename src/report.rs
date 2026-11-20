@@ -5,6 +5,7 @@
 //! 每项耗时。报告中心（今日统计 + 历史浏览）解析同格式——格式由本
 //! 模块单向生成，自产自销，不再附带 JSON（V2 预留的 MES 对接暂无需求）。
 
+use crate::config::ModelKind;
 use crate::engine::{TestItem, TestResult, Verdict};
 use crate::protocol::DeviceInfo;
 use chrono::{DateTime, Local, Utc};
@@ -16,6 +17,8 @@ use std::time::SystemTime;
 pub struct ReportMeta {
     /// 工位名（来自 config）
     pub station: String,
+    /// 产品型号（V3.14：标题/文件名前缀按型号）
+    pub model: ModelKind,
     /// 序列开始（本地时间，文件名同款格式）
     pub started: String,
     pub elapsed_secs: u64,
@@ -57,7 +60,7 @@ pub fn render_text(
     finished: bool,
 ) -> String {
     let mut s = String::new();
-    s.push_str("E02 工厂测试报告\n");
+    s.push_str(&format!("{} 工厂测试报告\n", meta.model.label()));
     s.push_str(&format!("结果: {}\n", overall(results, finished)));
     s.push_str(&format!(
         "工位: {}    开始: {}    耗时: {:02}:{:02}:{:02}\n",
@@ -70,6 +73,13 @@ pub fn render_text(
     s.push_str(&format!("sn-address:{}\n", device.sn));
     s.push_str(&format!("wifi-mac:{}\n", device.wifi_mac));
     s.push_str(&format!("bt-mac:{}\n", device.bt_mac));
+    // E02E（eSIM 型）专属身份字段（V3.14）：读到才落行，E02 报告不出现
+    if !device.imei.is_empty() {
+        s.push_str(&format!("imei:{}\n", device.imei));
+    }
+    if !device.ccid.is_empty() {
+        s.push_str(&format!("ccid:{}\n", device.ccid));
+    }
     s.push_str(&format!("soft-ware:{}\n", device.t32_ver));
     s.push_str(&format!("hard-ware:{}\n", device.hardware_ver));
     s.push('\n');
@@ -143,7 +153,7 @@ fn file_name(meta: &ReportMeta, device: &DeviceInfo, results: &[TestResult]) -> 
             mac
         }
     };
-    format!("e02-{day}-{tail}.txt")
+    format!("{}-{day}-{tail}.txt", meta.model.file_prefix())
 }
 
 /// 绑定冲突（V3.13）：MAC 绑定行判 FAIL（同址不同对），报告文件名加后缀。
@@ -181,17 +191,20 @@ pub struct DayStats {
     pub fail: usize,
 }
 
-/// 扫描 `dir` 下文件名为 `e02-<day>-*.txt` 的报告，按"结果:"行统计。
-/// 解析不到"结果:"行的旧版/中断报告计入 total 不计入 pass/fail。
+/// 扫描 `dir` 下文件名为 `<prefix>-<day>-*.txt`（e02-/e02e- 均计）的报告，
+/// 按"结果:"行统计。解析不到"结果:"行的旧版/中断报告计入 total 不计入
+/// pass/fail。
 pub fn scan_stats(dir: &Path, day: &str) -> DayStats {
     let mut s = DayStats::default();
     let Ok(entries) = std::fs::read_dir(dir) else {
         return s;
     };
+    let day_mark = format!("-{day}-");
     for e in entries.flatten() {
         let name = e.file_name();
         let Some(name) = name.to_str() else { continue };
-        if !name.starts_with(&format!("e02-{day}-")) || !name.ends_with(".txt") {
+        // V3.14：型号前缀族（e02 / e02e）都计入今日统计
+        if !name.starts_with(ModelKind::E02.file_prefix()) || !name.contains(&day_mark) {
             continue;
         }
         s.total += 1;
@@ -209,12 +222,13 @@ pub fn scan_stats(dir: &Path, day: &str) -> DayStats {
 }
 
 /// 报告列表（新→旧，文件名时间戳前缀字典序倒排即时间倒序），最多 `limit` 条。
+/// V3.14：e02- 与 e02e-（型号前缀族）都列出。
 pub fn list_reports(dir: &Path, limit: usize) -> Vec<PathBuf> {
     let mut names: Vec<String> = std::fs::read_dir(dir)
         .map(|rd| {
             rd.flatten()
                 .filter_map(|e| e.file_name().into_string().ok())
-                .filter(|n| n.starts_with("e02-") && n.ends_with(".txt"))
+                .filter(|n| n.starts_with(ModelKind::E02.file_prefix()) && n.ends_with(".txt"))
                 .collect()
         })
         .unwrap_or_default();
@@ -260,6 +274,7 @@ mod tests {
     fn meta() -> ReportMeta {
         ReportMeta {
             station: "complete".into(),
+            model: crate::config::ModelKind::E02,
             started: "20261022-103012".into(),
             elapsed_secs: 155,
         }

@@ -127,6 +127,8 @@ pub struct E02App {
     pub ledger_view: crate::ledger::Ledger,
     /// 台账"清空"两步确认状态（true = 已点一次，按钮显示"确认清空？"）
     pub ledger_clear_armed: bool,
+    /// 当前型号（V3.14）：设备信息读到固件名后自动切换（或手动锁定）
+    pub model: config::ModelKind,
     event_rx: Option<Receiver<UiEvent>>,
     /// 在位监测线程事件（V3.8）
     dev_rx: Receiver<DevState>,
@@ -150,6 +152,7 @@ impl E02App {
                 Some(format!("配置加载失败，已用内置默认: {e:#}")),
             ),
         };
+        let model = cfg.model.locked.unwrap_or_default();
         let mut app = Self {
             device: DeviceInfo::default(),
             dev: DevState::Disconnected,
@@ -172,6 +175,7 @@ impl E02App {
             report_text: None,
             ledger_view: crate::ledger::Ledger::default(),
             ledger_clear_armed: false,
+            model,
             event_rx: None,
             dev_rx,
             manual_tx: None,
@@ -193,11 +197,12 @@ impl E02App {
     }
 
     /// 开始测试项集：当前工位启用项，按原程序批次顺序执行。
+    /// V3.14：按当前型号过滤不可用项（配置串了型号也不会跑必 FAIL 项）。
     pub fn batch_items(&self) -> Vec<TestItem> {
         let active = self.config.active_items();
         worker::BATCH_ORDER
             .into_iter()
-            .filter(|i| active.contains(i))
+            .filter(|i| active.contains(i) && i.available_for(self.model))
             .collect()
     }
 
@@ -433,6 +438,14 @@ impl E02App {
             UiEvent::Result(r, dev) => {
                 if let Some(d) = dev {
                     self.device.merge(d);
+                    // 型号自动识别（V3.14）：与 worker 同规则，UI 过滤随型号切换
+                    if self.config.model.auto {
+                        if let Some(m) = config::ModelKind::detect(&self.device.t32_ver) {
+                            self.model = m;
+                        }
+                    } else if let Some(m) = self.config.model.locked {
+                        self.model = m;
+                    }
                 }
                 if let Some(p) = &mut self.progress {
                     p.done += 1;

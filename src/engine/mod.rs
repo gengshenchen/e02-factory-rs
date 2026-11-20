@@ -64,13 +64,17 @@ pub enum TestItem {
     MicSpeaker,
     Keys,
     Gyro,
+    /// eSIM 型（E02E）IMEI 读取校验（camera-factory 20，V3.14）
+    Imei,
+    /// eSIM 型（E02E）CCID 读取校验（camera-factory 20，V3.14）
+    Ccid,
     /// MAC 绑定台账校验（虚拟项，worker 内联执行）
     Binding,
 }
 
 impl TestItem {
-    /// 侧栏顺序对应原对话框按钮排列 + 陀螺仪。
-    pub const ALL: [TestItem; 11] = [
+    /// 侧栏顺序对应原对话框按钮排列 + 陀螺仪 + E02E eSIM 项。
+    pub const ALL: [TestItem; 13] = [
         TestItem::Video,
         TestItem::Photo,
         TestItem::DeviceInfo,
@@ -82,6 +86,8 @@ impl TestItem {
         TestItem::MicSpeaker,
         TestItem::Keys,
         TestItem::Gyro,
+        TestItem::Imei,
+        TestItem::Ccid,
     ];
 
     pub fn label(self) -> &'static str {
@@ -97,6 +103,8 @@ impl TestItem {
             TestItem::MicSpeaker => "麦克风测试",
             TestItem::Keys => "按键测试",
             TestItem::Gyro => "陀螺仪测试",
+            TestItem::Imei => "IMEI",
+            TestItem::Ccid => "CCID",
             TestItem::Binding => "MAC 绑定",
         }
     }
@@ -115,7 +123,19 @@ impl TestItem {
             TestItem::MicSpeaker => "mic",
             TestItem::Keys => "keys",
             TestItem::Gyro => "gyro",
+            TestItem::Imei => "imei",
+            TestItem::Ccid => "ccid",
             TestItem::Binding => "binding",
+        }
+    }
+
+    /// 型号可用性（V3.14）：E02E 无 WiFi 模组；E02 无 eSIM（IMEI/CCID
+    /// 读不到必 FAIL）。设置勾选、工位模板、执行序列统一按此过滤。
+    pub fn available_for(self, model: crate::config::ModelKind) -> bool {
+        match self {
+            TestItem::Imei | TestItem::Ccid => model == crate::config::ModelKind::E02e,
+            TestItem::Wifi => model.has_wifi(),
+            _ => true,
         }
     }
 
