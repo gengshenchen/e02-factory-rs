@@ -162,11 +162,33 @@ fn test_cmd(
             }
         }
     };
-    match adb::devices() {
-        Ok(devs) if !devs.is_empty() => println!("在线设备: {}", devs.join(", ")),
-        Ok(_) => eprintln!("警告：无 adb 在线设备"),
-        Err(e) => eprintln!("警告：{e:#}"),
-    }
+    // 设备定向（V3.15）：唯一在线设备锁定为 adb 目标（中途插入其他
+    // 设备不打断）；多台时明确报错（adb 多设备无 -s 会逐条报
+    // more than one device）；用户自设 ANDROID_SERIAL 时不覆盖
+    let user_serial = std::env::var_os("ANDROID_SERIAL").filter(|s| !s.is_empty());
+    let serial = match (adb::devices(), user_serial) {
+        (_, Some(_)) => None,
+        (Ok(devs), None) if devs.len() == 1 => {
+            println!("在线设备: {}", devs[0]);
+            Some(devs[0].clone())
+        }
+        (Ok(devs), None) if !devs.is_empty() => {
+            eprintln!(
+                "多台设备在线: {}（只留一台被测耳机，或先设 ANDROID_SERIAL 再运行）",
+                devs.join(", ")
+            );
+            return 2;
+        }
+        (Ok(_), None) => {
+            eprintln!("警告：无 adb 在线设备");
+            None
+        }
+        (Err(e), None) => {
+            eprintln!("警告：{e:#}");
+            None
+        }
+    };
+    let _target = adb::TargetGuard::new(serial);
 
     // 单项超时（V2.3）：与 GUI worker 同一子进程看门狗
     let t = cfg.timeouts.item_secs;

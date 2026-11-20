@@ -241,6 +241,12 @@ impl E02App {
         let reports = self.reports_dir.clone();
         let n = items.len();
         let cfg = self.config.clone();
+        // 设备定向（V3.15）：锁定开始时在线的被测序列号，测试中途电脑上
+        // 插入其他 adb 设备不打断测试（adb 多设备无 -s 直接报错）
+        let serial = match &self.dev {
+            DevState::Online(sn) => Some(sn.clone()),
+            _ => None,
+        };
         // 单项补测以当前整机结果为底稿（V3.9）：测完按项合并、重写整机
         // 报告，不另散一份单项报告；全测从空白开始
         let base = if items.len() == 1 {
@@ -258,7 +264,8 @@ impl E02App {
             worker::RunBase::default()
         };
         thread::spawn(move || {
-            let report = worker::run_sequence(&items, &tx, &mrx, &media, &reports, &cfg, base);
+            let report =
+                worker::run_sequence(&items, &tx, &mrx, &media, &reports, &cfg, base, serial);
             let _ = tx.send(UiEvent::Finished { report });
         });
         self.push_log(format!("开始测试，共 {n} 项（自动项先行，人工项弹窗判定）"));

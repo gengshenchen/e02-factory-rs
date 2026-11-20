@@ -8,6 +8,50 @@ use anyhow::{bail, Context, Result};
 use std::path::Path;
 use std::process::Command;
 
+/// 被测设备序列号（V3.15）：测试开始时锁定，此后所有 adb 子命令注入
+/// `ANDROID_SERIAL` 定向到这台设备——测试中途电脑上插入/出现其他 adb
+/// 设备时，adb 不再报 "more than one device/emulator" 打断测试
+/// （真机 18:24 案：第二台设备中途上线 13 秒，SD 卡/电池/录像被打断）。
+/// None = 不定向（单设备默认行为，`adb devices` 等列举不受影响）。
+static TARGET: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// 设定/清除被测设备定向。
+pub fn set_target(serial: Option<String>) {
+    *TARGET.lock().unwrap_or_else(|e| e.into_inner()) = serial;
+}
+
+/// 当前被测设备序列号。
+pub fn target() -> Option<String> {
+    TARGET.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// 测试序列作用域的设备定向：构造时锁定、Drop 时恢复之前的值，
+/// panic 也不泄漏（worker 线程 panic 后下一次运行不受影响）。
+pub struct TargetGuard(Option<String>);
+
+impl TargetGuard {
+    pub fn new(serial: Option<String>) -> Self {
+        let prev = target();
+        set_target(serial);
+        Self(prev)
+    }
+}
+
+impl Drop for TargetGuard {
+    fn drop(&mut self) {
+        set_target(self.0.take());
+    }
+}
+
+/// 给设备选择类 adb 命令注入定向环境（逐命令注入，不污染进程环境，
+/// 不影响 `adb devices` 列举与其他 adb 调用方）。
+fn directed(cmd: &mut Command) -> &mut Command {
+    if let Some(s) = target() {
+        cmd.env("ANDROID_SERIAL", s);
+    }
+    cmd
+}
+
 /// adb 可执行文件路径；环境变量 `ADB` 可覆盖（非常规安装路径/测试桩）。
 fn adb_path() -> String {
     std::env::var("ADB").unwrap_or_else(|_| "adb".into())
@@ -26,7 +70,8 @@ pub fn shell_timeout(cmd: &str, timeout: std::time::Duration) -> Result<String> 
 }
 
 fn shell_inner(cmd: &str, timeout: Option<std::time::Duration>) -> Result<String> {
-    let out = match exec::output(Command::new(adb_path()).arg("shell").arg(cmd), timeout) {
+    let mut c = Command::new(adb_path());
+    let out = match exec::output(directed(&mut c).arg("shell").arg(cmd), timeout) {
         Ok(o) => o,
         // NotFound 才提示 PATH（真机 18:44 超时错误也挂着这提示，误导排查）
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -48,7 +93,8 @@ fn shell_inner(cmd: &str, timeout: Option<std::time::Duration>) -> Result<String
 /// 新版固件的 13/14 回环进程存活期间才有声音、不再自动退出；
 /// 调用方拿到 Child 自行读输出、在人工应答后 kill 结束回环。
 pub fn spawn_shell(cmd: &str) -> Result<std::process::Child> {
-    Command::new(adb_path())
+    let mut c = Command::new(adb_path());
+    directed(&mut c)
         .arg("shell")
         .arg(cmd)
         .stdout(std::process::Stdio::piped())
@@ -59,8 +105,9 @@ pub fn spawn_shell(cmd: &str) -> Result<std::process::Child> {
 
 /// `adb pull <remote> <local>`。
 pub fn pull(remote: &str, local: &Path) -> Result<()> {
+    let mut c = Command::new(adb_path());
     let out = exec::output(
-        Command::new(adb_path()).args(["pull", remote]).arg(local),
+        directed(&mut c).args(["pull", remote]).arg(local),
         exec::default_timeout(),
     )
     .with_context(|| format!("adb pull {remote} 失败"))?;
@@ -75,8 +122,9 @@ pub fn pull(remote: &str, local: &Path) -> Result<()> {
 
 /// `adb push <local> <remote>`（写设备侧文件，WiFi 配网用）。
 pub fn push(local: &Path, remote: &str) -> Result<()> {
+    let mut c = Command::new(adb_path());
     let out = exec::output(
-        Command::new(adb_path()).arg("push").arg(local).arg(remote),
+        directed(&mut c).arg("push").arg(local).arg(remote),
         exec::default_timeout(),
     )
     .with_context(|| format!("adb push {} 失败", local.display()))?;

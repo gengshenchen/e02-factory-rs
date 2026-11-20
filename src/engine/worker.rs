@@ -73,6 +73,10 @@ pub struct RunBase {
 }
 
 /// 返回报告文件路径；写入失败为 None。
+/// `serial`（V3.15）= 开始时在线的被测设备序列号：序列期间所有 adb
+/// 命令定向到它，中途插入其他设备不打断测试（None = 不定向）。
+// 参数是执行一条序列的全部上下文，聚成结构体反而不易读，豁免条数限制
+#[allow(clippy::too_many_arguments)]
 pub fn run_sequence(
     items: &[TestItem],
     tx: &Sender<UiEvent>,
@@ -81,8 +85,10 @@ pub fn run_sequence(
     reports_dir: &Path,
     cfg: &Config,
     base: RunBase,
+    serial: Option<String>,
 ) -> Option<PathBuf> {
     exec::clear_abort(); // 新序列不残留上一轮的停止请求
+    let _target = crate::adb::TargetGuard::new(serial);
     let _ = std::fs::create_dir_all(media_dir);
     let _ = std::fs::create_dir_all(reports_dir);
     let _ = tx.send(UiEvent::Started);
@@ -1684,6 +1690,7 @@ mod tests {
                 &reports_c,
                 &cfg,
                 RunBase::default(),
+                None,
             )
         });
 
@@ -1884,6 +1891,7 @@ mod tests {
                     &r_c,
                     &Config::default(),
                     RunBase::default(),
+                    None,
                 )
             });
             let (mut waves, mut verdict) = (0usize, None);
@@ -2194,6 +2202,7 @@ mod tests {
                     &r_c,
                     &Config::default(),
                     RunBase::default(),
+                    None,
                 )
             });
             let (mut asked, mut verdict) = (0usize, None);
@@ -2323,6 +2332,7 @@ mod tests {
                 &r_c,
                 &Config::default(),
                 RunBase::default(),
+                None,
             )
         });
         let mut stop_verdicts = Vec::new();
@@ -2368,6 +2378,7 @@ mod tests {
                 &r_g,
                 &Config::default(),
                 RunBase::default(),
+                None,
             )
         });
         let mut gone_verdicts = Vec::new();
@@ -2422,6 +2433,7 @@ mod tests {
                 &r_c,
                 &Config::default(),
                 RunBase::default(),
+                None,
             )
         });
         let mut ks_verdicts = Vec::new();
@@ -2469,6 +2481,7 @@ mod tests {
                 &r_c,
                 &Config::default(),
                 RunBase::default(),
+                None,
             )
         });
         let mut ks_verdicts = Vec::new();
@@ -2517,7 +2530,7 @@ mod tests {
         let (mtx, mrx) = mpsc::channel();
         let (m, r) = (media.to_path_buf(), reports.to_path_buf());
         let handle = thread::spawn(move || {
-            run_sequence(&items, &tx, &mrx, &m, &r, &cfg, RunBase::default())
+            run_sequence(&items, &tx, &mrx, &m, &r, &cfg, RunBase::default(), None)
         });
 
         let (mut verdicts, mut awaiting) = (Vec::new(), 0usize);
@@ -2577,7 +2590,7 @@ mod tests {
         let (_mtx, mrx) = mpsc::channel();
         let (m, r) = (media.clone(), reports.clone());
         let handle = thread::spawn(move || {
-            run_sequence(&items, &tx, &mrx, &m, &r, &Config::default(), base)
+            run_sequence(&items, &tx, &mrx, &m, &r, &Config::default(), base, None)
         });
         let mut verdicts = Vec::new();
         while let Ok(ev) = rx.recv_timeout(Duration::from_secs(30)) {
@@ -2639,7 +2652,7 @@ mod tests {
             let (_mtx, mrx) = mpsc::channel();
             let (m, r) = (base_dir.join("media"), reports.clone());
             let handle = thread::spawn(move || {
-                run_sequence(&items, &tx, &mrx, &m, &r, &cfg, RunBase::default())
+                run_sequence(&items, &tx, &mrx, &m, &r, &cfg, RunBase::default(), None)
             });
             let mut verdicts = Vec::new();
             while let Ok(ev) = rx.recv_timeout(Duration::from_secs(30)) {
@@ -2748,7 +2761,7 @@ mod tests {
             let (_mtx, mrx) = mpsc::channel();
             let (m, r) = (base_dir.join("media"), reports.clone());
             let handle = thread::spawn(move || {
-                run_sequence(&items, &tx, &mrx, &m, &r, &cfg, RunBase::default())
+                run_sequence(&items, &tx, &mrx, &m, &r, &cfg, RunBase::default(), None)
             });
             let mut verdicts = Vec::new();
             while let Ok(ev) = rx.recv_timeout(Duration::from_secs(30)) {
@@ -2810,6 +2823,63 @@ mod tests {
         std::env::remove_var("ADB");
         std::env::remove_var("E_IMEI");
         std::env::remove_var("E_CCID");
+        crate::exec::clear_abort();
+        let _ = std::fs::remove_dir_all(&base_dir);
+    }
+
+    /// 设备定向（V3.15）：run_sequence 带 serial 时所有 adb 子命令注入
+    /// ANDROID_SERIAL。假桩把该环境变量回读成 SN，端到端验证注入生效；
+    /// 序列结束后定向恢复（Guard Drop）。
+    #[test]
+    fn adb_serial_target_directs_commands() {
+        let _g = crate::exec::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::exec::clear_abort();
+        let base_dir = std::env::temp_dir().join(format!("e02-serial-{}", std::process::id()));
+        let reports = base_dir.join("reports");
+        std::fs::create_dir_all(&reports).unwrap();
+        let script = base_dir.join("adb-serial");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\ncase \"$*\" in\n\
+             *\"camera-factory 3\"*) printf 'sn-address:%s\\n' \"$ANDROID_SERIAL\";;\n\
+             *) printf 'ok\\n';;\nesac\n",
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::env::set_var("ADB", &script);
+        let items = vec![TestItem::DeviceInfo];
+        let (tx, rx) = mpsc::channel();
+        let (_mtx, mrx) = mpsc::channel();
+        let (m, r) = (base_dir.join("media"), reports.clone());
+        let handle = thread::spawn(move || {
+            run_sequence(
+                &items,
+                &tx,
+                &mrx,
+                &m,
+                &r,
+                &Config::default(),
+                RunBase::default(),
+                Some("SERIAL123".into()),
+            )
+        });
+        let mut pass = false;
+        while let Ok(ev) = rx.recv_timeout(Duration::from_secs(30)) {
+            if let UiEvent::Result(res, _) = ev {
+                pass = res.verdict == Verdict::Pass;
+            }
+        }
+        let report = handle.join().unwrap().expect("应产出报告");
+        assert!(pass, "设备信息应 PASS（桩回读 ANDROID_SERIAL 作 SN）");
+        let text = std::fs::read_to_string(&report).unwrap();
+        assert!(text.contains("sn-address:SERIAL123"), "{text}");
+        assert_eq!(crate::adb::target(), None, "序列结束应恢复定向");
+        std::env::remove_var("ADB");
         crate::exec::clear_abort();
         let _ = std::fs::remove_dir_all(&base_dir);
     }
