@@ -49,8 +49,8 @@ impl Verdict {
 }
 
 /// 测试项：与 camera-factory 子命令对应（V3.5：充电并入电池、陀螺仪走 17）。
-/// Binding（V3.13）为虚拟项——不发设备命令，蓝牙与 WiFi 地址齐备后由
-/// worker 查绑定台账产生结果行，故不进 ALL（设置/CLI 不可勾选）。
+/// Binding（V3.13）为虚拟项——不发设备命令，蓝牙与绑定对另一半齐备后由
+/// worker 查绑定记录产生结果行，故不进 ALL（设置/CLI 不可勾选）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
 pub enum TestItem {
     Video,
@@ -64,17 +64,16 @@ pub enum TestItem {
     MicSpeaker,
     Keys,
     Gyro,
-    /// eSIM 型（E02E）IMEI 读取校验（camera-factory 20，V3.14）
-    Imei,
-    /// eSIM 型（E02E）CCID 读取校验（camera-factory 20，V3.14）
-    Ccid,
-    /// MAC 绑定台账校验（虚拟项，worker 内联执行）
+    /// eSIM 型（E02E）IMEI/CCID 读取校验（V3.14；V3.14.1 合并为单项：
+    /// camera-factory 20 一条指令同时打印 CCID 与 IMEI，一项一命令）
+    Esim,
+    /// MAC 绑定记录校验（虚拟项，worker 内联执行）
     Binding,
 }
 
 impl TestItem {
     /// 侧栏顺序对应原对话框按钮排列 + 陀螺仪 + E02E eSIM 项。
-    pub const ALL: [TestItem; 13] = [
+    pub const ALL: [TestItem; 12] = [
         TestItem::Video,
         TestItem::Photo,
         TestItem::DeviceInfo,
@@ -86,8 +85,7 @@ impl TestItem {
         TestItem::MicSpeaker,
         TestItem::Keys,
         TestItem::Gyro,
-        TestItem::Imei,
-        TestItem::Ccid,
+        TestItem::Esim,
     ];
 
     pub fn label(self) -> &'static str {
@@ -103,8 +101,7 @@ impl TestItem {
             TestItem::MicSpeaker => "麦克风测试",
             TestItem::Keys => "按键测试",
             TestItem::Gyro => "陀螺仪测试",
-            TestItem::Imei => "IMEI",
-            TestItem::Ccid => "CCID",
+            TestItem::Esim => "IMEI/CCID",
             TestItem::Binding => "MAC 绑定",
         }
     }
@@ -123,8 +120,7 @@ impl TestItem {
             TestItem::MicSpeaker => "mic",
             TestItem::Keys => "keys",
             TestItem::Gyro => "gyro",
-            TestItem::Imei => "imei",
-            TestItem::Ccid => "ccid",
+            TestItem::Esim => "esim",
             TestItem::Binding => "binding",
         }
     }
@@ -133,7 +129,7 @@ impl TestItem {
     /// 读不到必 FAIL）。设置勾选、工位模板、执行序列统一按此过滤。
     pub fn available_for(self, model: crate::config::ModelKind) -> bool {
         match self {
-            TestItem::Imei | TestItem::Ccid => model == crate::config::ModelKind::E02e,
+            TestItem::Esim => model == crate::config::ModelKind::E02e,
             TestItem::Wifi => model.has_wifi(),
             _ => true,
         }

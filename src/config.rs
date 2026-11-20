@@ -207,36 +207,13 @@ impl ModelKind {
     }
 
     /// 按固件名识别型号：`soft-ware:E02E-1.0.1` 前缀匹配，长前缀优先
-    /// （E02E 先于 E02，否则 E02 恒中）。
+    /// （E02E 先于 E02，否则 E02 恒中）。仅用于型号不符提醒（V3.14.1：
+    /// E02E 固件名规律未证实，不作切换/判定依据）。
     pub fn detect(soft_ver: &str) -> Option<ModelKind> {
         let v = soft_ver.trim().to_ascii_uppercase();
         [ModelKind::E02e, ModelKind::E02]
             .into_iter()
             .find(|m| v.starts_with(m.label()))
-    }
-}
-
-/// 型号配置（V3.14）：默认自动按固件名识别；可关自动改手动锁定。
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ModelCfg {
-    /// 自动识别（设备信息读到 soft-ware 后切换型号；识别不到维持现状）
-    #[serde(default = "d_model_auto")]
-    pub auto: bool,
-    /// 手动锁定型号（auto=false 时生效；不锁则用默认 E02）
-    #[serde(default)]
-    pub locked: Option<ModelKind>,
-}
-
-fn d_model_auto() -> bool {
-    true
-}
-
-impl Default for ModelCfg {
-    fn default() -> Self {
-        Self {
-            auto: d_model_auto(),
-            locked: None,
-        }
     }
 }
 
@@ -293,9 +270,9 @@ pub struct Config {
     /// 设备绑定台账（V3.13）
     #[serde(default)]
     pub binding: BindingCfg,
-    /// 型号（V3.14：E02 WiFi 型 / E02E eSIM 型）
+    /// 型号（V3.14：E02 WiFi 型 / E02E eSIM 型；手动选定，缺省 E02）
     #[serde(default)]
-    pub model: ModelCfg,
+    pub model: Option<ModelKind>,
 }
 
 fn d_station() -> String {
@@ -324,12 +301,12 @@ fn d_profiles() -> BTreeMap<String, Profile> {
                 .collect(),
         },
     );
-    // E02E（eSIM 型）产线模板（V3.14）：陀螺仪 + IMEI + CCID，
-    // info/btmac 为身份来源（绑定对 = 蓝牙↔IMEI）
+    // E02E（eSIM 型）产线模板（V3.14）：陀螺仪 + IMEI/CCID（单项，
+    // camera-factory 20 一条指令），info/btmac 为身份来源（绑定对=蓝牙↔IMEI）
     m.insert(
         "e02e".into(),
         Profile {
-            items: vec!["info", "btmac", "gyro", "imei", "ccid"]
+            items: vec!["info", "btmac", "gyro", "esim"]
                 .into_iter()
                 .map(String::from)
                 .collect(),
@@ -348,7 +325,7 @@ impl Default for Config {
             timeouts: TimeoutsCfg::default(),
             conn: ConnCfg::default(),
             binding: BindingCfg::default(),
-            model: ModelCfg::default(),
+            model: None,
         }
     }
 }
@@ -390,13 +367,22 @@ impl Config {
         &self.profiles[&self.station]
     }
 
-    /// 当前工位启用的测试项（未知 slug 忽略）。
+    /// 当前工位启用的测试项（未知 slug 忽略）。设备信息与蓝牙 MAC 是
+    /// 设备身份来源（报告键与绑定对的一半，V3.14.1 必测）：工位档案
+    /// 漏勾也强制带上。
     pub fn active_items(&self) -> Vec<TestItem> {
-        self.active_profile()
+        let mut items: Vec<TestItem> = self
+            .active_profile()
             .items
             .iter()
             .filter_map(|s| TestItem::from_slug(s))
-            .collect()
+            .collect();
+        for must in [TestItem::DeviceInfo, TestItem::BtMac] {
+            if !items.contains(&must) {
+                items.push(must);
+            }
+        }
+        items
     }
 
     pub fn to_toml(&self) -> Result<String> {
@@ -418,7 +404,7 @@ mod tests {
             .filter(|i| i.available_for(ModelKind::E02))
             .count();
         assert_eq!(cfg.active_items().len(), e02_all);
-        assert!(!cfg.active_items().contains(&TestItem::Imei));
+        assert!(!cfg.active_items().contains(&TestItem::Esim));
         let mut module = Config::builtin();
         module.station = "module".into();
         // 模组工位无电池/按键/MIC/录像/陀螺仪
@@ -426,14 +412,25 @@ mod tests {
         assert!(!items.contains(&TestItem::Battery));
         assert!(!items.contains(&TestItem::Keys));
         assert!(items.contains(&TestItem::Wifi));
-        // E02E 工位模板（V3.14）：陀螺仪 + IMEI + CCID + 身份来源项
+        // E02E 工位模板（V3.14）：陀螺仪 + IMEI/CCID 单项 + 身份来源项
         let mut e02e = Config::builtin();
         e02e.station = "e02e".into();
         let items = e02e.active_items();
         assert!(items.contains(&TestItem::Gyro));
-        assert!(items.contains(&TestItem::Imei));
-        assert!(items.contains(&TestItem::Ccid));
+        assert!(items.contains(&TestItem::Esim));
         assert!(!items.contains(&TestItem::Wifi)); // E02E 无 WiFi 模组
+                                                   // 必测项兜底（V3.14.1）：自建档漏勾 info/btmac 也强制补上
+        let mut hand = Config::builtin();
+        hand.profiles.insert(
+            "hand".into(),
+            Profile {
+                items: vec!["led".into()],
+            },
+        );
+        hand.station = "hand".into();
+        let items = hand.active_items();
+        assert!(items.contains(&TestItem::DeviceInfo));
+        assert!(items.contains(&TestItem::BtMac));
     }
 
     #[test]

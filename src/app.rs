@@ -152,7 +152,7 @@ impl E02App {
                 Some(format!("配置加载失败，已用内置默认: {e:#}")),
             ),
         };
-        let model = cfg.model.locked.unwrap_or_default();
+        let model = cfg.model.unwrap_or_default();
         let mut app = Self {
             device: DeviceInfo::default(),
             dev: DevState::Disconnected,
@@ -438,14 +438,8 @@ impl E02App {
             UiEvent::Result(r, dev) => {
                 if let Some(d) = dev {
                     self.device.merge(d);
-                    // 型号自动识别（V3.14）：与 worker 同规则，UI 过滤随型号切换
-                    if self.config.model.auto {
-                        if let Some(m) = config::ModelKind::detect(&self.device.t32_ver) {
-                            self.model = m;
-                        }
-                    } else if let Some(m) = self.config.model.locked {
-                        self.model = m;
-                    }
+                    // 型号固定为设置窗所选（V3.14.1 手动锁定，不随固件名切换；
+                    // 不符提醒由 worker 发日志）
                 }
                 if let Some(p) = &mut self.progress {
                     p.done += 1;

@@ -22,7 +22,7 @@ use std::time::{Duration, Instant, SystemTime};
 /// → 电池 → 陀螺仪；人工项——录像（长动作先启动、回放判定）→ 拍照 →
 /// 指示灯 → 麦克风 → 按键（操作员收尾）。run_sequence 内仍会按
 /// is_manual 稳定排序：自动项先行，人工项按此相对顺序殿后。
-pub const BATCH_ORDER: [TestItem; 12] = [
+pub const BATCH_ORDER: [TestItem; 13] = [
     TestItem::DeviceInfo,
     TestItem::BtMac,
     // 虚拟项（紧随蓝牙 MAC：地址两半齐备即校验）
@@ -31,6 +31,7 @@ pub const BATCH_ORDER: [TestItem; 12] = [
     TestItem::SdCard,
     TestItem::Battery,
     TestItem::Gyro,
+    TestItem::Esim,
     TestItem::Video,
     TestItem::Photo,
     TestItem::Led,
@@ -99,14 +100,18 @@ pub fn run_sequence(
 
     let mut device = base.device;
     let mut results = base.results;
-    results.sort_by_key(|r| batch_pos(r.item)); // 底稿按批序归位，报告行序稳定
-                                                // 绑定台账（V3.13）：蓝牙与 WiFi 地址齐备后校验一次（含单项补测——
-                                                // 底稿 device 已带两地址时开测即校验）。冲突判 FAIL 但不中止：剩余项
-                                                // 测完留完整报告（产线返修定位需要），冲突机不动台账、报告文件名加
-                                                // "-冲突"后缀避免覆盖原机报告。台账每次变更前从磁盘重读：设置窗可
-                                                // 在测试中开合，避免收尾回填覆盖中途的删/清操作。
-                                                // 型号（V3.14）：自动按固件名识别，设备信息读到 soft-ware 后切换
-    let mut model = current_model(cfg, &device);
+    // 底稿按批序归位，报告行序稳定
+    // 绑定记录（V3.13）：蓝牙与绑定对另一半齐备后校验一次（含单项补测——
+    // 底稿 device 已带两地址时开测即校验）。冲突判 FAIL 但不中止：剩余项
+    // 测完留完整报告（产线返修定位需要），冲突机不动记录、报告文件名加
+    // "-冲突"后缀避免覆盖原机报告。记录每次变更前从磁盘重读：设置窗可
+    // 在测试中开合，避免收尾回填覆盖中途的删/清操作。
+    // 型号（V3.14；V3.14.1 改手动锁定）：设置窗选定为准，不随固件名
+    // 自动切换；读到与所选不符的固件名只提醒核对（E02E 固件名规律
+    // 未证实，不作判定依据）
+    results.sort_by_key(|r| batch_pos(r.item));
+    let model = current_model(cfg);
+    let mut model_warned = false;
     let ledger_path = ledger::path_of(cfg);
     let mut binding_done = false;
     maybe_bind(
@@ -154,15 +159,19 @@ pub fn run_sequence(
         )));
         if let Some(d) = &dev {
             device.merge(d.clone());
-            // 型号切换（设备信息带回固件名）：绑定对与报告前缀随型号走
-            let detected = current_model(cfg, &device);
-            if detected != model {
-                model = detected;
-                let _ = tx.send(UiEvent::Log(format!(
-                    "识别到型号 {}（soft-ware: {}）",
-                    model.label(),
-                    clip(&device.t32_ver, 40)
-                )));
+            // 固件名不符提醒（只提醒一次，不影响判定与流程）
+            if !model_warned {
+                if let Some(detected) = ModelKind::detect(&device.t32_ver) {
+                    if detected != model {
+                        model_warned = true;
+                        let _ = tx.send(UiEvent::Log(format!(
+                            "提示：固件名 {} 疑似 {} 型，与所选型号 {} 不符，请核对设置",
+                            clip(&device.t32_ver, 40),
+                            detected.label(),
+                            model.label()
+                        )));
+                    }
+                }
             }
             maybe_bind(
                 cfg.binding.enable,
@@ -297,7 +306,7 @@ fn maybe_bind(
         }
     }
     if let Err(e) = ledger.save(ledger_path) {
-        let _ = tx.send(UiEvent::Log(format!("台账保存失败: {e}")));
+        let _ = tx.send(UiEvent::Log(format!("绑定记录保存失败: {e}")));
     }
     let _ = tx.send(UiEvent::Log(format!(
         "【{}】{} {}",
@@ -309,15 +318,9 @@ fn maybe_bind(
     upsert(results, r);
 }
 
-/// 当前型号（V3.14）：手动锁定（auto=false）优先；否则按固件名识别，
-/// 识别不到维持默认 E02。
-fn current_model(cfg: &Config, device: &DeviceInfo) -> ModelKind {
-    if !cfg.model.auto {
-        if let Some(m) = cfg.model.locked {
-            return m;
-        }
-    }
-    ModelKind::detect(&device.t32_ver).unwrap_or_default()
+/// 当前型号（V3.14；V3.14.1 改手动锁定）：设置窗选定，缺省 E02。
+fn current_model(cfg: &Config) -> ModelKind {
+    cfg.model.unwrap_or_default()
 }
 
 /// 秒数 → 超时选项（0 = 不限制）。
@@ -1745,12 +1748,14 @@ mod tests {
             vec![
                 TestItem::DeviceInfo,
                 TestItem::BtMac,
-                // 虚拟项：蓝牙 MAC 解析到即查台账（V3.13）
+                // 虚拟项：蓝牙 MAC 解析到即查绑定记录（V3.13）
                 TestItem::Binding,
                 TestItem::Wifi,
                 TestItem::SdCard,
                 TestItem::Battery,
-                TestItem::Gyro
+                TestItem::Gyro,
+                // E02E 专属（V3.14.1 单项：camera-factory 20 一条指令）
+                TestItem::Esim
             ]
         );
         let get = |item: TestItem| {
@@ -2695,8 +2700,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base_dir);
     }
 
-    /// E02E（eSIM 型，V3.14）全链：固件名自动识别型号 → 蓝牙↔IMEI 绑定
-    /// （不同 IMEI 判冲突）→ IMEI/CCID 走 camera-factory 20 → 报告
+    /// E02E（eSIM 型，V3.14）全链：型号手动锁定 E02E → 蓝牙↔IMEI 绑定
+    /// （不同 IMEI 判冲突）→ IMEI/CCID 单项走 camera-factory 20 → 报告
     /// e02e- 前缀 + E02E 标题。假 adb 同前，20 的值由环境变量切换。
     #[test]
     fn e02e_model_flow_and_imei_binding() {
@@ -2730,13 +2735,14 @@ mod tests {
             std::env::set_var("E_CCID", "89860115123456789012");
             let mut cfg = Config::default();
             cfg.binding.ledger_path = Some(ledger_path.to_string_lossy().into_owned());
-            // e02e 产线模板的项集（陀螺仪 + IMEI + CCID + 身份来源）
+            // 型号手动锁定 E02E（V3.14.1：不随固件名自动切换）
+            cfg.model = Some(ModelKind::E02e);
+            // e02e 产线模板的项集（陀螺仪 + IMEI/CCID 单项 + 身份来源）
             let items = vec![
                 TestItem::DeviceInfo,
                 TestItem::BtMac,
                 TestItem::Gyro,
-                TestItem::Imei,
-                TestItem::Ccid,
+                TestItem::Esim,
             ];
             let (tx, rx) = mpsc::channel();
             let (_mtx, mrx) = mpsc::channel();
@@ -2753,23 +2759,21 @@ mod tests {
             (handle.join().unwrap(), verdicts)
         };
 
-        // 1) 新机：型号自动识别为 E02E，蓝牙↔IMEI 入账，报告 e02e- 前缀
+        // 1) 新机：型号锁定 E02E，蓝牙↔IMEI 入账，报告 e02e- 前缀
         let (p1, v1) = run("864192051234567");
         let p1 = p1.expect("E02E 新机应产出报告");
         let name1 = p1.to_string_lossy();
         assert!(name1.contains("e02e-"), "{name1}");
         assert!(name1.ends_with("-0011A3B4C5D6.txt"), "{name1}");
         assert!(v1.contains(&(TestItem::Binding, Verdict::Pass)), "{v1:?}");
-        assert!(v1.contains(&(TestItem::Imei, Verdict::Pass)), "{v1:?}");
-        assert!(v1.contains(&(TestItem::Ccid, Verdict::Pass)), "{v1:?}");
+        assert!(v1.contains(&(TestItem::Esim, Verdict::Pass)), "{v1:?}");
         assert!(v1.contains(&(TestItem::Gyro, Verdict::Pass)), "{v1:?}");
         let text1 = std::fs::read_to_string(&p1).unwrap();
         assert!(text1.contains("E02E 工厂测试报告"), "{text1}");
         assert!(text1.contains("MAC 绑定:PASS 新设备入账"), "{text1}");
         assert!(text1.contains("imei:864192051234567"), "{text1}");
         assert!(text1.contains("ccid:89860115123456789012"), "{text1}");
-        assert!(text1.contains("IMEI:PASS"), "{text1}");
-        assert!(text1.contains("CCID:PASS"), "{text1}");
+        assert!(text1.contains("IMEI/CCID:PASS"), "{text1}");
         assert!(text1.contains("陀螺仪测试:PASS"), "{text1}");
         assert!(text1.contains("结果: PASS"), "{text1}");
         let rec = Ledger::load(&ledger_path).recent(5)[0].clone();

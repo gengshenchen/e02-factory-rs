@@ -54,33 +54,33 @@ fn tab(ui: &mut egui::Ui, active: bool, text: &str) -> bool {
     .clicked()
 }
 
-/// 台账落盘 + 结果日志（V3.13 台账卡）。
+/// 绑定记录落盘 + 结果日志（V3.13 台账卡，V3.14.1 更名）。
 fn save_ledger(app: &mut E02App, ok_msg: String) {
     let path = crate::ledger::path_of(&app.config);
     match app.ledger_view.save(&path) {
         Ok(()) => app.push_log(format!("{ok_msg}（{}）", path.display())),
-        Err(e) => app.push_log(format!("台账保存失败: {e}")),
+        Err(e) => app.push_log(format!("绑定记录保存失败: {e}")),
     }
 }
 
-/// 台账导出 CSV（V3.13）：落到台账同目录，UTF-8 BOM，Excel 直开。
+/// 绑定记录导出 CSV（V3.13）：落到记录文件同目录，UTF-8 BOM，Excel 直开。
 fn export_csv(app: &mut E02App) {
     let path = crate::ledger::path_of(&app.config)
         .parent()
         .map(|d| {
             d.join(format!(
-                "台账-{}.csv",
+                "绑定记录-{}.csv",
                 chrono::Local::now().format("%Y%m%d-%H%M%S")
             ))
         })
-        .unwrap_or_else(|| "台账.csv".into());
+        .unwrap_or_else(|| "绑定记录.csv".into());
     match std::fs::write(&path, app.ledger_view.to_csv()) {
         Ok(()) => app.push_log(format!(
-            "台账已导出 {} 台: {}",
+            "绑定记录已导出 {} 台: {}",
             app.ledger_view.len(),
             path.display()
         )),
-        Err(e) => app.push_log(format!("台账导出失败: {e}")),
+        Err(e) => app.push_log(format!("绑定记录导出失败: {e}")),
     }
 }
 
@@ -110,6 +110,52 @@ pub fn show(ctx: &egui::Context, app: &mut E02App) {
                     ui.set_min_width(ui.available_width()); // 内容不窄于视口（滚动底完整）
                     ui.add_space(4.0);
 
+                    // —— 产品型号（V3.14；V3.14.1 改手动选定）：产线按型号
+                    // 分工位，选定即锁定；绑定对/可测项/设备栏字段随型号
+                    // 切换。固件名只提醒不自动切换（E02E 固件名规律未证实，
+                    // 不能作生产判定依据）——
+                    theme::card().show(ui, |ui| {
+                        card_begin(ui);
+                        card_head(ui, "产品型号", None);
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            for (kind, name) in [
+                                (crate::config::ModelKind::E02, "E02（WiFi 型）"),
+                                (crate::config::ModelKind::E02e, "E02E（eSIM 型）"),
+                            ] {
+                                if tab(ui, app.model == kind, name) && app.model != kind {
+                                    app.config.model = Some(kind);
+                                    app.model = kind;
+                                    changed = true;
+                                    // 内置工位模板联动：防锁了 E02E 还停在
+                                    // complete 档（IMEI/CCID 不在项里，整台
+                                    // 白测）；自建档不动
+                                    match (kind, app.config.station.as_str()) {
+                                        (crate::config::ModelKind::E02e, "complete") => {
+                                            app.config.station = "e02e".into();
+                                        }
+                                        (crate::config::ModelKind::E02, "e02e") => {
+                                            app.config.station = "complete".into();
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        });
+                        ui.add_space(2.0);
+                        // 型号属性提醒（按型号区分）
+                        caption(
+                            ui,
+                            if app.model.has_wifi() {
+                                "WiFi 型：含无线驱动与吞吐测试；绑定 = 蓝牙与 WiFi MAC"
+                            } else {
+                                "eSIM 型：无 WiFi 模组，不测无线，测陀螺仪与 IMEI/CCID；绑定 = 蓝牙与 IMEI"
+                            },
+                        );
+                    });
+
+                    ui.add_space(12.0);
+
                     // —— 工位档案：分段选择 + 启用徽章 ——
                     theme::card().show(ui, |ui| {
                         card_begin(ui);
@@ -133,61 +179,12 @@ pub fn show(ctx: &egui::Context, app: &mut E02App) {
 
                     ui.add_space(12.0);
 
-                    // —— 型号（V3.14）：E02 WiFi 型 / E02E eSIM 型；绑定对、
-                    // 可测项、设备栏字段按型号切换 ——
-                    theme::card().show(ui, |ui| {
-                        card_begin(ui);
-                        card_head(
-                            ui,
-                            "产品型号",
-                            Some(
-                                if app.config.model.auto {
-                                    "自动"
-                                } else {
-                                    "锁定"
-                                }
-                                .into(),
-                            ),
-                        );
-                        ui.add_space(4.0);
-                        let auto = app.config.model.auto;
-                        changed |= ui
-                            .checkbox(&mut app.config.model.auto, "自动识别（按固件名）")
-                            .changed();
-                        ui.horizontal(|ui| {
-                            for (kind, name) in [
-                                (crate::config::ModelKind::E02, "E02（WiFi）"),
-                                (crate::config::ModelKind::E02e, "E02E（eSIM）"),
-                            ] {
-                                // 自动模式下选项卡展示识别结果；点击即转锁定
-                                let active = if auto {
-                                    app.model == kind
-                                } else {
-                                    app.config.model.locked == Some(kind)
-                                };
-                                if tab(ui, active, name) {
-                                    app.config.model.auto = false;
-                                    app.config.model.locked = Some(kind);
-                                    app.model = kind;
-                                    changed = true;
-                                }
-                            }
-                        });
-                        ui.add_space(2.0);
-                        caption(
-                            ui,
-                            "E02E 无 WiFi 模组：隐藏 WiFi 项与配网卡，绑定对 = 蓝牙↔IMEI",
-                        );
-                    });
-
-                    ui.add_space(12.0);
-
                     // —— 测试项：三列勾选（按型号过滤不可用项）——
                     theme::card().show(ui, |ui| {
                         card_begin(ui);
                         card_head(ui, "测试项", None);
                         ui.add_space(2.0);
-                        caption(ui, "勾选写入当前工位");
+                        caption(ui, "勾选写入当前工位；设备信息与蓝牙 MAC 为身份来源，必测");
                         ui.add_space(4.0);
                         if let Some(profile) = app.config.profiles.get_mut(&app.config.station) {
                             egui::Grid::new("items_grid")
@@ -201,9 +198,21 @@ pub fn show(ctx: &egui::Context, app: &mut E02App) {
                                         .filter(|i| i.available_for(app.model))
                                         .collect();
                                     for (idx, item) in avail.iter().enumerate() {
+                                        // 身份来源必测（V3.14.1）：只展示不可关
+                                        // （active_items 对漏勾档案也会强制补上）
+                                        let fixed = matches!(
+                                            **item,
+                                            TestItem::DeviceInfo | TestItem::BtMac
+                                        );
                                         let slug = item.slug().to_string();
                                         let mut on = profile.items.contains(&slug);
-                                        if ui.checkbox(&mut on, item.label()).changed() {
+                                        if fixed {
+                                            on = true;
+                                            ui.add_enabled(
+                                                false,
+                                                egui::Checkbox::new(&mut on, item.label()),
+                                            );
+                                        } else if ui.checkbox(&mut on, item.label()).changed() {
                                             if on {
                                                 profile.items.push(slug);
                                             } else {
@@ -480,23 +489,31 @@ pub fn show(ctx: &egui::Context, app: &mut E02App) {
 
                     ui.add_space(12.0);
 
-                    // —— 设备绑定台账（V3.13）：SN 未烧写不可作键，报告键=
-                    // 蓝牙 MAC；台账记"蓝牙↔WiFi"绑定，防工厂烧错地址 ——
+                    // —— 设备绑定记录（V3.13；原叫"台账"，V3.14.1 改叫
+                    // 记录）：SN 未烧写不可作键，报告键=蓝牙 MAC；记录
+                    // "蓝牙与 WiFi/IMEI"的绑定关系，防工厂烧错地址 ——
                     theme::card().show(ui, |ui| {
                         card_begin(ui);
                         card_head(
                             ui,
-                            "设备绑定台账",
+                            "设备绑定记录",
                             Some(format!("{} 台", app.ledger_view.len())),
                         );
                         ui.add_space(4.0);
-                        caption(ui, "同机复测放行；不同设备同蓝牙或同 WiFi 地址判 FAIL");
+                        caption(
+                            ui,
+                            if app.model.has_wifi() {
+                                "同机复测放行；不同设备同蓝牙或同 WiFi 地址判不合格"
+                            } else {
+                                "同机复测放行；不同设备同蓝牙或同 IMEI 判不合格"
+                            },
+                        );
                         if !app.config.binding.enable {
                             caption(ui, "校验当前已关闭（config: binding.enable = false）");
                         }
                         ui.add_space(6.0);
                         if app.ledger_view.is_empty() {
-                            caption(ui, "尚无记录；测过一台且蓝牙/WiFi 地址都读到后入账");
+                            caption(ui, "尚无记录；测完一台、蓝牙与绑定值都读到后自动保存");
                         } else {
                             egui::Grid::new("ledger_grid")
                                 .num_columns(5)
@@ -512,7 +529,7 @@ pub fn show(ctx: &egui::Context, app: &mut E02App) {
                                         ui.label(verdict);
                                         if ui.button("删").clicked() {
                                             app.ledger_view.remove(&rec.bt_mac);
-                                            save_ledger(app, format!("已删台账记录 {}", rec.bt_mac));
+                                            save_ledger(app, format!("已删绑定记录 {}", rec.bt_mac));
                                         }
                                         ui.end_row();
                                     }
@@ -530,9 +547,9 @@ pub fn show(ctx: &egui::Context, app: &mut E02App) {
                                 if ui.add(theme::danger("确认清空？")).clicked() {
                                     app.ledger_view.clear();
                                     app.ledger_clear_armed = false;
-                                    save_ledger(app, "台账已清空".into());
+                                    save_ledger(app, "绑定记录已清空".into());
                                 }
-                            } else if ui.button("清空台账").clicked() {
+                            } else if ui.button("清空记录").clicked() {
                                 app.ledger_clear_armed = true;
                             }
                         });

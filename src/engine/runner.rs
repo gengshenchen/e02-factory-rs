@@ -70,15 +70,10 @@ pub fn run_auto(item: TestItem) -> RunOutcome {
             }
             Err(e) => fail(&mut r, e),
         },
-        // E02E eSIM（V3.14）：20 一条命令同印 IMEI 与 CCID；两项各跑一次
-        // 保持项独立（只读命令，无副作用）。任一项都把读到的两个字段
-        // merge 进设备信息（绑定对 = 蓝牙↔IMEI）。
-        TestItem::Imei | TestItem::Ccid => {
-            let what = if matches!(item, TestItem::Imei) {
-                "IMEI"
-            } else {
-                "CCID"
-            };
+        // E02E eSIM（V3.14；V3.14.1 合并为单项）：camera-factory 20 一条
+        // 指令同时打印 IMEI 与 CCID，跑一次、两值都合格才 PASS；读到的
+        // 字段 merge 进设备信息（绑定对 = 蓝牙↔IMEI）。
+        TestItem::Esim => {
             let parsed = exec(&CameraFactory::CcidImei.device_cmd()).and_then(|out| {
                 match protocol::parse_device_info(&out) {
                     Ok(info) => Ok((info, out)),
@@ -87,25 +82,23 @@ pub fn run_auto(item: TestItem) -> RunOutcome {
             });
             match parsed {
                 Ok((info, out)) => {
-                    let val = if matches!(item, TestItem::Imei) {
-                        &info.imei
-                    } else {
-                        &info.ccid
-                    };
-                    let valid = if matches!(item, TestItem::Imei) {
-                        protocol::imei_valid(val)
-                    } else {
-                        protocol::ccid_valid(val)
-                    };
-                    if valid {
+                    let mut problems: Vec<String> = Vec::new();
+                    if info.imei.is_empty() {
+                        problems.push("未读到IMEI".into());
+                    } else if !protocol::imei_valid(&info.imei) {
+                        problems.push(format!("IMEI 格式异常: {}", info.imei));
+                    }
+                    if info.ccid.is_empty() {
+                        problems.push("未读到CCID".into());
+                    } else if !protocol::ccid_valid(&info.ccid) {
+                        problems.push(format!("CCID 格式异常: {}", info.ccid));
+                    }
+                    if problems.is_empty() {
                         r.verdict = Verdict::Pass;
-                        r.detail = val.clone();
-                    } else if val.is_empty() {
-                        r.verdict = Verdict::Fail;
-                        r.detail = format!("输出中未读到{what}: {}", one_line(&out));
+                        r.detail = format!("IMEI {}，CCID {}", info.imei, info.ccid);
                     } else {
                         r.verdict = Verdict::Fail;
-                        r.detail = format!("{what} 格式异常: {val}");
+                        r.detail = format!("{}: {}", problems.join("；"), one_line(&out));
                     }
                     Some(info)
                 }
