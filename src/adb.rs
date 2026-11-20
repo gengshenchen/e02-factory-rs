@@ -98,8 +98,9 @@ pub fn spawn_shell(cmd: &str) -> Result<std::process::Child> {
         .arg("shell")
         .arg(cmd)
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
+        .stderr(std::process::Stdio::null());
+    exec::hide_window(&mut c); // 长会话（麦克风/按键）不得挂终端窗口
+    c.spawn()
         .with_context(|| format!("执行 adb shell {cmd} 失败（adb 是否在 PATH？）"))
 }
 

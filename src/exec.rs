@@ -123,11 +123,29 @@ pub fn output_no_abort(cmd: &mut Command, timeout: Option<Duration>) -> std::io:
     run(cmd, timeout, false)
 }
 
+/// Windows 下给子进程加 CREATE_NO_WINDOW（V3.15.1）：GUI 子系统进程没有
+/// 控制台，adb/ffmpeg/iperf3 这类控制台程序子进程会各自弹一个终端窗口、
+/// 随命令结束秒关（v0.4.4 真机反馈：在位监测每 1.5s 一次 adb devices，
+/// 界面不停地闪终端）。管道输出不受影响；Linux 无操作。
+pub fn hide_window(cmd: &mut Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = cmd;
+    }
+}
+
 fn run(
     cmd: &mut Command,
     timeout: Option<Duration>,
     respect_abort: bool,
 ) -> std::io::Result<Output> {
+    hide_window(cmd); // GUI 子系统下子命令不得各开终端窗口
     let deadline = timeout.map(|t| Instant::now() + t);
     let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
     loop {

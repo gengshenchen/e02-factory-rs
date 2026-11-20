@@ -1471,7 +1471,9 @@ fn wifi_flow(tx: &Sender<UiEvent>, wifi: &WifiCfg) -> RunOutcome {
     )));
     // PC 侧 iperf3 预检：随包分发缺失时明确报错，别让客户端玄学解析失败
     let host = player::resolve_tool(player::exe_dir().as_deref(), "IPERF3", "iperf3");
-    match std::process::Command::new(&host).arg("--version").output() {
+    let mut probe = std::process::Command::new(&host);
+    exec::hide_window(&mut probe);
+    match probe.arg("--version").output() {
         Ok(o) if o.status.success() => {}
         _ => {
             r.verdict = Verdict::Fail;
