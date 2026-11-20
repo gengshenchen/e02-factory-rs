@@ -288,7 +288,7 @@ fn maybe_bind(
         }
         BindCheck::Retest { tests } => {
             r.verdict = Verdict::Pass;
-            r.detail = format!("同机复测（第 {tests} 次）");
+            r.detail = format!("同一设备第 {tests} 次测试");
         }
         BindCheck::BtConflict { other } => {
             r.verdict = Verdict::Fail;
@@ -2680,13 +2680,13 @@ mod tests {
         assert!(text2.contains("结果: FAIL"), "{text2}");
         assert_eq!(Ledger::load(&ledger_path).len(), 1, "冲突不入账");
 
-        // 3) 原对复测：放行，计数累加，整机翻回 PASS
+        // 3) 原对复测：不报错，计数累加，整机翻回 PASS
         let (p3, v3) = run("00:60:A7:0B:9C:F2");
-        assert_eq!(p3.as_ref(), Some(&p1), "同机复测覆盖同一份报告");
+        assert_eq!(p3.as_ref(), Some(&p1), "同一设备复测覆盖同一份报告");
         assert!(v3.contains(&(TestItem::Binding, Verdict::Pass)), "{v3:?}");
         let text3 = std::fs::read_to_string(&p1).unwrap();
         assert!(
-            text3.contains("MAC 绑定:PASS 同机复测（第 2 次）"),
+            text3.contains("MAC 绑定:PASS 同一设备第 2 次测试"),
             "{text3}"
         );
         assert!(text3.contains("结果: PASS"), "{text3}");
@@ -2801,7 +2801,7 @@ mod tests {
         assert!(v3.contains(&(TestItem::Binding, Verdict::Pass)), "{v3:?}");
         let text3 = std::fs::read_to_string(&p1).unwrap();
         assert!(
-            text3.contains("MAC 绑定:PASS 同机复测（第 2 次）"),
+            text3.contains("MAC 绑定:PASS 同一设备第 2 次测试"),
             "{text3}"
         );
         let l = Ledger::load(&ledger_path);

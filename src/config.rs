@@ -290,26 +290,13 @@ fn d_profiles() -> BTreeMap<String, Profile> {
                 .collect(),
         },
     );
-    // 全测工位只含 E02 可用项（V3.14：imei/ccid 为 E02E 专属，混入必 FAIL）
+    // 整机工位 = 全项（V3.14.1：工位只有模组/整机两档，型号是产品属性
+    // 不建工位——项集按型号在展示/执行层过滤：E02 跑 WiFi，E02E 跑
+    // IMEI/CCID，互不可用项各自隐藏）
     m.insert(
         "complete".into(),
         Profile {
-            items: TestItem::ALL
-                .iter()
-                .filter(|i| i.available_for(ModelKind::E02))
-                .map(|i| i.slug().to_string())
-                .collect(),
-        },
-    );
-    // E02E（eSIM 型）产线模板（V3.14）：陀螺仪 + IMEI/CCID（单项，
-    // camera-factory 20 一条指令），info/btmac 为身份来源（绑定对=蓝牙↔IMEI）
-    m.insert(
-        "e02e".into(),
-        Profile {
-            items: vec!["info", "btmac", "gyro", "esim"]
-                .into_iter()
-                .map(String::from)
-                .collect(),
+            items: TestItem::ALL.iter().map(|i| i.slug().to_string()).collect(),
         },
     );
     m
@@ -398,28 +385,19 @@ mod tests {
     fn builtin_profiles_and_items() {
         let cfg = Config::builtin();
         assert_eq!(cfg.station, "complete");
-        // 全测工位 = E02 可用项全集（V3.14：imei/ccid 为 E02E 专属）
-        let e02_all = TestItem::ALL
-            .iter()
-            .filter(|i| i.available_for(ModelKind::E02))
-            .count();
-        assert_eq!(cfg.active_items().len(), e02_all);
-        assert!(!cfg.active_items().contains(&TestItem::Esim));
+        // 整机工位 = 全项（型号过滤在执行/展示层：E02 跑 WiFi、E02E 跑 IMEI/CCID）
+        assert_eq!(cfg.active_items().len(), TestItem::ALL.len());
+        assert!(cfg.active_items().contains(&TestItem::Wifi));
+        assert!(cfg.active_items().contains(&TestItem::Esim));
         let mut module = Config::builtin();
         module.station = "module".into();
-        // 模组工位无电池/按键/MIC/录像/陀螺仪
+        // 模组工位无电池/按键/MIC/录像/陀螺仪/eSIM
         let items = module.active_items();
         assert!(!items.contains(&TestItem::Battery));
         assert!(!items.contains(&TestItem::Keys));
         assert!(items.contains(&TestItem::Wifi));
-        // E02E 工位模板（V3.14）：陀螺仪 + IMEI/CCID 单项 + 身份来源项
-        let mut e02e = Config::builtin();
-        e02e.station = "e02e".into();
-        let items = e02e.active_items();
-        assert!(items.contains(&TestItem::Gyro));
-        assert!(items.contains(&TestItem::Esim));
-        assert!(!items.contains(&TestItem::Wifi)); // E02E 无 WiFi 模组
-                                                   // 必测项兜底（V3.14.1）：自建档漏勾 info/btmac 也强制补上
+        assert!(!items.contains(&TestItem::Esim));
+        // 必测项兜底（V3.14.1）：自建档漏勾 info/btmac 也强制补上
         let mut hand = Config::builtin();
         hand.profiles.insert(
             "hand".into(),

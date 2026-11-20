@@ -110,10 +110,10 @@ pub fn show(ctx: &egui::Context, app: &mut E02App) {
                     ui.set_min_width(ui.available_width()); // 内容不窄于视口（滚动底完整）
                     ui.add_space(4.0);
 
-                    // —— 产品型号（V3.14；V3.14.1 改手动选定）：产线按型号
-                    // 分工位，选定即锁定；绑定对/可测项/设备栏字段随型号
-                    // 切换。固件名只提醒不自动切换（E02E 固件名规律未证实，
-                    // 不能作生产判定依据）——
+                    // —— 产品型号（V3.14；V3.14.1 改手动选定）：型号是产品
+                    // 属性，不是工位（工位只有模组/整机两档）；绑定对/
+                    // 可测项/设备栏字段随型号切换。固件名只提醒不自动切换
+                    // （E02E 固件名规律未证实，不能作生产判定依据）——
                     theme::card().show(ui, |ui| {
                         card_begin(ui);
                         card_head(ui, "产品型号", None);
@@ -127,18 +127,6 @@ pub fn show(ctx: &egui::Context, app: &mut E02App) {
                                     app.config.model = Some(kind);
                                     app.model = kind;
                                     changed = true;
-                                    // 内置工位模板联动：防锁了 E02E 还停在
-                                    // complete 档（IMEI/CCID 不在项里，整台
-                                    // 白测）；自建档不动
-                                    match (kind, app.config.station.as_str()) {
-                                        (crate::config::ModelKind::E02e, "complete") => {
-                                            app.config.station = "e02e".into();
-                                        }
-                                        (crate::config::ModelKind::E02, "e02e") => {
-                                            app.config.station = "complete".into();
-                                        }
-                                        _ => {}
-                                    }
                                 }
                             }
                         });
@@ -156,13 +144,13 @@ pub fn show(ctx: &egui::Context, app: &mut E02App) {
 
                     ui.add_space(12.0);
 
-                    // —— 工位档案：分段选择 + 启用徽章 ——
+                    // —— 工位档案：分段选择 + 启用徽章（按型号过滤后的实跑项数）——
                     theme::card().show(ui, |ui| {
                         card_begin(ui);
                         card_head(
                             ui,
                             "工位档案",
-                            Some(format!("启用 {} 项", app.config.active_items().len())),
+                            Some(format!("启用 {} 项", app.batch_items().len())),
                         );
                         ui.add_space(4.0);
                         let names: Vec<String> = app.config.profiles.keys().cloned().collect();
@@ -503,9 +491,9 @@ pub fn show(ctx: &egui::Context, app: &mut E02App) {
                         caption(
                             ui,
                             if app.model.has_wifi() {
-                                "同机复测放行；不同设备同蓝牙或同 WiFi 地址判不合格"
+                                "同一台设备重复测试不报错；不同设备同蓝牙或同 WiFi 地址判不合格"
                             } else {
-                                "同机复测放行；不同设备同蓝牙或同 IMEI 判不合格"
+                                "同一台设备重复测试不报错；不同设备同蓝牙或同 IMEI 判不合格"
                             },
                         );
                         if !app.config.binding.enable {

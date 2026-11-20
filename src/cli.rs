@@ -145,9 +145,14 @@ fn test_cmd(
     cfg: &Config,
     profile: Option<&str>,
 ) -> i32 {
-    // --profile：空 slug 列表时用工位档案；显式 slug 仍优先
+    // --profile：空 slug 列表时用工位档案（按所选型号过滤不可用项）；
+    // 显式 slug 仍优先（点名要跑就照跑）
     let items = if slugs.is_empty() && profile.is_some() {
+        let model = cfg.model.unwrap_or_default();
         cfg.active_items()
+            .into_iter()
+            .filter(|i| i.available_for(model))
+            .collect()
     } else {
         match resolve_items(slugs) {
             Ok(items) => items,
