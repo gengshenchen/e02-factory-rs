@@ -89,14 +89,15 @@ fn shell_inner(cmd: &str, timeout: Option<std::time::Duration>) -> Result<String
     Ok(exec::decode_out(&out.stdout).trim().replace('\r', ""))
 }
 
-/// 启动 `adb shell <cmd>` 但不等它退出（V3.6 麦克风回环用）。
-/// 新版固件的 13/14 回环进程存活期间才有声音、不再自动退出；
-/// 调用方拿到 Child 自行读输出、在人工应答后 kill 结束回环。
+/// 启动 `adb shell <cmd>` 但不等它退出（V3.6 麦克风回环 / V3.6.3 按键
+/// 监听用）。stdin 也接管管道：13/14/15 固件端以 `ret=getchar();` 等任意
+/// 输入退出（V3.15.3），结束时由调用方往 stdin 写一个字符让固件自己走完。
 pub fn spawn_shell(cmd: &str) -> Result<std::process::Child> {
     let mut c = Command::new(adb_path());
     directed(&mut c)
         .arg("shell")
         .arg(cmd)
+        .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null());
     exec::hide_window(&mut c); // 长会话（麦克风/按键）不得挂终端窗口

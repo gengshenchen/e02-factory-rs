@@ -768,9 +768,26 @@ fn start_loopback(tx: &Sender<UiEvent>, cmd: &str) -> Option<std::process::Child
     }
 }
 
-/// 结束回环：杀本地 adb 会话（设备侧随会话断开停止回环）。
+/// 结束回环（V3.15.3：先礼后兵）。13/14/15 固件端是 `ret=getchar();`
+/// ——等任意输入才退出；此前直接杀本地 adb 会话，设备侧回环/监听进程
+/// 收不到字符、一直挂着。改为先往 stdin 写一个空符号（换行）让固件
+/// 自己走完退出，最多等 2s；超时（固件没在等输入/管道异常）兜底强杀。
 fn stop_loopback(child: &mut Option<std::process::Child>) {
     if let Some(mut c) = child.take() {
+        if let Some(mut stdin) = c.stdin.take() {
+            use std::io::Write;
+            let _ = stdin.write_all(b"\n");
+            let _ = stdin.flush();
+            drop(stdin);
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            match c.try_wait() {
+                Ok(Some(_)) => return, // 固件收到字符，自然退出
+                Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+                Err(_) => break,
+            }
+        }
         let _ = c.kill();
         let _ = c.wait();
     }
