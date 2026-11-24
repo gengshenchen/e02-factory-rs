@@ -1,7 +1,7 @@
 # FQC 出厂写号工位方案(V4 计划)
 
-> 2026-11-23 与产线/固件逐项确认后定稿。来源:旧 `HEC-E02-SNwrite.exe`(sn_tool)
-> 逆向 + 真机实测(camera-factory 30 已在固件落地)。本工位替代旧写号工具,
+> 2026-11-23 与产线/固件逐项确认并完成方案审查修订后定稿。来源:旧 `HEC-E02-SNwrite.exe`
+> (sn_tool) 逆向 + 真机实测(camera-factory 30 已在固件落地)。本工位替代旧写号工具,
 > 集成进本程序,作为与"测试"并列的独立模式(不是第三个工位档案——工位只有
 > 模组/整机两档,V3.14.2 原则)。
 
@@ -11,27 +11,31 @@
 整文件覆盖 → 对时 → cf4 收尾。缺陷:
 
 - **整文件覆盖会踩掉设备自己写入的数据**(见 §2)——旧工具的写法在新固件上是错的;
-- 版本号/电压值只显示不落盘,serno.txt 台账只有 SN+时间(且换行 bug 多条粘一行);
+- 版本号/电压值只显示不落盘,旧写号记录文件(`sn.ini`,注:`serno.txt` 实为待写 SN 池)
+  只有 SN+时间(且存在换行 bug 多条粘一行);
 - 号池消费靠人肉,无"已写号拦截",同 SN 可无限重写;
 - Windows 单机、无报告体系。
 
 目标:扫码写号 + 出厂终检 + 收尾切正式版,全流程留痕,防呆完备,数据可追溯。
+**不再兼容旧工具文本台账**,统一收口为 `ledger.json` + `ship` 报告 + CSV 导出。
 
 ## 2. 固件协议(camera-factory)
 
 | 命令 | 语义 | 判定 |
 |---|---|---|
-| 3 | 设备信息(sn-address / wifi-mac / soft-ware / hard-ware) | 既有 `parse_device_info` |
-| 4 | **清理 U 盘 + T32 切正式版**,必须最后执行,**重启后生效** | 输出含 FAIL 即失败 |
-| 7 | 获取蓝牙固件版本(比对工单 btsw) | 版本串完全相等 |
-| 8 | SD 卡在位 | 输出含 `true` |
-| 12 | 电池电压 | **数值 ≥3.5V**(新增数值解析,现只认"有电压行") |
-| 19 | 固件校时(配 `date -s`) | 失败只记日志 |
+| 3 | 设备信息(`sn-address` / `wifi-mac` / `soft-ware` / `hard-ware`) | 既有 `parse_device_info` |
+| 4 | **清理 U 盘 + T32 切正式版**,必须最后执行,**重启后生效** | 输出含 `FAIL` 即失败 |
+| 7 | 获取蓝牙固件版本(比对工单 `bt_ver`) | 经 `parse_bt_version` 提取后与工单版本完全相等(格式联调校准) |
+| 8 | SD 卡在位(可配开关 `check_sdcard`,默认开) | 输出含 `true` |
+| 10 | 读取蓝牙 MAC(设备身份主键) | 既有 `parse_device_info` |
+| 12 | 电池电压 | **数值 ≥ `min_batt_volts`**(新增 `parse_battery_volts`,**排除 `%` 百分比行**,兼容 V/mV) |
+| 19 | 固件校时(配 `date -s`,复用 `worker::sync_time`) | 失败只记日志 |
+| 20 | eSIM 型号读取 IMEI/CCID | 既有 `parse_device_info`;**顺带放宽 `ccid_valid` 支持十六进制字母**(实机含 `D`) |
 | **30** | **`camera-factory 30 <文件> <节> <键> <值>`** 按键写配置 | 见下 |
 
-### cf30 判定约定(2026-11-23 真机实测)
+### cf30 判定与解析约定(2026-11-23 真机实测)
 
-```
+```text
 camera-factory 30 webrtc_serno_file.ini ProvisionInfo sn 6302W1000288
 [ProvisionInfo]
 sn=6302W1000288        ← 写入后全文件回显
@@ -41,154 +45,297 @@ auth_key=
 config-update:true     ← 成功标记
 ```
 
-- 成功 = 输出含 `config-update:true` **且** 回显中该键值与写入值精确匹配;
+- 成功 = 输出含 `config-update:true` **且** `[ProvisionInfo]` 节内回显的该键值与写入值精确匹配;
 - 失败 = `config-update:false`;两者都无 = 协议异常,按失败处理;
 - **回显即免费回读**,键值判定以回显文件内容为准,不信"命令已发出";
-- 解析注意:空值键(`uuid=`)、`config-update:true` 行不是键值对、键两侧空格需 trim。
+- 解析加固:先滤除串口控制字符(`\r`/DC1/EOT 等,同 `report::sanitize`),**按 `[Section]`
+  作用域隔离匹配**(只认目标节内键),兼容空值键(`uuid=`)、忽略 `config-update:*` 状态行、
+  键与值两侧空白 trim;
+- 安全转义:下发前校验参数不含非法控制字符/换行,经 shell 单引号转义后再拼 `adb shell`。
 
-### 设备自写文件的事实(设计约束)
+### 设备自写文件的事实与预读方式(设计约束)
 
 设备在 T32 产测模式插 USB 会**自己写** `webrtc_serno_file.ini`:自动从 4G 模组
-取 IMEI/CCID 存入,值为空时自生成 uuid/auth_key。因此:
+取 IMEI/CCID 存入,值为空时自生成 `uuid`/`auth_key`(且包含 `enable_sub_record` 等业务键)。因此:
 
 - **adb push 整文件覆盖被禁止**(会踩掉设备数据)——必须走 cf30 按键写;
-- 工具写入集 = 型号卡键集(默认只有 `sn`);IMEI/CCID 工具只读回记档;
-- `webrtc_id` 预留未用,可选键默认不写;
-- 厂测 WiFi 配置与应用配置分离,出厂**不需要**清理。
+- 工具写入集 = 型号档案 `keys`(默认只有 `sn`);IMEI/CCID 工具只读回记档;
+- `webrtc_id` 预留未用,可选键默认不写;厂测 WiFi 配置与应用配置分离,出厂**不需要**清理;
+- **写前预读与重启复核**:`cf3` 不返回 `uuid`/`auth_key`,配置设备端绝对路径
+  `config_path`(经 `adb shell cat` / `adb pull` 读取;2026-11-24 已确认:`/config/webrtc_serno_file.ini`)。
 
 ## 3. 出厂流程
 
+```text
+扫码 SN(扫枪=键盘注入,自动剥回车、去空白、大写化;busy 期间锁输入防连扫)
+ ⓪设备身份与现值采集:cf10(BT MAC) + cf3(SN/WiFi MAC/软件版本)
+   + cf20[eSIM](IMEI/CCID) + 读 config_path(取当前 sn/uuid/auth_key)
+ ①闸门[gate_mode]:查本机(BT MAC)整机工位是否全测 PASS(strict=硬拦/warn=警告/off=跳过)
+ ②SN 校验与异号防呆:
+   - 格式校验(档案 sn_pattern)
+   - 设备现值比对(空/占位默认值/不匹配正式正则=未写号放行;已是另一合法正式 SN=硬拒)
+   - 台账反查(该 SN 已绑其他设备=硬拦;已绑本机=标记同号重写)
+ ③SN 池校验[已导入才启用]:在池且未写(同号重写允许复用已绑本机条目)
+ ④版本核对:t32_ver/bt_ver 留空=配置缺失拒写;soft-ware == t32_ver 且 cf7 == bt_ver
+ ⑤硬件终检:电池 cf12 ≥ min_batt_volts;SD 卡 cf8[check_sdcard=true 时启用]
+ ⑥确认卡与确认闸门[auto_commit]:
+   展示 SN、目标凭据全值(若有)、设备现值;
+   - 若 auto_commit=true 且无告警(非同号重写、非覆盖设备自生成凭据)→ 自动继续
+   - 若 auto_commit=false 或触发上述任一告警 → 暂停等待操作员点击确认
+ ⑦凭据领用与预落盘[凭据型号](所有只读检查通过后、首条写入前执行):
+   - 先按 bound_sn == target_sn 查既有 allocated/committed 凭据复用(幂等)
+   - 否则池空=拒写;取下一个 available 凭据,在发首条 cf30 前原子落盘为
+     allocated(记录 bound_sn + bound_bt_mac),防中途断电/崩溃导致双机撞凭据
+ ⑧cf30 逐键写:按档案 keys 顺序写(sn → uuid → auth_key),设备现值已一致则跳过;
+   每键判定:config-update:true + [ProvisionInfo] 回显键值精确匹配
+ ⑨[eSIM 型号]4G 模组配置写入(§3.1)
+ ⑩终检(重启前):以最后一次回显/读 config_path 复核全部目标键
+ ⑪对时 + 收尾切正式版:
+   date -s + cf19(复用 sync_time)→ cf4 清 U 盘+切正式版
+   → 置"预期重启"标记(屏蔽 devwatch 拔出中止)→ adb reboot
+ ⑫重启后探测[reboot_verify_secs]:
+   - 0 = 跳过(联调确认正式版无 adb 后置 0,避免每台白等 60s)
+   - >0 = 轮询等待 adb 回来 → 先跑 cf10 核对 BT MAC 与重启前一致(防换机串号)
+     → 读 config_path 复核目标键,不一致判 FAIL;超时未回记日志跳过
+ → PASS:stock 推进为 committed + ledger.json 回填(mark_shipped upsert)
+   + ship 报告落盘
 ```
-扫码 SN(扫枪=键盘注入,自动剥回车)
- ①闸门[可配开关]:查本机(蓝牙MAC)整机测试是否全 PASS
- ②SN 校验:格式(型号卡正则)→ 台账反查(绑其他设备=硬拦;绑本机=同号确认重写)
- ③SN 池校验[已导入才启用]:在池且未用
- ④凭据领用[凭据型号]:池空=拒写;取下一个未用 (uuid,auth_key)
- ⑤版本核对:soft-ware == 工单版本 且 cf7 蓝牙版本 == 工单版本(完全相等)
- ⑥电池 cf12 ≥ 3.5V;SD 卡 cf8
- ⑦cf30 逐键写:sn → uuid → auth_key(凭据型号)
-   每键判定:config-update:true + 回显键值精确匹配
- ⑧终检(重启前):最后一次回显/拉取,sn(凭据型号:三值)复核
- ⑨对时:date -s + cf19
- ⑩cf4 清U盘+切正式版 → adb reboot
- ⑪重启后探测(60s):adb 回来→拉配置三值复核,不一致判 FAIL(验收"固件
-   不自覆盖");adb 不回来→记日志跳过(正式版无 adb,靠固件保证)
- → PASS:台账回填 + serno.txt 追加 + ship 报告落盘
+
+**失败与异常隔离**:
+- ⑧⑨ 任一步失败立即停、判 FAIL、**不执行 cf4**(不切正式版,留产测态待返修);
+- 部分写入可恢复:凭据保持 `allocated`(已绑当前 SN/本机,不会分给下一台);重跑时同 SN
+  走"同号确认"、优先复原已分配凭据、已一致键自动跳过(幂等);若设备主板报废可在库存页手动标记作废;
+- **与测试模式/在位监测隔离**:处于出厂写号模式时屏蔽 `conn.auto_start`(插机不自动触发测试);
+  步骤 ⑪ 执行 `adb reboot` 前屏蔽 `devwatch` 的 `DeviceGone` 强杀,防止误杀步骤 ⑫ 探测。
+
+**闸门实现(`gate_mode`)**:
+- 升级 `LedgerRecord` 区分工位(见 §7):仅**整机工位(`complete`)全测 PASS** 才算满足闸门
+  (防止仅过模组工位或单项补测绕过);
+- `strict`:未查到记录或非整机全 PASS 一律硬拦(台账覆盖率上来后切此档);
+- `warn`(**默认**):未查到或非整机 PASS 弹窗/黄条警告但允许继续(兼容旧工具测完过渡期);
+- `off`:跳过闸门检查。
+
+### 3.1 eSIM 型号附加:4G 模组配置写入
+
+eSIM 产品有第二套可写区:4G 模组的 `U:/config.ini`(服务器/APN 等,AT 命令
+协议同 esim-desktop 的 CFG 域)。模组挂在设备侧 UART(**2026-11-24 确认:
+`/dev/ttyS2` @ 115200**),PC 不直接碰串口——系统同事提供**设备端 CLI
+`4g-test`**(随固件落地,同 `camera-factory` 形态),本工具经 `adb shell`
+转发调用:**系统层管串口,本工具管编排/判定/留痕**,不自己实现串口协议,
+也不让操作员另开 esim-desktop 手工做(流程断裂、无留痕)。
+
+```text
+4g-test "AT+PROD=1"                进产测模式
+── 配置写入事务(失败最多整轮重试 1 次,整体 60s 上限)──
+  4g-test "AT+CFGSTART"            清理 U:/config.tmp 并开始配置会话
+  4g-test "AT+CFGSET=\"<line>\"" ×N 逐行写(禁止原地重试单行——防超时重发写出重复行)
+  4g-test "AT+CFGSAVE"             保存并校验
+  4g-test "AT+CFGREAD?"            回读(剥 +CFGREAD: 前缀)→ 归一化后逐行比对,不一致判 FAIL(diff 落报告)
+4g-test "AT+PROD=0"                退产测模式(best-effort,失败不阻断判定)
 ```
 
-**失败处理**:⑦任一键失败立即停、判 FAIL、**不执行 cf4**(不切正式版,
-留产测态待返修);部分写入状态可恢复——重跑时同 SN 走"同号确认"、
-已一致的凭据自动跳过(幂等)。
+- **调用方式**:每条均经 `adb shell 4g-test "<AT命令>"` 在设备端执行;AT 命令内含
+  双引号(`AT+CFGSET="…"`)时外层用 shell 单引号包裹再拼 `adb shell`,转义收口在 `exec` 层;
+- **内容 = 静态模板 + 预留变量占位**(如 `{{sn}}`,当前先按纯静态模板用;型号维度:
+  数据目录 `templates/<profile>_4g.ini`,设置页可编辑);
+- **模板校验与比对归一化**:允许空行和 `#` 注释行;有效配置行必须含 `=` 且**禁止包含
+  双引号 `"` 或控制字符**(防截断 `AT+CFGSET="..."`);回读比对前剥除 `+CFGREAD:` 前缀、
+  过滤空行/注释行并 trim 两端空白;
+- **重试策略**:由于模组每收到一条 `AT+CFGSET` 即向 `U:/config.tmp` 追加一行,单行超时/
+  失败**严禁原地重试该行**,必须重发 `AT+CFGSTART` 清空临时文件后整轮重跑(最多重试 1 次);
+- 位置在 `cf30` 之后、`cf4` 之前——失败不切正式版,留产测态返修;结果行进 `ship` 报告
+  (写入行数/回读一致/耗时)。
 
-**闸门实现**:优先查绑定台账 `last_verdict == PASS`;台账关闭
-(binding.enable=false)或查不到时降级为警告可继续(产线可能用旧工具测完
-再来写号)。默认开,可配置。
+**`4g-test` 接口契约**(设备端 CLI,系统同事开发、随固件落地):
 
-## 4. 数据体系:provision_stock.json
+| 项 | 要求 |
+|---|---|
+| CLI 形态 | `4g-test [-d <串口>] [-b <波特率>] "<AT命令>"`,stdout 只打模组原始响应行(`+CMD:…`/OK/ERROR),无日志噪声 |
+| 串口参数 | **默认 `/dev/ttyS2` @ 115200**(2026-11-24 确认);`-d`/`-b` 覆盖兜底,联调换口才用 |
+| 退出码 | 收到 OK=0;ERROR/超时=非 0。老版 adb 不透传远端退出码,**判定以输出内容为主**(同 cf30 风格),退出码仅参考 |
+| 超时 | 默认 5s;`CFGSAVE`/`CFGREAD` 放宽 10s;超时打 `TIMEOUT` |
+| 无状态与串口互斥 | 每次调用独立(开→发→收→关);**须与设备产测取号进程约定 `/dev/ttyS2` 互斥**(插 USB 自动取 IMEI/CCID 的逻辑若常驻占用,4g-test 需给出明确报错而非静默失败) |
 
-**单文件双池,凭据池整体可选**(uuid/auth_key 不一定有,按客户分):
+## 4. 数据体系:`provision_stock.json`
 
-```
+**单文件双池,凭据池整体可选**(按产品/客户档案),**单机本地独占**(多台 FQC PC 采用
+互不重叠子批次独立分批导入,避免共享盘并发撞号):
+
+```json
 {
-  "sns": [ { "sn": "6302W1000288", "status": "未用|已写",
-             "bound_bt_mac": "", "written_at": "" } ],
-  "credentials": [ { "uuid": "uuid95fe...", "auth_key": "B7uT...",
-                     "status": "未用|已用", "bound_sn": "" } ]
+  "sns": [
+    {
+      "sn": "6302W1000288",
+      "status": "available | allocated | committed | voided",
+      "bound_bt_mac": "",
+      "updated_at": ""
+    }
+  ],
+  "credentials": [
+    {
+      "uuid": "uuid95fe...",
+      "auth_key": "B7uT...",
+      "status": "available | allocated | committed | voided",
+      "bound_sn": "",
+      "bound_bt_mac": "",
+      "updated_at": ""
+    }
+  ]
 }
 ```
 
-存数据目录,原子写(tmp+rename,同 ledger 风格)。
+- 存数据目录,原子写(`tmp + rename`,同 ledger 风格);
+- 状态字段使用稳定英文枚举(UI 层展示中文:未用 / 已分配 / 已写入 / 已作废);
+- 库存维护:支持对报废机手动将 `allocated` 条目标记 `voided`,支持"仅清空未用批次"
+  (只删 `available`,绝不碰已分配/已提交记录)。
 
 ### 行为矩阵
 
-| 型号 | SN 池 | 凭据池 | 行为 |
+| 档案类型 | SN 池 | 凭据池 | 行为 |
 |---|---|---|---|
-| 普通(keys=["sn"]) | 已导入 | —(无此概念) | 在池校验 + 库存计数 |
+| 普通(`keys=["sn"]`) | 已导入 | —(无此概念) | 在池校验 + 库存计数 |
 | 普通 | **未导入** | — | 降级:仅格式+台账校验,界面提示"未导入批次" |
 | 凭据客户 | 已导入 | 已导入 | 在池校验 → 领用凭据 → 写三键 |
-| 凭据客户 | 已导入 | **未导入** | **拒写**:"型号要求凭据,请先导入" |
+| 凭据客户 | 已导入 | **未导入** | **拒写**:"当前档案要求凭据,请先导入" |
 
-- **SN 池导入可选**(产线习惯兼容);**凭据型号的凭据导入强制**;
-- 普通型号的界面**不出现任何凭据入口**(按型号卡显隐);
-- 库存余量:普通型号只显示"SN 剩 N";凭据型号显示"SN 剩 N / 凭据剩 M"。
+- **SN 池导入可选**(产线习惯兼容);**凭据档案的凭据导入强制**;
+- 普通档案界面**不出现任何凭据入口**(按档案 `keys` 显隐);
+- 库存余量:普通档案只显示"SN 剩 N";凭据档案显示"SN 剩 N / 凭据剩 M"。
 
-### 导入规则
+### 导入格式与校验规则
 
-- 两个 txt 独立导入:SN txt(发号系统,一行一个)+ 凭据 txt(uuid/auth_key
-  对子,**不带 SN**);
-- **整批校验,任一行错整批拒入**(列出错误行号):格式(型号卡正则)、
-  批内查重、库存查重;
-- 数量对账:凭据型号下 SN 数 > 凭据数 → 警告(凭据写完即断供拒写);
-- **追加式**:已写状态永不重置,重复值静默跳过并计数。
+- 两个 txt 独立导入:SN txt(发号系统,一行一个)+ 凭据 txt(`uuid`/`auth_key` 对子,**不带 SN**);
+- **文本清洗**:自动剥 UTF-8 BOM(`\u{FEFF}`)与 `\r\n`,忽略纯空行与 `#` 注释行;凭据行支持
+  **逗号 / Tab / 空白**分隔且须恰好 2 列;
+- **拒入 vs 跳过(明确分离)**:
+  - **整批拒入**(列出错误行号):格式不匹配档案正则、**批内重复**、凭据中同一 `uuid`
+    与库存现有条目存在**不同 `auth_key` 冲突**;
+  - **追加跳过**:与现有库存**完全一致**的重复条目静默跳过并计数(**已写/已分配状态永不重置**),
+    仅追加新增条目;
+- 数量对账:凭据档案下可用 SN 数 > 可用凭据数 → 警告(凭据写完即断供拒写)。
 
 ### 凭据取用制
 
-客户凭据与 SN 无对应关系(文件不带 SN),**写号时领用**:取下一个未用
-凭据绑给当前 SN,绑定关系落 stock(凭据.bound_sn)+ 台账;同机重跑时
-凭据已绑本机 → 跳过不重写。
+客户凭据与 SN 无预先对应关系,**写号时领用**:在所有只读检查通过后、首条 `cf30` 之前,
+优先按 `bound_sn == 当前SN` 复用既有分配;无则取下一个 `available` 凭据并原子落盘为
+`allocated`(记录 `bound_sn` 与 `bound_bt_mac`),PASS 后推进为 `committed`。
 
-## 5. 配置(config.toml)
+## 5. 配置(`config.toml`)
+
+采用 `[provision]` 公共配置 + `[provision.profiles.<name>]` 强类型档案表(避免动态档案名
+与固定配置键混在同一层级),每个档案绑定所属产品型号(`E02`/`E02E`)并自带独立工单版本、
+正则、键集与可选 4G 配置。新增轻量正则依赖 `regex-lite`。
 
 ```toml
 [provision]
-gate_report = true            # 闸门:整机报告全 PASS 才许写(可关)
-min_batt_volts = 3.5          # 电池阈值(V,只验在位能开机)
-t32_ver = "V2.2.9"            # 工单版本(完全相等判定)
-bt_ver  = "V1_7_4"            # 工单蓝牙版本(完全相等判定)
-sn_pattern = '^\\d{4}[WE]\\d{7}$'
-keys = ["sn"]                 # 默认型号:只写 sn
+active_profile = "e02"                    # 当前启用的出厂档案名
+gate_mode = "warn"                        # 闸门: warn(默认,警告可继续,兼容过渡期) | strict(硬拦) | off
+auto_commit = true                        # 扫码即自动开写(有告警仍弹窗确认);false=每台人工点确认
+reboot_verify_secs = 60                   # ⑫ 重启后探测秒数;0=跳过(正式版无 adb 时置 0)
+config_path = "/config/webrtc_serno_file.ini" # 设备端 ini 绝对路径(2026-11-24 已确认)
+placeholder_sns = ["00001", "002"]        # 工厂未写号占位 SN(附加判断:不匹配正式正则也视作未写号)
 
-[provision.customer_x]        # 凭据客户型号(型号维度,不是工位)
+[provision.profiles.e02]
+model = "E02"
+t32_ver = "V2.2.9"                        # 工单软件版本(留空拒写,完全相等判定)
+bt_ver  = "V1_7_4"                        # 工单蓝牙版本(留空拒写,完全相等判定)
+min_batt_volts = 3.5                      # 电池最低电压(V)
+check_sdcard = true                       # 是否校验 SD 卡在位(可配)
+sn_pattern = '^\d{4}W\d{7}$'              # 注意 TOML 单引号为字面量,单反斜杠
+keys = ["sn"]                             # 默认只写 sn
+
+[provision.profiles.e02_customer_x]       # 凭据客户档案
+model = "E02"
+t32_ver = "V2.2.9"
+bt_ver  = "V1_7_4"
+min_batt_volts = 3.5
+check_sdcard = true
+sn_pattern = '^\d{4}[WE]\d{7}$'
 keys = ["sn", "uuid", "auth_key"]
 uuid_pattern = '^uuid[0-9a-f]{16}$'
-key_pattern   = '^[A-Za-z0-9]{32}$'
-# 凭据池为空 → 拒写
+key_pattern  = '^[A-Za-z0-9]{32}$'
+
+[provision.profiles.e02e]                 # eSIM 型号档案
+model = "E02E"
+t32_ver = "V2.2.9"
+bt_ver  = "V1_7_4"
+min_batt_volts = 3.5
+check_sdcard = true
+sn_pattern = '^\d{4}E\d{7}$'
+keys = ["sn"]
+
+[provision.profiles.e02e.fourg]           # 4G 模组配置写入(§3.1,可选;不配即跳过;设备端 4g-test 随固件落地)
+port = "/dev/ttyS2"                       # 设备端串口(2026-11-24 确认;留空 = 用 4g-test 自身默认)
+baud = 115200                             # 波特率(留空 = 用 4g-test 自身默认)
+template = "templates/e02e_4g.ini"
 ```
 
 ## 6. 重写与幂等规则
 
 | 对象 | 设备当前值 vs 目标值 | 动作 |
 |---|---|---|
-| SN | 空 / 相同 | 写 / 跳过 |
-| SN | **不同** | **硬拒**(已写号设备换号,防串联) |
-| uuid/auth_key | 空 / 相同 | 写 / 跳过(幂等) |
-| uuid/auth_key | 非空且不同(设备自生成) | **警告 + 操作员确认后覆盖**(客户型号必须写预分配值) |
+| SN | 空 / 命中 `placeholder_sns` / 不匹配正式 `sn_pattern` | 视作未写号新机,正常写入 |
+| SN | 与目标 SN 相同 | 跳过写 SN(触发"同号确认重写"后重跑其余步骤) |
+| SN | **已是另一个合法正式 SN 且不同** | **硬拒**(已写号设备换号,防串联) |
+| `uuid`/`auth_key` | 空 | 写入 |
+| `uuid`/`auth_key` | 与目标值相同 | 跳过(幂等) |
+| `uuid`/`auth_key` | 非空且不同(设备自生成) | **警告 + 操作员确认后覆盖**(凭据档案必须写预分配值) |
 
-同 SN 重写(返修/复测):确认弹窗 → 全流程重跑,已一致项跳过,台账每次都记。
+同 SN 重写(返修/复测):弹窗确认 → 全流程重跑,复用原分配凭据、已一致项跳过,台账与报告每次更新。
 
-## 7. 台账与报告
+## 7. 台账、报告与出货 CSV 导出
 
-- **绑定台账回填**:`ledger.json` 该机记录补 SN + 写号时间 + 写号判定
-  (新增 `mark_shipped`);`bind()` 逻辑不动;凭据**不进台账**;
-- **兼容 serno.txt**:继续追加旧格式 `SN [IMEI CCID] 时间`,每条强制 `\n`
-  修复旧 bug;路径可配;
-- **ship 报告**:`ship-<日期>-<蓝牙MAC>.txt`,完整记录:SN、uuid/auth_key
-  **全值**(用户确认)、IMEI/CCID、两版本号、电池电压实测值、各步判定;
-- **报告中心**:ship 报告列表**可见**、**不计入**今日测试统计(产量/良率
-  不被写号动作搅浑);
-- 台账 CSV 导出不含凭据。
+不再兼容旧工具文本台账(`sn.ini`/`serno.txt`),统一收口为三类产出:
 
-## 8. 工位独立统计(附带改造,修隐藏 bug)
+- **绑定台账升级与回填(`ledger.json`)**:
+  - `LedgerRecord` 新增测试工位字段(`last_station` / `complete_verdict` / `complete_pass_at`),
+    仅整机工位全测 PASS 时更新 `complete_verdict = "PASS"`,支撑 §3 闸门;
+  - 新增出厂独立字段(`shipped_sn` / `shipped_at` / `ship_verdict`),与测试回读 `sn` 隔离
+    (防止返修重刷默认固件 `00001` 时被 `bind()` 覆盖正式出厂 SN);
+  - 新增 `mark_shipped` 支持 **upsert**(台账尚无该 BT MAC 记录时按本次读到的
+    `bt_mac` + `partner`(WiFi MAC/IMEI) + `model` 自动建档并写入出厂字段);
+  - **凭据不进台账**,原有"绑定记录 CSV 导出"不含凭据。
+- **ship 报告**:`ship-<日期>-<蓝牙MAC>.txt`(未读到 BT MAC 兜底 `ship-<日期>-<时分秒>-unknown.txt`),
+  完整记录:型号/档案、SN、凭据全值(若有)、WiFi MAC 或 IMEI/CCID(按产品有无落行)、
+  两版本号、电池电压实测值、4G 写入/回读判定及 diff、各步判定与耗时。同机同日重跑覆盖最新。
+- **出货明细 CSV 导出**(出厂页独立入口,UTF-8 BOM Excel 直开):
+  - 关联 `ledger.json` 已出厂记录与 `provision_stock.json` 导出,供交付客户/云端批量激活;
+  - **字段按产品/档案自适应**(有则列/填,无则不出现或留空):基础列 `SN, 蓝牙MAC, 型号, 写号时间, 判定`,
+    WiFi 型含 `WiFi MAC`,eSIM 型含 `IMEI, CCID`,凭据档案含 `uuid`(默认不含 `auth_key`,
+    提供"包含 auth_key"勾选项按需导出)。
+- **报告中心**:`ship-` 报告列表**可见**、**不计入**测试工位今日产量/良率。
 
-现状文件名 `e02-<日期>-<蓝牙MAC>.txt` **不含工位**:同机同日过模组+整机
-工位两份报告**互相覆盖丢数据**。改造:
+## 8. 工位独立统计与报告改造(附带修隐藏 bug)
 
-- 文件名**加工位段**:`e02-<日期>-<station>-<蓝牙MAC>.txt`
-  (station ∈ module/complete);出厂报告独立前缀 `ship-`;
+现状文件名 `<model_prefix>-<日期>-<蓝牙MAC>.txt`(`e02-` / `e02e-`)**不含工位**:同机同日过
+模组+整机工位两份报告**互相覆盖丢数据**。改造:
+
+- 文件名**加工位段**:`<model_prefix>-<日期>-<station>-<蓝牙MAC>.txt`
+  (`model_prefix` ∈ `e02`/`e02e`,`station` 经 `sanitize_token` 清洗,常规为 `module`/`complete`,
+  `unknown` 与 `-冲突<hms>` 后缀保持兼容);出厂报告独立前缀 `ship-`;
 - 同机同日跨工位**各自保留、各自统计**;
-- 旧报告(无工位段)照常列出,统计按报告内容 `工位:` 行归组(scan_stats
-  本就逐文件读"结果:"行,顺手读工位行,零额外开销);
-- 今日统计按工位分组 `{module, complete}`,界面显示**当前工位**数字;
-  **切换工位即重扫**当日报告(目录扫描,无持久化状态);
+- 旧报告(无工位段)照常列出,统计按报告内容 `工位:` 行归组(`scan_stats` 本就逐文件读
+  `结果:` 行,顺手读 `工位:` 行,零额外开销);
+- **修复 `list_reports` 排序 Bug**:现有代码按完整文件名字典序倒排并截断前 300 条,引入 `ship-`
+  后会因 `'s' > 'e'` 导致历史出厂报告永久压在测试报告之前甚至挤爆上限——改为**提取日期段
+  (+ 文件 mtime 兜底)统一倒排**;`dialog_report.rs::display_name` 同步适配 `e02-`/`e02e-`/`ship-`
+  及工位段显示;
+- 今日统计按工位分组 `{module, complete}`,界面显示**当前工位**数字;**设置页切换工位立即调用
+  `refresh_stats()` 重扫**当日报告(目录扫描,无持久化状态);
 - 出厂页独立统计:扫 `ship-` 前缀 → 今日写号 N / 成功 x / 失败 y。
 
 ## 9. UI
 
-- 顶栏**模式切换**:测试 / 出厂写号(两个页面,不是工位档案);
-- 出厂页:扫码输入框(焦点常驻)→ 确认卡(SN、凭据全值、设备当前值,
-  供人工核对)→ 步骤进度与逐项判定(复用结果行样式)→ 大号 PASS/FAIL;
-  库存余量常显;数据导入入口(两个 txt 分别选入,导入预览显示校验结果);
-- 设置页:`[provision]` 可视化编辑(阈值/正则/闸门/型号键集)。
+- 顶栏**模式切换**:测试 / 出厂写号(两个页面,不是工位档案;出厂模式下屏蔽测试自动开测);
+- 出厂页:
+  - 档案与库存条(当前档案名、SN/凭据余量常显,普通档案隐藏凭据项);
+  - 扫码输入框(焦点常驻、`busy` 锁输入防连扫)→ 确认卡(SN、凭据全值、设备当前值,
+    `auto_commit` 控制自动开写或手动确认,告警场景强制弹窗确认)→ 步骤进度与逐项判定
+    (复用结果行样式)→ 大号 PASS/FAIL;
+  - 数据管理区:SN txt / 凭据 txt 独立导入(预览校验结果与行号报错)、清空未用批次/异常作废、
+    **导出出货明细 CSV**(凭据档案提供"含 auth_key"勾选项);
+- 设置页:`[provision]` 可视化编辑(档案切换、工单版本、阈值、正则、闸门模式、`auto_commit`、
+  `check_sdcard`、`reboot_verify_secs`、`config_path`、4G 模板编辑)。
 
 CLI 对应(`e02-factory-rs ship --sn X [--dry-run]`)为后续可选项,不阻塞。
 
@@ -196,24 +343,27 @@ CLI 对应(`e02-factory-rs ship --sn X [--dry-run]`)为后续可选项,不阻塞
 
 | 步骤 | 内容 | 依赖真机 |
 |---|---|---|
-| 1 | `src/stock.rs`:双池 + 导入校验 + 取用制(纯逻辑,单测全覆盖) | 否 |
-| 2 | `protocol.rs`:`parse_cf30_response`(config-update/回显键值/trim)、`parse_battery_volts`(覆盖 `Bat vol:`/`Vol:4.326,cur:`/`voltage:` 已见格式)、版本比较器 | 否 |
-| 3 | `src/provision.rs`:流程引擎(§3 步骤编排、失败路径、幂等) | 否(fake-adb mock) |
-| 4 | 报告改造:文件名工位段 + 按工位统计 + ship 前缀渲染 + 旧文件兼容 | 否 |
-| 5 | `ledger.rs::mark_shipped` + serno.txt 追加 + `config.rs [provision]` | 否 |
-| 6 | UI:模式切换 + 出厂页 + 导入界面 | 否 |
-| 7 | 真机联调:cf30 三键实测、cf7 版本格式、正式版重启后 adb 是否在线(决定 ⑪ 探测行为) | **是** |
+| 1 | `Cargo.toml` 加 `regex-lite`;`src/stock.rs`:双池三态枚举 + 导入清洗/校验/跳过合并 + 领用预落盘与幂等复原(纯逻辑,单测全覆盖) | 否 |
+| 2 | `protocol.rs`:`CameraFactory` 补 `4`/`7`/`30`、`parse_cf30_response`(去控制符/Section 隔离/trim)、`parse_battery_volts`(排除 `%`、兼容 V/mV)、`parse_bt_version`、**修复 `ccid_valid` 支持十六进制字母** | 否 |
+| 3 | `src/provision.rs`:流程引擎(§3 ⓪–⑫ 编排、占位 SN 判断、预落盘失败路径、幂等、预期重启隔离 `devwatch`) | 否(fake-adb mock) |
+| 3.5 | `provision.rs` 4G 配置步骤:`adb shell 4g-test` 封装(引号转义/输出内容判定) + 模板校验/占位符替换 + `CFGSTART` 整轮重试 + `CFGREAD` 归一化比对(fake-4g-test mock) | 否 |
+| 4 | 报告改造:文件名工位段(`e02-`/`e02e-`) + `list_reports` 按日期/mtime 倒排 + `display_name` 适配 + 按工位统计 + `ship-` 渲染与统计 + 旧文件兼容 | 否 |
+| 5 | `ledger.rs`:整机工位判定字段 + `shipped_sn` 分离 + `mark_shipped` upsert;出货明细 CSV 自适应列导出;`config.rs [provision]` 强类型档案结构 | 否 |
+| 6 | UI:模式切换 + 出厂页(含导入/库存维护/出货 CSV 导出) + 设置页 `[provision]` + 切工位触发 `refresh_stats()` | 否 |
+| 7 | 真机联调:cf30 三键实测、cf7 版本格式、正式版重启后 adb 是否在线(决定 ⑫ `reboot_verify_secs` 默认值)、`4g-test` 与设备取号进程的 `/dev/ttyS2` 互斥 | **是** |
 
-测试策略沿用 worker.rs 的 fake-adb mock 模式;重点覆盖:异号拒写、同号
-重跑幂等、凭据断供拒写、cf30 false/协议异常、回显键值不匹配、导入整批
-拒入、跨工位报告不覆盖。
+测试策略沿用 `worker.rs` 的 fake-adb mock 模式;重点覆盖:新机占位 SN 放行与已写正式 SN 异号拒写、
+同号重跑幂等与凭据复原、凭据预落盘防崩溃撞号、凭据断供拒写、cf30 false/协议异常/跨 Section 同名键、
+电压百分比行防误判、4G 失败整轮重试无重复行、导入整批拒入与重复跳过、跨工位报告不覆盖与 `ship-` 排序。
 
 ## 11. 依赖与风险
 
 | 项 | 状态 | 说明 |
 |---|---|---|
-| cf30 固件落地 | ✅ 已实测 | true/false 判定约定已确认 |
-| cf4/cf7 语义 | ✅ 已确认 | cf4 最后执行、重启生效;cf7 蓝牙版本 |
-| **固件:uuid/auth_key 外写后不自生成** | ⚠️ 需固件保证 | 仅值为空时生成;⑪ 重启后复核是验收手段 |
-| 正式版重启后 adb 是否在线 | ❓ 联调确认 | 不在线则 ⑪ 降级为记日志跳过 |
-| E02E 适配 | 同流程 | 绑定对为蓝牙↔IMEI,其余不变 |
+| cf30 固件落地 | ✅ 已实测 | `config-update:true/false` + 回显判定约定已确认 |
+| cf4 / cf7 语义 | ✅ 已确认 | cf4 最后执行、重启生效;cf7 返回蓝牙版本(输出格式联调校准) |
+| `webrtc_serno_file.ini` 设备端路径 | ✅ 已确认 | `/config/webrtc_serno_file.ini`(2026-11-24),用于 ⓪ 预读现值与 ⑫ 复核 |
+| **固件:uuid/auth_key 外写后不自生成** | ⚠️ 需固件保证 | 仅值为空时生成;⑫ 重启后复核是验收手段 |
+| **4g-test 设备端 CLI(系统同事)** | 🔶 待开发/实测 | 默认 `/dev/ttyS2`@115200,随固件落地、经 `adb shell` 调用(§3.1 契约);未到位前档案不配 `fourg` 即跳过;**须与设备取号进程约定串口互斥,真机实测 20+ 轮 PROD→CFG 事务稳定** |
+| 正式版重启后 adb 是否在线 | ❓ 联调确认 | 若确认无 adb,量产配置将 `reboot_verify_secs` 设为 `0` 免白等 60s |
+| E02E 适配 | 同流程 | 绑定对为蓝牙↔IMEI,CCID 兼容十六进制字母,其余不变 |
