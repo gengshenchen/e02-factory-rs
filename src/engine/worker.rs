@@ -224,13 +224,18 @@ pub fn run_sequence(
         }
     }
     exec::set_default_timeout(prev_timeout);
-    // 测后回填整机判定（台账"最近判定"列；bind 入过账的机器才会命中）
+    // 测后回填整机判定（台账"最近判定"列；bind 入过账的机器才会命中）。
+    // FQC §3 ① 闸门防绕过：仅当整机工位（complete）且当前型号整机全部
+    // 启用项均已执行且全部 PASS（排除单项补测与中途停止），才置整机 PASS。
     if cfg.binding.enable && !device.bt_mac.is_empty() {
+        let verdict = report::overall(&results, true);
+        let complete_all_pass = is_complete_full_pass(cfg, model, &results, verdict);
         let mut ledger = Ledger::load(&ledger_path);
         ledger.set_verdict(
             &device.bt_mac,
-            report::overall(&results, true),
+            verdict,
             &cfg.station,
+            complete_all_pass,
             &report::time_str(SystemTime::now()),
         );
         if let Err(e) = ledger.save(&ledger_path) {
@@ -266,10 +271,36 @@ fn write_update(
     path
 }
 
+/// 判断本次测试结果是否满足"整机工位全测 PASS"（FQC 闸门严口径）：
+/// 当前工位为 `complete`、总判定为 `PASS`、且该型号在整机档案下的全部
+/// 启用项（含必测 info/btmac）均已测且为 PASS（防单项补测或中途停止绕过）。
+fn is_complete_full_pass(
+    cfg: &Config,
+    model: ModelKind,
+    results: &[TestResult],
+    verdict: &str,
+) -> bool {
+    if cfg.station != "complete" || verdict != "PASS" {
+        return false;
+    }
+    let required: Vec<TestItem> = cfg
+        .active_items()
+        .into_iter()
+        .filter(|i| i.available_for(model))
+        .collect();
+    !required.is_empty()
+        && required.iter().all(|req| {
+            results
+                .iter()
+                .any(|r| r.item == *req && r.verdict.is_pass())
+        })
+}
+
 /// 绑定校验执行一次（V3.13；V3.14 型号化绑定对）：蓝牙 MAC 与绑定对
 /// 另一半（E02=WiFi MAC，E02E=IMEI）都齐备且本轮未校验过。
 /// 结果行进序列/报告；台账即时落盘（应用随时可能被关），变更前重读
 /// 磁盘（设置窗可能在测试中改台账）。
+#[allow(clippy::too_many_arguments)]
 fn maybe_bind(
     enable: bool,
     done: &mut bool,
@@ -298,7 +329,7 @@ fn maybe_bind(
         partner,
         model.label(),
         &device.sn,
-        &cfg_station,
+        cfg_station,
         &now,
     ) {
         BindCheck::New => {

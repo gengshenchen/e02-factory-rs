@@ -65,6 +65,17 @@ pub struct LedgerRecord {
     pub ccid: String,
 }
 
+/// 出厂回填参数（收拢字段，避免长参列表）。
+pub struct ShipMeta<'a> {
+    pub bt_mac: &'a str,
+    pub partner: &'a str,
+    pub model: &'a str,
+    pub sn: &'a str,
+    pub ccid: &'a str,
+    pub verdict: &'a str,
+    pub now: &'a str,
+}
+
 /// 绑定校验结论。
 #[derive(Debug, Clone, PartialEq)]
 pub enum BindCheck {
@@ -187,17 +198,30 @@ impl Ledger {
         BindCheck::New
     }
 
-    /// 测后回填整机判定（bind 已入账/复测过的机器）。整机工位
-    /// （complete）同时更新 complete_verdict（FQC 闸门依据）。
-    pub fn set_verdict(&mut self, bt: &str, verdict: &str, station: &str, now: &str) {
+    /// 测后回填整机判定（bind 已入账/复测过的机器）。
+    ///
+    /// FQC §3 ① 闸门防绕过：仅当整机工位（`complete`）且 `complete_all_pass`
+    /// 为 true（该型号整机应测项全覆盖且全部 PASS，排除单项补测与中途停止）
+    /// 时，才写 `complete_verdict = "PASS"`；若整机工位出现 FAIL，则写入
+    /// `"FAIL"` 覆盖旧 PASS。
+    pub fn set_verdict(
+        &mut self,
+        bt: &str,
+        verdict: &str,
+        station: &str,
+        complete_all_pass: bool,
+        now: &str,
+    ) {
         if let Some(rec) = self.devices.get_mut(bt.trim().to_uppercase().as_str()) {
             rec.last_verdict = verdict.into();
             rec.last_station = station.into();
             rec.last_seen = now.into();
             if station == "complete" {
-                rec.complete_verdict = verdict.into();
-                if verdict == "PASS" {
+                if complete_all_pass {
+                    rec.complete_verdict = "PASS".into();
                     rec.complete_pass_at = now.into();
+                } else if verdict == "FAIL" {
+                    rec.complete_verdict = "FAIL".into();
                 }
             }
         }
@@ -228,27 +252,59 @@ impl Ledger {
         recs
     }
 
+    /// 只读检查 `(bt, partner)` 是否与现有台账记录冲突（FQC 出厂写号前置防呆：
+    /// 拦截两台设备烧重同一蓝牙 MAC 或同一 WiFi MAC / IMEI，保护原机台账）。
+    pub fn check_pair(&self, bt: &str, partner: &str) -> Option<BindCheck> {
+        let (bt, partner) = (bt.trim().to_uppercase(), partner.trim().to_uppercase());
+        if bt.is_empty() || partner.is_empty() {
+            return None;
+        }
+        if let Some(rec) = self.devices.get(&bt) {
+            if !rec.partner.is_empty() && rec.partner != partner {
+                return Some(BindCheck::BtConflict { other: rec.clone() });
+            }
+        }
+        if let Some(other) = self
+            .devices
+            .values()
+            .find(|r| r.bt_mac != bt && !r.partner.is_empty() && r.partner == partner)
+            .cloned()
+        {
+            return Some(BindCheck::PartnerConflict { other });
+        }
+        None
+    }
+
     /// 出厂回填 upsert（FQC §7）：台账尚无该 BT MAC 记录时按本次读到的
     /// 身份自动建档（warn 闸门下旧工具测完过渡期的机器），再写出厂字段。
-    /// ccid = eSIM 型出厂读到的 CCID（E02 传空）。
-    pub fn mark_shipped(
-        &mut self,
-        bt: &str,
-        partner: &str,
-        model: &str,
-        sn: &str,
-        ccid: &str,
-        verdict: &str,
-        now: &str,
-    ) {
-        let (bt, partner) = (bt.trim().to_uppercase(), partner.trim().to_uppercase());
+    /// 若检测到与既有记录存在绑定对冲突，拒绝覆盖并返回错误，保护原机出厂记录。
+    pub fn mark_shipped(&mut self, meta: &ShipMeta<'_>) -> Result<(), String> {
+        let (bt, partner) = (
+            meta.bt_mac.trim().to_uppercase(),
+            meta.partner.trim().to_uppercase(),
+        );
+        if let Some(conflict) = self.check_pair(&bt, &partner) {
+            return Err(match conflict {
+                BindCheck::BtConflict { other } => format!(
+                    "蓝牙 {bt} 已绑定 {}（首见 {}），拒绝用新设备覆盖台账",
+                    other.partner, other.first_seen
+                ),
+                BindCheck::PartnerConflict { other } => format!(
+                    "绑定值 {partner} 已归属蓝牙 {}（首见 {}），拒绝重复入账",
+                    other.bt_mac, other.first_seen
+                ),
+                _ => unreachable!(),
+            });
+        }
+        let sn = meta.sn.trim().to_uppercase();
+        let ccid = meta.ccid.trim().to_uppercase();
         if let Some(rec) = self.devices.get_mut(&bt) {
-            rec.shipped_sn = sn.trim().to_uppercase();
-            rec.shipped_at = now.into();
-            rec.ship_verdict = verdict.into();
-            rec.last_seen = now.into();
-            if !ccid.trim().is_empty() {
-                rec.ccid = ccid.trim().to_uppercase();
+            rec.shipped_sn = sn;
+            rec.shipped_at = meta.now.into();
+            rec.ship_verdict = meta.verdict.into();
+            rec.last_seen = meta.now.into();
+            if !ccid.is_empty() {
+                rec.ccid = ccid;
             }
             if rec.partner.is_empty() {
                 rec.partner = partner;
@@ -259,22 +315,23 @@ impl Ledger {
                 LedgerRecord {
                     bt_mac: bt,
                     partner,
-                    model: model.into(),
+                    model: meta.model.into(),
                     sn: String::new(),
-                    first_seen: now.into(),
-                    last_seen: now.into(),
+                    first_seen: meta.now.into(),
+                    last_seen: meta.now.into(),
                     tests: 0,
                     last_verdict: String::new(),
                     last_station: String::new(),
                     complete_verdict: String::new(),
                     complete_pass_at: String::new(),
-                    shipped_sn: sn.trim().to_uppercase(),
-                    shipped_at: now.into(),
-                    ship_verdict: verdict.into(),
-                    ccid: ccid.trim().to_uppercase(),
+                    shipped_sn: sn,
+                    shipped_at: meta.now.into(),
+                    ship_verdict: meta.verdict.into(),
+                    ccid,
                 },
             );
         }
+        Ok(())
     }
 
     /// 删单条（误录/返修换地址后清理）。
@@ -325,18 +382,39 @@ mod tests {
         let mut l = Ledger::default();
         // 新机入账（SN 留证）
         assert_eq!(
-            l.bind("0011A3B4C5D6", "00:60:A7:0B:9C:F2", "E02", "00001", "complete", "t1"),
+            l.bind(
+                "0011A3B4C5D6",
+                "00:60:A7:0B:9C:F2",
+                "E02",
+                "00001",
+                "complete",
+                "t1"
+            ),
             BindCheck::New
         );
         // 同对再现 = 同机复测，计数累加
         assert_eq!(
-            l.bind("0011a3b4c5d6", "00:60:a7:0b:9c:f2", "E02", "", "complete", "t2"),
+            l.bind(
+                "0011a3b4c5d6",
+                "00:60:a7:0b:9c:f2",
+                "E02",
+                "",
+                "complete",
+                "t2"
+            ),
             BindCheck::Retest { tests: 2 }
         );
         // 同蓝牙不同绑定值 = 烧错地址，冲突且不动台账
         let before = l.clone();
         assert!(matches!(
-            l.bind("0011A3B4C5D6", "00:60:A7:0B:9C:99", "E02", "", "complete", "t3"),
+            l.bind(
+                "0011A3B4C5D6",
+                "00:60:A7:0B:9C:99",
+                "E02",
+                "",
+                "complete",
+                "t3"
+            ),
             BindCheck::BtConflict { .. }
         ));
         assert_eq!(l, before);
@@ -346,10 +424,24 @@ mod tests {
     #[test]
     fn partner_conflict_symmetric() {
         let mut l = Ledger::default();
-        l.bind("0011A3B4C5D6", "00:60:A7:0B:9C:F2", "E02", "", "complete", "t1");
+        l.bind(
+            "0011A3B4C5D6",
+            "00:60:A7:0B:9C:F2",
+            "E02",
+            "",
+            "complete",
+            "t1",
+        );
         // 不同蓝牙占同一绑定值同样告警
         assert!(matches!(
-            l.bind("9999A3B4C5D6", "00:60:A7:0B:9C:F2", "E02", "", "complete", "t2"),
+            l.bind(
+                "9999A3B4C5D6",
+                "00:60:A7:0B:9C:F2",
+                "E02",
+                "",
+                "complete",
+                "t2"
+            ),
             BindCheck::PartnerConflict { .. }
         ));
         assert_eq!(l.len(), 1); // 冲突不入账
@@ -360,17 +452,38 @@ mod tests {
     fn esim_binds_bt_to_imei() {
         let mut l = Ledger::default();
         assert_eq!(
-            l.bind("0011A3B4C5D6", "860123456789012", "E02E", "", "complete", "t1"),
+            l.bind(
+                "0011A3B4C5D6",
+                "860123456789012",
+                "E02E",
+                "",
+                "complete",
+                "t1"
+            ),
             BindCheck::New
         );
         // 同蓝牙不同 IMEI（双机同蓝牙地址）冲突
         assert!(matches!(
-            l.bind("0011A3B4C5D6", "860999999999999", "E02E", "", "complete", "t2"),
+            l.bind(
+                "0011A3B4C5D6",
+                "860999999999999",
+                "E02E",
+                "",
+                "complete",
+                "t2"
+            ),
             BindCheck::BtConflict { .. }
         ));
         // 同对复测放行
         assert_eq!(
-            l.bind("0011A3B4C5D6", "860123456789012", "E02E", "", "complete", "t3"),
+            l.bind(
+                "0011A3B4C5D6",
+                "860123456789012",
+                "E02E",
+                "",
+                "complete",
+                "t3"
+            ),
             BindCheck::Retest { tests: 2 }
         );
     }
@@ -379,7 +492,7 @@ mod tests {
     fn verdict_roundtrip_and_remove() {
         let mut l = Ledger::default();
         l.bind("0011A3B4C5D6", "AA", "E02", "", "complete", "t1");
-        l.set_verdict("0011A3B4C5D6", "FAIL", "complete", "t2");
+        l.set_verdict("0011A3B4C5D6", "FAIL", "complete", false, "t2");
         assert_eq!(l.recent(5)[0].last_verdict, "FAIL");
         assert_eq!(l.recent(5)[0].last_seen, "t2");
         assert!(l.remove("0011a3b4c5d6")); // 大小写不敏感
@@ -403,7 +516,9 @@ mod tests {
         l.bind("9999A3B4C5D6", "BB", "E02E", "", "complete", "t2");
         let csv = l.to_csv();
         assert!(csv.starts_with('\u{FEFF}'));
-        assert!(csv.contains("蓝牙MAC,绑定值(WiFi/IMEI),型号,SN,首测,最近,测试次数,最近判定,最近工位"));
+        assert!(
+            csv.contains("蓝牙MAC,绑定值(WiFi/IMEI),型号,SN,首测,最近,测试次数,最近判定,最近工位")
+        );
         let b = csv.lines().nth(1).unwrap();
         assert!(b.starts_with("9999A3B4C5D6,BB,E02E"), "{csv}");
         let _ = std::fs::remove_dir_all(&dir);
@@ -437,14 +552,20 @@ mod tests {
     fn gate_requires_complete_pass() {
         let mut l = Ledger::default();
         l.bind("0011A3B4C5D6", "AA", "E02", "", "module", "t1");
-        l.set_verdict("0011A3B4C5D6", "PASS", "module", "t1");
+        l.set_verdict("0011A3B4C5D6", "PASS", "module", false, "t1");
         assert!(!l.complete_pass("0011A3B4C5D6"), "模组工位 PASS 不满足闸门");
-        l.set_verdict("0011A3B4C5D6", "PASS", "complete", "t2");
+        // 整机工位仅单项补测/中途停止（complete_all_pass=false）也不得绕过闸门
+        l.set_verdict("0011A3B4C5D6", "PASS", "complete", false, "t1b");
+        assert!(
+            !l.complete_pass("0011A3B4C5D6"),
+            "整机工位未跑全项不得置位整机 PASS"
+        );
+        l.set_verdict("0011A3B4C5D6", "PASS", "complete", true, "t2");
         assert!(l.complete_pass("0011A3B4C5D6"));
         assert_eq!(l.recent(1)[0].complete_pass_at, "t2");
         assert_eq!(l.recent(1)[0].last_station, "complete");
         // 整机 FAIL 覆盖 PASS（返修重测）
-        l.set_verdict("0011A3B4C5D6", "FAIL", "complete", "t3");
+        l.set_verdict("0011A3B4C5D6", "FAIL", "complete", false, "t3");
         assert!(!l.complete_pass("0011A3B4C5D6"));
         // 查无此机 = 不满足
         assert!(!l.complete_pass("UNKNOWN"));
@@ -456,7 +577,16 @@ mod tests {
     fn mark_shipped_upsert_and_sn_isolation() {
         let mut l = Ledger::default();
         // 过渡期机器：台账无记录 → upsert 自动建档
-        l.mark_shipped("0011A3B4C5D6", "AA", "E02", "6302W1000248", "", "PASS", "t1");
+        l.mark_shipped(&ShipMeta {
+            bt_mac: "0011A3B4C5D6",
+            partner: "AA",
+            model: "E02",
+            sn: "6302W1000248",
+            ccid: "",
+            verdict: "PASS",
+            now: "t1",
+        })
+        .unwrap();
         let rec = &l.recent(1)[0];
         assert_eq!(rec.shipped_sn, "6302W1000248");
         assert_eq!(rec.ship_verdict, "PASS");
@@ -464,7 +594,37 @@ mod tests {
         assert_eq!(rec.tests, 0);
         // 已有记录：出厂字段回填，绑定值不动；ccid 仅 eSIM 型落值
         l.bind("0011A3B4C5D6", "AA", "E02", "00001", "complete", "t2");
-        l.mark_shipped("0011A3B4C5D6", "AA", "E02", "6302W1000248", "", "PASS", "t3");
+        l.mark_shipped(&ShipMeta {
+            bt_mac: "0011A3B4C5D6",
+            partner: "AA",
+            model: "E02",
+            sn: "6302W1000248",
+            ccid: "",
+            verdict: "PASS",
+            now: "t3",
+        })
+        .unwrap();
+        // 双机烧重同蓝牙 MAC（partner=ZZ ≠ AA）：check_pair 检出冲突，mark_shipped 拒绝覆盖原机 SN
+        assert!(matches!(
+            l.check_pair("0011A3B4C5D6", "ZZ"),
+            Some(BindCheck::BtConflict { .. })
+        ));
+        assert!(l
+            .mark_shipped(&ShipMeta {
+                bt_mac: "0011A3B4C5D6",
+                partner: "ZZ",
+                model: "E02",
+                sn: "6302W9999999",
+                ccid: "",
+                verdict: "PASS",
+                now: "t3x",
+            })
+            .is_err());
+        assert_eq!(
+            l.recent(1)[0].shipped_sn,
+            "6302W1000248",
+            "原机出厂 SN 不得被冲掉"
+        );
         let rec = &l.recent(1)[0];
         assert_eq!(rec.shipped_sn, "6302W1000248");
         assert_eq!(rec.shipped_at, "t3");
@@ -479,7 +639,16 @@ mod tests {
             l.find_by_shipped_sn("6302W1000248").unwrap().bt_mac,
             "0011A3B4C5D6"
         );
-        l.mark_shipped("9999A3B4C5D6", "BB", "E02E", "6322E1001999", "898608691025D0767784", "PASS", "t5");
+        l.mark_shipped(&ShipMeta {
+            bt_mac: "9999A3B4C5D6",
+            partner: "BB",
+            model: "E02E",
+            sn: "6322E1001999",
+            ccid: "898608691025D0767784",
+            verdict: "PASS",
+            now: "t5",
+        })
+        .unwrap();
         assert_eq!(
             l.find_by_shipped_sn("6322E1001999").unwrap().bt_mac,
             "9999A3B4C5D6"

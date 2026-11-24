@@ -41,7 +41,7 @@ fn main() -> eframe::Result<()> {
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
-    tracing::info!("E02 工厂测试工具启动");
+    tracing::info!("E02 工厂测试工具 v{} 启动", env!("CARGO_PKG_VERSION"));
 
     // 有命令行参数 → CLI 模式（M1）；无参数 → 图形界面
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -57,7 +57,7 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
     eframe::run_native(
-        "E02 工厂测试工具",
+        &format!("E02 工厂测试工具 v{}", env!("CARGO_PKG_VERSION")),
         options,
         Box::new(|cc| Ok(Box::new(app::E02App::new(cc)))),
     )

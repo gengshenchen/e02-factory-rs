@@ -31,7 +31,7 @@ impl EntryStatus {
     pub fn label(self) -> &'static str {
         match self {
             EntryStatus::Available => "未用",
-            EntryStatus::Allocated => "已分配",
+            EntryStatus::Allocated => "占用中",
             EntryStatus::Committed => "已写入",
             EntryStatus::Voided => "已作废",
         }
@@ -128,17 +128,38 @@ impl ProvisionStock {
     }
 
     pub fn available_sns(&self) -> usize {
-        self.sns
-            .iter()
-            .filter(|e| e.status == EntryStatus::Available)
-            .count()
+        self.count_sn_status(EntryStatus::Available)
     }
 
     pub fn available_credentials(&self) -> usize {
+        self.count_cred_status(EntryStatus::Available)
+    }
+
+    pub fn count_sn_status(&self, status: EntryStatus) -> usize {
+        self.sns.iter().filter(|e| e.status == status).count()
+    }
+
+    pub fn count_cred_status(&self, status: EntryStatus) -> usize {
         self.credentials
             .iter()
-            .filter(|e| e.status == EntryStatus::Available)
+            .filter(|e| e.status == status)
             .count()
+    }
+
+    /// 数量提醒：启用凭据写入时，未用 SN 多于未用凭据则提醒及时补充。
+    pub fn mismatch_warning(&self, needs_cred: bool) -> Option<String> {
+        if !needs_cred || !self.has_sn_pool() {
+            return None;
+        }
+        let sns = self.available_sns();
+        let creds = self.available_credentials();
+        if sns > creds {
+            Some(format!(
+                "凭据余量不足：未用 SN（{sns}）多于未用凭据（{creds}），请及时补充凭据"
+            ))
+        } else {
+            None
+        }
     }
 
     /// SN 池是否已导入（池非空即视为已导入——空批次导入无意义）。
@@ -217,9 +238,11 @@ impl ProvisionStock {
                 return out;
             }
         };
-        let mut batch: Vec<(String, String)> = Vec::new();
+        let mut batch: Vec<(usize, String, String)> = Vec::new();
         for (idx, line) in text.lines().enumerate() {
-            let Some(line) = clean_line(line) else { continue };
+            let Some(line) = clean_line(line) else {
+                continue;
+            };
             let lineno = idx + 1;
             // 分隔符：逗号 / Tab / 连续空白，取分割后恰好 2 列
             let cols: Vec<&str> = if line.contains(',') {
@@ -227,16 +250,24 @@ impl ProvisionStock {
             } else {
                 line.split_whitespace().collect()
             };
-            // Tab 已被 split_whitespace 覆盖；显式 split('\t') 分支给
-            // "uuid\tauth_key" 无空格场景（split_whitespace 同样正确处理）
             if cols.len() != 2 {
-                out.errors
-                    .push(format!("第 {lineno} 行应为 uuid/auth_key 两列（逗号/Tab/空格分隔）: {line}"));
+                out.errors.push(format!(
+                    "第 {lineno} 行应为 uuid/auth_key 两列（逗号/Tab/空格分隔）: {line}"
+                ));
+                continue;
+            }
+            // 常见 CSV 首行表头（uuid,auth_key）自动跳过，避免客户文件带表头被误拒
+            if batch.is_empty()
+                && out.errors.is_empty()
+                && cols[0].eq_ignore_ascii_case("uuid")
+                && cols[1].eq_ignore_ascii_case("auth_key")
+            {
                 continue;
             }
             let (uuid, key) = (cols[0].to_string(), cols[1].to_string());
             if !re_uuid.is_match(&uuid) {
-                out.errors.push(format!("第 {lineno} 行 uuid 格式不符: {uuid}"));
+                out.errors
+                    .push(format!("第 {lineno} 行 uuid 格式不符: {uuid}"));
                 continue;
             }
             if !re_key.is_match(&key) {
@@ -244,29 +275,32 @@ impl ProvisionStock {
                     .push(format!("第 {lineno} 行 auth_key 格式不符: {key}"));
                 continue;
             }
-            if let Some((_, prev)) = batch.iter().find(|(u, _)| *u == uuid) {
+            if let Some((_, _, prev)) = batch.iter().find(|(_, u, _)| *u == uuid) {
                 out.errors.push(format!(
                     "第 {lineno} 行 uuid 批内重复（首见 auth_key {}）: {uuid}",
                     clip_secret(prev)
                 ));
                 continue;
             }
-            batch.push((uuid, key));
+            batch.push((lineno, uuid, key));
+        }
+        // 只读阶段二：检查与现有库存的 auth_key 冲突，确保任一错整批拒入且库存零变更
+        for (lineno, uuid, key) in &batch {
+            if let Some(prev) = self.credentials.iter().find(|e| e.uuid == *uuid) {
+                if prev.auth_key != *key {
+                    out.errors.push(format!(
+                        "第 {lineno} 行 uuid {uuid} 与库存现有条目 auth_key 冲突（库存 {}）",
+                        clip_secret(&prev.auth_key)
+                    ));
+                }
+            }
         }
         if !out.ok() {
             return out;
         }
-        for (uuid, key) in batch {
-            if let Some(prev) = self.credentials.iter().find(|e| e.uuid == uuid) {
-                if prev.auth_key == key {
-                    out.skipped_dup += 1; // 完全一致 → 跳过，已写状态不重置
-                } else {
-                    // 同 uuid 不同 auth_key：两份客户文件互冲，整批拒入
-                    out.errors.push(format!(
-                        "uuid {uuid} 与库存现有条目 auth_key 冲突（库存 {}）",
-                        clip_secret(&prev.auth_key)
-                    ));
-                }
+        for (_, uuid, key) in batch {
+            if self.credentials.iter().any(|e| e.uuid == uuid) {
+                out.skipped_dup += 1; // 完全一致 → 跳过，已写状态不重置
                 continue;
             }
             self.credentials.push(CredEntry {
@@ -278,11 +312,6 @@ impl ProvisionStock {
                 updated_at: now.into(),
             });
             out.added += 1;
-        }
-        if !out.ok() {
-            // 冲突拒入：本批新增回滚（错误在逐条合并阶段发现）
-            // ——实现上错误只可能来自"库存冲突"分支，该分支不新增条目，
-            // 但为防御后续演进，仍以整体一致性为准：失败时调用方不落盘。
         }
         out
     }
@@ -297,7 +326,12 @@ impl ProvisionStock {
 
     /// 领取下一个未用凭据并预落盘为 allocated（绑定 SN + 蓝牙 MAC）。
     /// 返回 None = 池空（凭据档案此时拒写）。调用方负责 save。
-    pub fn claim_next_credential(&mut self, sn: &str, bt_mac: &str, now: &str) -> Option<CredEntry> {
+    pub fn claim_next_credential(
+        &mut self,
+        sn: &str,
+        bt_mac: &str,
+        now: &str,
+    ) -> Option<CredEntry> {
         let idx = self
             .credentials
             .iter()
@@ -381,7 +415,52 @@ impl ProvisionStock {
         before - self.credentials.len()
     }
 
-    /// 凭据按 uuid 查找（出货 CSV / 展示用）。
+    /// 挂起（已预分配但未完成出厂 PASS）的 SN 列表，供库存维护页释放或作废。
+    pub fn allocated_sns(&self) -> Vec<&SnEntry> {
+        self.sns
+            .iter()
+            .filter(|e| e.status == EntryStatus::Allocated)
+            .collect()
+    }
+
+    /// 挂起（已预分配但未完成出厂 PASS）的凭据列表。
+    pub fn allocated_credentials(&self) -> Vec<&CredEntry> {
+        self.credentials
+            .iter()
+            .filter(|c| c.status == EntryStatus::Allocated)
+            .collect()
+    }
+
+    /// 将挂起（Allocated）的 SN 释放回未用（误扫/未写入即中断换码场景）；
+    /// 已出厂（Committed）或已作废（Voided）严禁释放。
+    pub fn release_allocated_sn(&mut self, sn: &str, now: &str) -> bool {
+        if let Some(e) = self.sns.iter_mut().find(|e| e.sn == sn) {
+            if e.status == EntryStatus::Allocated {
+                e.status = EntryStatus::Available;
+                e.bound_bt_mac.clear();
+                e.updated_at = now.into();
+                return true;
+            }
+        }
+        false
+    }
+
+    /// 将挂起（Allocated）的凭据释放回未用（确认设备未烧入该凭据时人工释放）；
+    /// 已出厂（Committed）或已作废（Voided）严禁释放。
+    pub fn release_allocated_credential(&mut self, uuid: &str, now: &str) -> bool {
+        if let Some(c) = self.credentials.iter_mut().find(|c| c.uuid == uuid) {
+            if c.status == EntryStatus::Allocated {
+                c.status = EntryStatus::Available;
+                c.bound_sn.clear();
+                c.bound_bt_mac.clear();
+                c.updated_at = now.into();
+                return true;
+            }
+        }
+        false
+    }
+
+    /// 凭据按绑定 SN 查找（出货 CSV / 展示用）。
     pub fn credential_by_sn(&self, sn: &str) -> Option<&CredEntry> {
         self.credentials
             .iter()
@@ -389,13 +468,14 @@ impl ProvisionStock {
     }
 }
 
-/// 凭据脱敏截断（错误信息里不落全值）。
-fn clip_secret(s: &str) -> String {
+/// 凭据脱敏截断（日志/错误信息不落全值；按字符边界切，避免非 ASCII panic）。
+pub(crate) fn clip_secret(s: &str) -> String {
     let n = s.chars().count();
     if n <= 6 {
         "****".into()
     } else {
-        format!("{}…（{} 字符）", &s[..4], n)
+        let head: String = s.chars().take(4).collect();
+        format!("{head}…（{n} 字符）")
     }
 }
 
@@ -530,17 +610,24 @@ mod tests {
         let mut st = ProvisionStock::default();
         let uuid1 = "uuid95fe79695a6df72f";
         let key1 = "B7uTB4QjoSLw55oHLk2wPSokAAwWXENH";
-        // 三种分隔符等价
-        let text = format!("{uuid1},{key1}\nuuid95fe79695a6df730\t{key1}\n");
+        // 首行 CSV 表头自动跳过 + 三种分隔符等价
+        let text = format!("uuid,auth_key\n{uuid1},{key1}\nuuid95fe79695a6df730\t{key1}\n");
         let out = st.import_credentials(&text, UUID_PAT, KEY_PAT, "t1");
         assert!(out.ok(), "{:?}", out.errors);
         assert_eq!(out.added, 2);
 
-        // 同 uuid 不同 auth_key → 整批拒入
-        let bad = format!("{uuid1},AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n");
+        // 第 1 行新凭据 + 第 2 行与库存同 uuid 异 auth_key 冲突 → 整批拒入且库存零变更
+        let before = st.credentials.clone();
+        let bad =
+            format!("uuid95fe79695a6df731,{key1}\n{uuid1},AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n");
         let out = st.import_credentials(&bad, UUID_PAT, KEY_PAT, "t2");
         assert!(!out.ok());
+        assert!(out.errors[0].contains("第 2 行"));
         assert!(out.errors[0].contains("冲突"));
+        assert_eq!(st.credentials, before, "冲突拒入不得残留前序新增条目");
+
+        // clip_secret 非 ASCII 安全不 panic
+        assert!(clip_secret("中文密钥一二三四五").starts_with("中文密钥…"));
 
         // 完全一致 → 跳过
         let same = format!("{uuid1},{key1}\n");
@@ -584,7 +671,11 @@ mod tests {
             .claim_next_credential(&sn("6302W1000249"), "9999A3B4C5D6", "t4")
             .unwrap();
         assert_ne!(c1.uuid, c2.uuid);
-        assert!(st.claim_next_credential(&sn("6302W1000250"), "AA", "t5").is_none(), "池空");
+        assert!(
+            st.claim_next_credential(&sn("6302W1000250"), "AA", "t5")
+                .is_none(),
+            "池空"
+        );
     }
 
     #[test]
@@ -597,20 +688,45 @@ mod tests {
             KEY_PAT,
             "t2",
         );
+        // 数量对账预警：SN 2 > 凭据 1
+        assert!(st.mismatch_warning(true).is_some());
+        assert!(st.mismatch_warning(false).is_none());
         st.mark_sn_allocated("6302W1000248", "0012A3B4C5D6", "t3");
         let c = st
             .claim_next_credential("6302W1000248", "0012A3B4C5D6", "t3")
             .unwrap();
+        assert_eq!(st.allocated_sns().len(), 1);
+        assert_eq!(st.allocated_credentials().len(), 1);
+        // 挂起态允许释放回未用，重领后继续推进
+        assert!(st.release_allocated_sn("6302W1000248", "t3r"));
+        assert!(st.release_allocated_credential(&c.uuid, "t3r"));
+        assert_eq!(st.available_credentials(), 1);
+        st.mark_sn_allocated("6302W1000248", "0012A3B4C5D6", "t3b");
+        let c = st
+            .claim_next_credential("6302W1000248", "0012A3B4C5D6", "t3b")
+            .unwrap();
         // PASS 推进
         assert!(st.commit_sn("6302W1000248", "t4"));
         assert!(st.commit_credential(&c.uuid, "t4"));
-        assert_eq!(st.sn_entry("6302W1000248").unwrap().status, EntryStatus::Committed);
+        // 已 committed 严禁释放回未用
+        assert!(!st.release_allocated_sn("6302W1000248", "t4x"));
+        assert!(!st.release_allocated_credential(&c.uuid, "t4x"));
+        assert_eq!(
+            st.sn_entry("6302W1000248").unwrap().status,
+            EntryStatus::Committed
+        );
         // committed 的 SN 同号重写 mark 不回退
         st.mark_sn_allocated("6302W1000248", "X", "t5");
-        assert_eq!(st.sn_entry("6302W1000248").unwrap().status, EntryStatus::Committed);
+        assert_eq!(
+            st.sn_entry("6302W1000248").unwrap().status,
+            EntryStatus::Committed
+        );
         // 作废终态
         assert!(st.void_sn("6302W1000249", "t6"));
-        assert_eq!(st.sn_entry("6302W1000249").unwrap().status, EntryStatus::Voided);
+        assert_eq!(
+            st.sn_entry("6302W1000249").unwrap().status,
+            EntryStatus::Voided
+        );
         assert!(!st.commit_sn("6302W1000249", "t7"), "voided 不再推进");
         // 清未用：只删 available
         st.import_sns("6302W1000250\n", SN_PAT, "t8");
@@ -631,7 +747,8 @@ mod tests {
             KEY_PAT,
             "t2",
         );
-        st.claim_next_credential("6302W1000248", "0012A3B4C5D6", "t3").unwrap();
+        st.claim_next_credential("6302W1000248", "0012A3B4C5D6", "t3")
+            .unwrap();
         st.save(&path).unwrap();
         assert_eq!(ProvisionStock::load(&path), st);
         // 损坏文件 → 空库存
@@ -672,7 +789,9 @@ mod tests {
         });
         let csv = ship_csv(&rows, true);
         assert!(csv.contains("WiFi MAC,IMEI,CCID,uuid,auth_key"));
-        assert!(csv.contains("6322E1001999,9999A3B4C5D6,E02E,20261124-100001,PASS,,868781080025402"));
+        assert!(
+            csv.contains("6322E1001999,9999A3B4C5D6,E02E,20261124-100001,PASS,,868781080025402")
+        );
         let csv_no_auth = ship_csv(&rows, false);
         assert!(csv_no_auth.contains("uuid"));
         assert!(!csv_no_auth.contains("auth_key"));

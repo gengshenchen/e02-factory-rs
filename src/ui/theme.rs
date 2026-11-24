@@ -45,6 +45,8 @@ pub const HAIRLINE: Color32 = Color32::from_rgb(230, 223, 216);
 pub const DARK: Color32 = Color32::from_rgb(24, 23, 21);
 /// 暖黑上的抬升面（日志里的按钮）
 pub const DARK_ELEVATED: Color32 = Color32::from_rgb(37, 35, 32);
+/// 暖黑内部代码块/明细底色（surface-dark-soft #1f1e1b）
+pub const DARK_SOFT: Color32 = Color32::from_rgb(31, 30, 27);
 /// 暖黑上的文字（奶油白，呼应画布）
 pub const ON_DARK: Color32 = Color32::from_rgb(250, 249, 245);
 /// 暖黑上的次要文字
@@ -200,6 +202,20 @@ pub fn primary(text: &str) -> egui::Button<'static> {
     .stroke(Stroke::NONE)
 }
 
+/// 次级按钮（画布底 + 发丝描边 + 暖墨字，规范 button-secondary）。
+pub fn secondary(text: &str) -> egui::Button<'static> {
+    egui::Button::new(egui::RichText::new(text).color(INK).size(14.5))
+        .fill(CANVAS)
+        .stroke(hairline(HAIRLINE))
+}
+
+/// 行内珊瑚文字链接按钮（规范 text-link：无底无边，珊瑚字色）。
+pub fn text_link(text: &str) -> egui::Button<'static> {
+    egui::Button::new(egui::RichText::new(text).color(PRIMARY).size(13.5))
+        .fill(Color32::TRANSPARENT)
+        .stroke(Stroke::NONE)
+}
+
 /// 危险按钮（红实底白字）：停止测试。
 pub fn danger(text: &str) -> egui::Button<'static> {
     egui::Button::new(
@@ -213,8 +229,8 @@ pub fn danger(text: &str) -> egui::Button<'static> {
 }
 
 /// 今日看板徽章组（报告中心头部用；主界面看板在右面板 stats_card）。
-pub fn today_badges(ui: &mut egui::Ui, t: &DayStats) {
-    badge(ui, &format!("已测 {} 台", t.total), INK, CARD);
+pub fn today_badges(ui: &mut egui::Ui, prefix: &str, t: &DayStats) {
+    badge(ui, &format!("{prefix} {} 台", t.total), INK, CARD);
     let (pf, pb) = if t.pass > 0 {
         (OK_STRONG, OK_BG)
     } else {

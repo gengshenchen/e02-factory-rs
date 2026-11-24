@@ -1,4 +1,4 @@
-//! 应用状态与窗口装配：worker 事件消费、媒体显示、人工判定应答。
+//! 应用状态与窗口装配：worker 事件消费、媒体显示、人工判定应答、三工位统一布局。
 
 use crate::config::{self, Config};
 use crate::devwatch::{self, DevState};
@@ -18,11 +18,18 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 /// 内嵌中文字体：Droid Sans Fallback（Apache-2.0，完整 CJK 覆盖，3.9MB）。
-/// M6 打包阶段如需更精致字形，可换 Noto Sans SC 子集。
 const CJK_FONT: &[u8] = include_bytes!("../assets/fonts/DroidSansFallbackFull.ttf");
 
 /// 视频回放帧率（worker 抽帧同为 2fps）。
 const PLAYBACK_INTERVAL: Duration = Duration::from_millis(200);
+
+/// 4G 模板首启占位注释（文件尚不存在时填充到设置页编辑器）。
+const DEFAULT_FOURG_TPL_HINT: &str = "\
+# E02E 4G 模组配置模板（每行 key=value，禁含引号，支持 {{sn}} 变量）
+# 示例：
+# apn=cmnet
+# server=ota.example.com
+";
 
 /// 人工判定待应答请求（UI 弹窗收集应答后经 reply 传回 worker）。
 pub struct ManualAsk {
@@ -85,14 +92,6 @@ pub enum MediaState {
     },
 }
 
-/// 界面模式（V3.16 FQC）：测试工位页 / 出厂写号页——两页各自独立状态，
-/// 互不抢通道（测试走 UiEvent，写号走 ShipEvent），顶栏分段切换。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Mode {
-    Test,
-    Ship,
-}
-
 /// 写号确认卡（⑥：worker 阻塞等应答；UI 按钮/停止键经 reply 放行或取消）。
 pub struct ShipConfirm {
     pub card: provision::ConfirmCard,
@@ -105,13 +104,21 @@ impl ShipConfirm {
     }
 }
 
-/// 出厂写号页状态（FQC §6）。
+type FilePickMsg = (bool, Result<Option<PathBuf>, String>);
+
+/// 出厂写号工位界面状态（FQC §6）。
 pub struct ShipUi {
     /// 写号流程进行中（扫码输入锁定）
     pub busy: bool,
+    /// 当前正在执行的步骤（左栏高亮与顶栏/底栏状态展示）
+    pub current: Option<provision::ShipStep>,
+    /// 写号进度（顶栏进度条与右栏写号结论卡共用）
+    pub(crate) progress: Option<Progress>,
+    /// 右侧被测设备实时字段快照
+    pub device: provision::ShipDeviceView,
     /// 扫码输入框（回车即开写；trim + 大写后传引擎）
     pub scan_input: String,
-    /// 步骤行（初值按 ShipStep::ALL 排好，事件按 step 原位更新）
+    /// 步骤行（按当前型号有效步骤排好，事件按 step 原位更新）
     pub steps: Vec<provision::ShipStepResult>,
     /// 待应答确认卡
     pub confirm: Option<ShipConfirm>,
@@ -121,18 +128,23 @@ pub struct ShipUi {
     pub last_pass: Option<bool>,
     /// 今日写号统计（ship- 报告扫描）
     pub today: Option<report::DayStats>,
+    /// 批次与库存管理弹窗开关
+    pub stock_open: bool,
+    /// 原生文件选择窗后台等待中
+    pub file_picking: bool,
+    pub(crate) file_pick_rx: Option<Receiver<FilePickMsg>>,
     /// 库存快照（SN/凭据双池；导入/作废/写号结束后刷新）
     pub stock: stock::ProvisionStock,
-    /// SN txt 导入文本框
+    /// SN txt 手动粘贴框
     pub sn_text: String,
-    /// 凭据 txt 导入文本框
+    /// 凭据 txt 手动粘贴框
     pub cred_text: String,
-    /// 导入预检回显（文本变化时重算，不入库）
+    /// 导入预检回显
     pub sn_preview: String,
     pub cred_preview: String,
-    /// 导入/作废操作回执（错误列行号在这里展示）
+    /// 操作回执提示
     pub note: String,
-    /// 出货 CSV 勾选：附带 auth_key（默认只导 uuid，缩小凭据暴露面）
+    /// 出货 CSV 勾选：附带 auth_key（默认只导 uuid）
     pub include_auth_key: bool,
     /// 作废输入（SN 或 uuid）
     pub void_input: String,
@@ -142,12 +154,18 @@ pub struct ShipUi {
     pub clear_sn_armed: bool,
     /// 清空未用凭据两步确认
     pub clear_cred_armed: bool,
+    /// 设置页 4G 模板内联编辑缓冲
+    pub fourg_tpl_buf: String,
+    pub fourg_tpl_dirty: bool,
 }
 
 impl Default for ShipUi {
     fn default() -> Self {
         Self {
             busy: false,
+            current: None,
+            progress: None,
+            device: provision::ShipDeviceView::default(),
             scan_input: String::new(),
             steps: provision::ShipStep::ALL
                 .map(|step| provision::ShipStepResult {
@@ -161,6 +179,9 @@ impl Default for ShipUi {
             rebooting: false,
             last_pass: None,
             today: None,
+            stock_open: false,
+            file_picking: false,
+            file_pick_rx: None,
             stock: stock::ProvisionStock::default(),
             sn_text: String::new(),
             cred_text: String::new(),
@@ -172,13 +193,15 @@ impl Default for ShipUi {
             void_armed: false,
             clear_sn_armed: false,
             clear_cred_armed: false,
+            fourg_tpl_buf: String::new(),
+            fourg_tpl_dirty: false,
         }
     }
 }
 
 /// 应用全局状态。
 pub struct E02App {
-    /// 被测设备信息（原 Deviceinfo 结构）
+    /// 被测设备信息（测试工位）
     pub device: DeviceInfo,
     /// 设备在位状态（V3.8 USB 插拔监测：开测门槛与拔出中止依据）
     pub dev: DevState,
@@ -206,9 +229,11 @@ pub struct E02App {
     pub last_report: Option<PathBuf>,
     /// 报告中心窗口开关
     pub report_open: bool,
-    /// 报告目录（数据目录下 reports/，V3）
+    /// 报告中心筛选维度
+    pub report_filter: ui::dialog_report::ReportFilter,
+    /// 报告目录（数据目录下 reports/）
     pub reports_dir: PathBuf,
-    /// 今日统计（V3 报告中心）
+    /// 今日统计（测试工位）
     pub today: Option<report::DayStats>,
     /// 报告中心：历史列表（新→旧）
     pub report_list: Vec<PathBuf>,
@@ -216,24 +241,19 @@ pub struct E02App {
     pub report_sel: Option<PathBuf>,
     /// 报告中心：选中文件内容缓存（路径, 文本）
     report_text: Option<(PathBuf, String)>,
-    /// 台账卡快照（V3.13）：设置窗打开时从磁盘加载，卡内增删后同步
+    /// 台账卡快照（设置窗打开时从磁盘加载）
     pub ledger_view: crate::ledger::Ledger,
-    /// 台账"清空"两步确认状态（true = 已点一次，按钮显示"确认清空？"）
+    /// 台账"清空"两步确认状态
     pub ledger_clear_armed: bool,
-    /// 当前型号（V3.14）：设备信息读到固件名后自动切换（或手动锁定）
+    /// 当前产品型号（全局唯一真源）
     pub model: config::ModelKind,
-    /// 界面模式（V3.16）：测试页 / 出厂写号页
-    pub mode: Mode,
-    /// 出厂写号页状态（FQC §6）
+    /// 出厂写号工位界面状态
     pub ship: ShipUi,
     event_rx: Option<Receiver<UiEvent>>,
-    /// 在位监测线程事件（V3.8）
     dev_rx: Receiver<DevState>,
     manual_tx: Option<Sender<UiResponse>>,
-    /// 写号 worker 事件 / 应答通道（busy 期间成对在位）
     ship_rx: Option<Receiver<provision::ShipEvent>>,
     ship_answer_tx: Option<Sender<provision::ShipAnswer>>,
-    /// 录像回放声音（V3.6）：OutputStream 须保活，Sink 可替换曲目
     audio_out: Option<(rodio::OutputStream, rodio::OutputStreamHandle)>,
     audio_sink: Option<rodio::Sink>,
 }
@@ -242,9 +262,7 @@ impl E02App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         install_cjk_font(&cc.egui_ctx);
         ui::theme::apply(&cc.egui_ctx);
-        // USB 在位监测（V3.8）：后台线程轮询 adb devices，插拔经事件驱动 UI
         let dev_rx = devwatch::spawn(&cc.egui_ctx);
-        // 配置：exe 同目录 config.toml；缺失用内置默认，坏文件降级并提示
         let (cfg, cfg_err) = match Config::load(&config::default_path()) {
             Ok(c) => (c, None),
             Err(e) => (
@@ -268,6 +286,7 @@ impl E02App {
             settings_open: false,
             last_report: None,
             report_open: false,
+            report_filter: ui::dialog_report::ReportFilter::All,
             reports_dir: crate::paths::data_dir().join("reports"),
             today: None,
             report_list: Vec::new(),
@@ -276,7 +295,6 @@ impl E02App {
             ledger_view: crate::ledger::Ledger::default(),
             ledger_clear_armed: false,
             model,
-            mode: Mode::Test,
             ship: ShipUi::default(),
             event_rx: None,
             dev_rx,
@@ -289,22 +307,69 @@ impl E02App {
         if let Some(msg) = cfg_err {
             app.push_log(msg);
         }
-        app.push_log(format!(
-            "工位: {}（启用 {} 项），数据目录 {}",
-            app.config.station,
-            app.config.active_items().len(),
-            crate::paths::data_dir().display()
-        ));
-        app.push_log("等待设备插入（USB 连接后自动检测）");
-        app.refresh_stats();
-        // 出厂页库存/统计初始加载（FQC §6）
+        app.sync_ship_steps_for_model();
+        app.reload_fourg_template_buf();
         app.ship.stock = stock::ProvisionStock::load(&stock::stock_path());
+        app.refresh_stats();
         app.refresh_ship_stats();
+
+        if app.config.is_ship_station() {
+            app.push_log(format!(
+                "工位: 出厂写号（型号 {}），数据目录 {}",
+                app.model.label(),
+                crate::paths::data_dir().display()
+            ));
+        } else {
+            app.push_log(format!(
+                "工位: {}（型号 {}，启用 {} 项），数据目录 {}",
+                Config::station_label(&app.config.station),
+                app.model.label(),
+                app.batch_items().len(),
+                crate::paths::data_dir().display()
+            ));
+        }
+        app.push_log("等待设备插入（USB 连接后自动检测）");
         app
     }
 
-    /// 开始测试项集：当前工位启用项，按原程序批次顺序执行。
-    /// V3.14：按当前型号过滤不可用项（配置串了型号也不会跑必 FAIL 项）。
+    /// 按当前型号同步写号步骤表（空闲时调用）。
+    pub fn sync_ship_steps_for_model(&mut self) {
+        if self.ship.busy {
+            return;
+        }
+        self.ship.steps = provision::ShipStep::steps_for(self.model)
+            .into_iter()
+            .map(|step| provision::ShipStepResult {
+                step,
+                verdict: provision::StepVerdict::Pending,
+                detail: String::new(),
+                secs: 0,
+            })
+            .collect();
+    }
+
+    /// 从磁盘加载 E02E 的 4G 模板文件到设置页编辑缓冲（文件不存在时填充注释示例）。
+    pub fn reload_fourg_template_buf(&mut self) {
+        let rel = self
+            .config
+            .provision
+            .e02e
+            .fourg
+            .as_ref()
+            .map(|f| f.template.trim())
+            .unwrap_or("templates/e02e_4g.ini");
+        if rel.is_empty() {
+            self.ship.fourg_tpl_buf = DEFAULT_FOURG_TPL_HINT.to_string();
+            self.ship.fourg_tpl_dirty = false;
+            return;
+        }
+        let full = crate::paths::data_dir().join(rel);
+        self.ship.fourg_tpl_buf =
+            std::fs::read_to_string(&full).unwrap_or_else(|_| DEFAULT_FOURG_TPL_HINT.to_string());
+        self.ship.fourg_tpl_dirty = false;
+    }
+
+    /// 开始测试项集：当前工位启用项，按原程序批次顺序执行并按型号过滤。
     pub fn batch_items(&self) -> Vec<TestItem> {
         let active = self.config.active_items();
         worker::BATCH_ORDER
@@ -313,17 +378,16 @@ impl E02App {
             .collect()
     }
 
-    /// 设备是否在线且唯一（可开始测试）。
+    /// 设备是否在线且唯一。
     pub fn device_online(&self) -> bool {
         matches!(self.dev, DevState::Online(_))
     }
 
     /// 启动测试序列（单项或全测）；busy 期间忽略重复触发。
     pub fn start_run(&mut self, items: Vec<TestItem>) {
-        if self.busy || items.is_empty() {
+        if self.busy || self.ship.busy || items.is_empty() {
             return;
         }
-        // 在位门槛（V3.8）：所有测试依赖 USB 连接，未插/多台都不开测
         if !self.device_online() {
             self.push_log(match &self.dev {
                 DevState::Disconnected => "设备未连接：请插入 USB 线后再开始".to_string(),
@@ -348,14 +412,10 @@ impl E02App {
         let reports = self.reports_dir.clone();
         let n = items.len();
         let cfg = self.config.clone();
-        // 设备定向（V3.15）：锁定开始时在线的被测序列号，测试中途电脑上
-        // 插入其他 adb 设备不打断测试（adb 多设备无 -s 直接报错）
         let serial = match &self.dev {
             DevState::Online(sn) => Some(sn.clone()),
             _ => None,
         };
-        // 单项补测以当前整机结果为底稿（V3.9）：测完按项合并、重写整机
-        // 报告，不另散一份单项报告；全测从空白开始
         let base = if items.len() == 1 {
             let active = self.config.active_items();
             worker::RunBase {
@@ -378,9 +438,7 @@ impl E02App {
         self.push_log(format!("开始测试，共 {n} 项（自动项先行，人工项弹窗判定）"));
     }
 
-    /// 操作员请求停止：杀掉当前命令、剩余项记跳过（worker 侧配合）。
-    /// 弹窗立即收起给"已停"反馈（worker 侧 Result/Finished 事件再兜底），
-    /// 回放声音同步停止。
+    /// 操作员请求停止测试。
     pub fn request_stop(&mut self, reason: StopReason) {
         crate::exec::request_abort(reason);
         self.keys_prompt = None;
@@ -393,11 +451,10 @@ impl E02App {
         self.push_log(msg);
     }
 
-    /// 开始一轮出厂写号（扫码回车触发；busy 期间忽略）。镜像 start_run：
-    /// 锁定开始时在线的被测序列号 + ShipCtx 显式注入路径。
+    /// 开始一轮出厂写号（扫码回车触发；busy 期间忽略）。
     pub fn start_ship(&mut self, sn: &str) {
         let sn = sn.trim().to_uppercase();
-        if self.ship.busy || sn.is_empty() {
+        if self.ship.busy || self.busy || sn.is_empty() {
             return;
         }
         if !self.device_online() {
@@ -408,8 +465,27 @@ impl E02App {
             });
             return;
         }
+        let step_list = provision::ShipStep::steps_for(self.model);
         self.ship.busy = true;
-        self.ship.steps = ShipUi::default().steps; // 全部回"未测"
+        self.ship.current = step_list.first().copied();
+        self.ship.progress = Some(Progress {
+            total: step_list.len(),
+            done: 0,
+            started: Instant::now(),
+        });
+        self.ship.steps = step_list
+            .into_iter()
+            .map(|step| provision::ShipStepResult {
+                step,
+                verdict: provision::StepVerdict::Pending,
+                detail: String::new(),
+                secs: 0,
+            })
+            .collect();
+        self.ship.device = provision::ShipDeviceView {
+            target_sn: sn.clone(),
+            ..Default::default()
+        };
         self.ship.last_pass = None;
         self.ship.rebooting = false;
         self.ship.confirm = None;
@@ -418,12 +494,13 @@ impl E02App {
         let (atx, arx) = mpsc::channel();
         self.ship_rx = Some(rx);
         self.ship_answer_tx = Some(atx);
-        // 设备定向同 start_run：锁定被测序列号，工位上其他 adb 设备不打断
         let serial = match &self.dev {
-            DevState::Online(sn) => Some(sn.clone()),
+            DevState::Online(s) => Some(s.clone()),
             _ => None,
         };
-        let ctx = provision::ShipCtx::new(&self.config, &self.reports_dir);
+        let mut cfg = self.config.clone();
+        cfg.model = Some(self.model);
+        let ctx = provision::ShipCtx::new(&cfg, &self.reports_dir);
         let scanned = sn.clone();
         thread::spawn(move || {
             provision::run_ship(&scanned, serial, &tx, &arx, &ctx);
@@ -431,20 +508,23 @@ impl E02App {
         self.push_log(format!("出厂写号：扫码 SN {sn}"));
     }
 
-    /// 停止写号：确认卡先答"否"（worker 立即解锁走失败路径），再请求
-    /// 中止当前命令。弹卡即收给"已停"反馈。
-    pub fn request_ship_stop(&mut self) {
+    /// 停止写号：确认卡先答"否"，再请求中止当前命令。
+    pub fn request_ship_stop(&mut self, reason: StopReason) {
         if !self.ship.busy {
             return;
         }
         if let Some(c) = self.ship.confirm.take() {
             c.answer(false);
         }
-        crate::exec::request_abort(StopReason::User);
-        self.push_log("已请求停止出厂写号，等待当前命令退出...");
+        crate::exec::request_abort(reason);
+        let msg = match reason {
+            StopReason::User => "已请求停止出厂写号，等待当前命令退出...",
+            StopReason::DeviceGone => "设备已拔出，写号中止，等待当前命令退出...",
+        };
+        self.push_log(msg);
     }
 
-    /// 重扫今日写号统计（ship- 报告，独立于测试工位统计）。
+    /// 重扫今日写号统计（ship- 报告）。
     pub fn refresh_ship_stats(&mut self) {
         self.ship.today = Some(report::scan_ship_stats(
             &self.reports_dir,
@@ -452,7 +532,6 @@ impl E02App {
         ));
     }
 
-    /// 排空写号 worker 事件。
     fn drain_ship_events(&mut self, ctx: &egui::Context) {
         let mut events = Vec::new();
         if let Some(rx) = &self.ship_rx {
@@ -470,7 +549,7 @@ impl E02App {
         match ev {
             ShipEvent::Started => {}
             ShipEvent::Current(step) => {
-                // 步骤开跑：该行回"未测"并清旧详情（重跑场景显示进行中）
+                self.ship.current = Some(step);
                 if let Some(slot) = self.ship.steps.iter_mut().find(|s| s.step == step) {
                     slot.verdict = provision::StepVerdict::Pending;
                     slot.detail = String::new();
@@ -478,35 +557,42 @@ impl E02App {
                 }
             }
             ShipEvent::StepResult(r) => {
+                if let Some(p) = &mut self.ship.progress {
+                    p.done = (p.done + 1).min(p.total);
+                }
                 if let Some(slot) = self.ship.steps.iter_mut().find(|s| s.step == r.step) {
                     *slot = r;
                 } else {
                     self.ship.steps.push(r);
                 }
             }
+            ShipEvent::Device(d) => {
+                self.ship.device = d;
+            }
             ShipEvent::Confirm(card) => {
                 if let Some(reply) = self.ship_answer_tx.clone() {
-                    attention(ctx); // 需要操作员过目，及时提醒
+                    attention(ctx);
                     self.ship.confirm = Some(ShipConfirm { card, reply });
                 }
             }
             ShipEvent::Rebooting => {
-                // cf4 后 adb reboot 是预期离线：屏蔽 devwatch 的拔出中止
                 self.ship.rebooting = true;
             }
             ShipEvent::Log(s) => self.push_log(s),
             ShipEvent::Finished { report, pass } => {
                 self.ship.busy = false;
+                self.ship.current = None;
+                self.ship.progress = None;
                 self.ship.rebooting = false;
                 self.ship.confirm = None;
                 self.ship.last_pass = Some(pass);
+                self.last_report = report.clone();
                 self.ship_rx = None;
                 self.ship_answer_tx = None;
                 match &report {
                     Some(p) => self.push_log(format!("出厂报告: {}", p.display())),
                     None => self.push_log("出厂报告写入失败"),
                 }
-                // 库存/统计/报告列表刷新（PASS 后 stock+台账已落盘）
                 self.ship.stock = stock::ProvisionStock::load(&stock::stock_path());
                 self.refresh_ship_stats();
                 self.refresh_reports();
@@ -514,14 +600,19 @@ impl E02App {
         }
     }
 
-    /// 导出出货明细 CSV（FQC §7：台账 shipped 记录 × 库存凭据关联）。
-    /// 落数据目录 `出货明细-<yyyymmdd-hhmmss>.csv`，UTF-8 BOM Excel 直开。
+    /// 导出出货明细 CSV（台账 shipped 记录 × 库存凭据关联）。
     pub fn export_ship_csv(&mut self) {
         let ledger = crate::ledger::Ledger::load(&crate::ledger::path_of(&self.config));
+        let shipped = ledger.shipped();
+        if shipped.is_empty() {
+            let msg = "暂无已出厂记录，无需导出".to_string();
+            self.ship.note = msg.clone();
+            self.push_log(msg);
+            return;
+        }
         let mut rows = Vec::new();
-        for rec in ledger.shipped() {
+        for rec in shipped {
             let cred = self.ship.stock.credential_by_sn(&rec.shipped_sn);
-            // partner 按型号分流到 WiFi MAC / IMEI 列；ccid 台账留证
             let (wifi_mac, imei) = if rec.model == "E02E" {
                 (String::new(), rec.partner.clone())
             } else {
@@ -530,8 +621,8 @@ impl E02App {
             rows.push(stock::ShipCsvRow {
                 sn: rec.shipped_sn.clone(),
                 bt_mac: rec.bt_mac.clone(),
-                model: if rec.model.is_empty() {
-                    "E02".into()
+                model: if rec.model.is_empty() || rec.model == "E02" {
+                    "E02W".into()
                 } else {
                     rec.model.clone()
                 },
@@ -549,18 +640,20 @@ impl E02App {
             chrono::Local::now().format("%Y%m%d-%H%M%S")
         ));
         match std::fs::write(&path, stock::ship_csv(&rows, self.ship.include_auth_key)) {
-            Ok(()) => self.push_log(format!(
-                "出货明细已导出 {} 台: {}",
-                rows.len(),
-                path.display()
-            )),
-            Err(e) => self.push_log(format!("出货明细导出失败: {e}")),
+            Ok(()) => {
+                let msg = format!("出货明细已导出 {} 台（{}）", rows.len(), path.display());
+                self.ship.note = format!("出货明细已导出 {} 台：{}", rows.len(), path.display());
+                self.push_log(msg);
+            }
+            Err(e) => {
+                let msg = format!("出货明细导出失败: {e}");
+                self.ship.note = msg.clone();
+                self.push_log(msg);
+            }
         }
     }
 
-    /// 清空上一台的界面显示（V3.9）：结果回待测、设备信息清空、媒体区
-    /// 复位、停回放声音；报告文件与日志不动（磁盘审计留痕）。
-    /// 在"下一台插入"沿调用而非拔出沿——操作员拔线后还要看结果。
+    /// 清空测试工位上一台界面显示（在下一台插入沿调用）。
     fn clear_unit_state(&mut self) {
         self.results = TestItem::ALL.map(TestResult::new).to_vec();
         self.device = DeviceInfo::default();
@@ -568,7 +661,15 @@ impl E02App {
         self.media = MediaState::Note("媒体区：拍照显示图片，录像解码后回放".into());
     }
 
-    /// 播放录像音轨（V3.6）。OutputStream 首次播放时创建并保活。
+    /// 清空写号工位上一台界面显示（在下一台插入沿调用，拔线后仍保留上台结论供查看）。
+    fn clear_ship_unit_state(&mut self) {
+        self.sync_ship_steps_for_model();
+        self.ship.device = provision::ShipDeviceView::default();
+        self.ship.last_pass = None;
+        self.ship.current = None;
+        self.ship.progress = None;
+    }
+
     fn play_audio(&mut self, wav: &Path) {
         let handle = match &self.audio_out {
             Some((_, h)) => h.clone(),
@@ -597,24 +698,27 @@ impl E02App {
         }
     }
 
-    /// 停止回放声音（不销毁输出流，下段录像复用）。
     fn stop_audio(&mut self) {
         if let Some(sink) = self.audio_sink.take() {
             sink.stop();
         }
     }
 
-    /// 重扫今日统计（启动与每轮结束后调用）。FQC §8：按当前工位分组
-    /// （报告内容 `工位:` 行归组），出厂报告走独立统计（见 ship 页）。
+    /// 重扫当前测试工位今日统计（当工位为 ship 时兜底扫 complete）。
     pub fn refresh_stats(&mut self) {
+        let station = if self.config.is_ship_station() {
+            "complete"
+        } else {
+            self.config.station.as_str()
+        };
         self.today = Some(report::scan_stats(
             &self.reports_dir,
             &report::today_str(),
-            &self.config.station,
+            station,
         ));
     }
 
-    /// 重扫报告历史列表（报告中心打开/刷新/一轮结束调用）。
+    /// 重扫报告历史列表。
     pub fn refresh_reports(&mut self) {
         self.report_list = report::list_reports(&self.reports_dir, 300);
         self.report_sel = if self
@@ -629,24 +733,21 @@ impl E02App {
                 .filter(|p| self.report_list.contains(p))
                 .or_else(|| self.report_list.first().cloned())
         };
-        self.report_text = None; // 选中可能变化，缓存失效
+        self.report_text = None;
     }
 
-    /// 读取当前选中报告内容（带缓存，报告中心用）。
     pub fn report_content(&mut self) -> Option<&str> {
         let want = self.report_sel.clone()?;
         if self.report_text.as_ref().is_some_and(|(p, _)| *p == want) {
             return self.report_text.as_ref().map(|(_, t)| t.as_str());
         }
         let text = std::fs::read_to_string(&want).unwrap_or_else(|e| format!("报告读取失败: {e}"));
-        // 旧报告可能带控制字符（V3.7 之前未过滤），显示时同样清洗
         let text = report::sanitize(&text);
         self.report_text = Some((want, text));
         self.report_text.as_ref().map(|(_, t)| t.as_str())
     }
 
     pub fn push_log(&mut self, line: impl Into<String>) {
-        // 控制字符（\r、ANSI 转义等）在内嵌 CJK 字体里是豆腐块，滤掉（V3.6）
         let clean: String = line.into().chars().filter(|c| !c.is_control()).collect();
         self.log
             .push_back(format!("{} {}", report::now_hms(), clean));
@@ -655,21 +756,37 @@ impl E02App {
         }
     }
 
-    /// 人工应答截止时刻（0 = 不限时，V2.3 超时）。
     fn manual_deadline(&self) -> Option<Instant> {
         let secs = self.config.timeouts.manual_secs;
         (secs > 0).then(|| Instant::now() + Duration::from_secs(secs))
     }
 
-    /// 消费在位监测事件（V3.8）：插入可测（配置可开自动开始）；
-    /// 测试中拔出立即走停止路径中止（各项记"设备已拔出"）；多台提示。
+    fn drain_file_pick(&mut self) {
+        let picked = self
+            .ship
+            .file_pick_rx
+            .as_ref()
+            .and_then(|rx| rx.try_recv().ok());
+        if let Some((is_cred, res)) = picked {
+            self.ship.file_picking = false;
+            self.ship.file_pick_rx = None;
+            match res {
+                Ok(Some(path)) => ui::panel_ship::import_picked_file(self, is_cred, &path),
+                Ok(None) => {}
+                Err(e) => {
+                    self.ship.note = e.clone();
+                    self.push_log(e);
+                }
+            }
+        }
+    }
+
     fn drain_dev_events(&mut self) {
         while let Ok(next) = self.dev_rx.try_recv() {
             if next == self.dev {
                 continue;
             }
             let was_online = matches!(self.dev, DevState::Online(_));
-            // 先落状态再动作：插入自动开始要过 start_run 的在位门槛
             self.dev = next.clone();
             match next {
                 DevState::Multiple => {
@@ -677,13 +794,13 @@ impl E02App {
                 }
                 DevState::Online(sn) => {
                     self.push_log(format!("设备已连接: {sn}"));
-                    // 出厂页：不自动开测、不清测试页显示（两页状态隔离）；
-                    // 扫码才是写号触发器，设备只需在位
-                    if self.mode == Mode::Ship {
-                        // 写号中途设备闪断重连（adb 抖动）：不动作，引擎侧
-                        // 命令自会失败重试或判 FAIL
+                    if self.config.is_ship_station() {
+                        // 出厂写号工位：不自动跑测试；若空闲则复位上一台的写号结论，待扫新码
+                        if !self.ship.busy && self.ship.last_pass.is_some() {
+                            self.clear_ship_unit_state();
+                            self.push_log("新机接入，已清空上一台写号结果，请扫码");
+                        }
                     } else if !self.busy {
-                        // 新机插入（V3.9）：清上一台界面显示再（可选）自动开测
                         self.clear_unit_state();
                         self.push_log("已清空上一台显示");
                         if self.config.conn.auto_start {
@@ -698,11 +815,12 @@ impl E02App {
                 DevState::Disconnected => {
                     if was_online {
                         self.push_log("设备已拔出");
-                        // 写号重启阶段（cf4 后 adb reboot）是预期离线，
-                        // 屏蔽中止直到 Finished；其余情况与测试同样立即中止
-                        let shipping = self.mode == Mode::Ship && self.ship.busy;
-                        let shielded = shipping && self.ship.rebooting;
-                        if (self.busy || shipping) && !shielded {
+                        let shipping = self.ship.busy;
+                        let shielded =
+                            shipping && (self.ship.rebooting || provision::is_rebooting());
+                        if shipping && !shielded {
+                            self.request_ship_stop(StopReason::DeviceGone);
+                        } else if self.busy {
                             self.request_stop(StopReason::DeviceGone);
                         }
                     }
@@ -711,7 +829,6 @@ impl E02App {
         }
     }
 
-    /// 排空 worker 事件并落到界面状态。
     fn drain_events(&mut self, ctx: &egui::Context) {
         let mut events = Vec::new();
         if let Some(rx) = &self.event_rx {
@@ -731,20 +848,18 @@ impl E02App {
             UiEvent::Result(r, dev) => {
                 if let Some(d) = dev {
                     self.device.merge(d);
-                    // 型号固定为设置窗所选（V3.14.1 手动锁定，不随固件名切换；
-                    // 不符提醒由 worker 发日志）
                 }
                 if let Some(p) = &mut self.progress {
                     p.done += 1;
                 }
                 if r.item == TestItem::Keys {
-                    self.keys_prompt = None; // 结果已定，弹窗收起（兜底）
+                    self.keys_prompt = None;
                 }
                 if matches!(
                     r.item,
                     TestItem::Led | TestItem::MicSpeaker | TestItem::Video | TestItem::Photo
                 ) {
-                    self.manual = None; // 已答/超时，弹窗收起（兜底）
+                    self.manual = None;
                 }
                 if let Some(slot) = self.results.iter_mut().find(|s| s.item == r.item) {
                     *slot = r;
@@ -756,7 +871,7 @@ impl E02App {
                 in_media,
             } => {
                 if let Some(reply) = self.manual_tx.clone() {
-                    attention(ctx); // 及时提醒（V3）：任务栏闪烁
+                    attention(ctx);
                     self.manual = Some(ManualAsk {
                         title,
                         question,
@@ -771,9 +886,6 @@ impl E02App {
                     if awaiting {
                         attention(ctx);
                     }
-                    // 任何状态都开窗/更新（V3.5 修复：此前仅 awaiting 开窗，
-                    // 检测阶段无事件可发时操作员全程看不到弹窗）。
-                    // 收窗由 Result/Finished/停止时兜底。
                     self.keys_prompt = Some(KeysPrompt {
                         detected,
                         awaiting,
@@ -792,9 +904,6 @@ impl E02App {
                 has_audio,
                 audio,
             } => {
-                // 按目录实际文件名排序加载（V3.6：ffmpeg 图序从 f0001 起，
-                // 旧代码按 f0000 起猜名必然落空，媒体区永远空——真机
-                // "录像没有回显"的根因）
                 let mut names: Vec<PathBuf> = match std::fs::read_dir(&frames_dir) {
                     Ok(rd) => rd
                         .flatten()
@@ -818,7 +927,6 @@ impl E02App {
                 if frames.is_empty() {
                     self.push_log(format!("视频帧加载失败（期望 {count} 帧）"));
                 } else {
-                    // 新录像先停上一段的声音，再按需播放本段音轨
                     self.stop_audio();
                     if let Some(wav) = audio {
                         self.play_audio(&wav);
@@ -853,8 +961,6 @@ impl E02App {
         }
     }
 
-    /// 视频回放推进：按抽取帧率循环播放（V3.6 改循环，操作员判定期间
-    /// 画面反复滚动，不再播一轮定住）。
     fn tick_video(&mut self, ctx: &egui::Context) {
         if let MediaState::Video {
             frames, idx, last, ..
@@ -869,7 +975,6 @@ impl E02App {
     }
 }
 
-/// 注册中文字体到 egui，并设为 Proportional 家族首位。
 fn install_cjk_font(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
     fonts
@@ -888,7 +993,6 @@ fn install_cjk_font(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
-/// 解码图片文件为 egui 纹理（等比显示的原始尺寸一并返回）。
 fn load_texture(
     ctx: &egui::Context,
     path: &Path,
@@ -912,19 +1016,33 @@ fn load_texture(
 
 impl eframe::App for E02App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // 主题守卫（V3.7）：eframe/系统主题事件可能在启动后改写 visuals
-        // （真机 Linux 黑色主题下弹窗/设置出现 egui 默认灰底白字），
-        // 发现偏离即重刷；正常帧为一次字段比较，无开销
         if ctx.style().visuals.window_fill != ui::theme::CANVAS {
             ui::theme::apply(ctx);
         }
-        if self.busy || (self.mode == Mode::Ship && self.ship.busy) {
-            ctx.request_repaint(); // 测试/写号进行期间持续刷新
+        if self.busy || self.ship.busy {
+            ctx.request_repaint();
         }
-        self.drain_dev_events(); // 先处理插拔（拔出要尽快触发中止）
-        self.drain_events(ctx);
+        self.drain_file_pick();
         self.drain_ship_events(ctx);
+        self.drain_events(ctx);
+        self.drain_dev_events();
         self.tick_video(ctx);
+
+        // 出厂写号工位下支持拖拽 .txt/.csv 文件进窗口直接校验导入
+        if self.config.is_ship_station() && !self.ship.busy {
+            let dropped: Vec<PathBuf> = ctx.input(|i| {
+                i.raw
+                    .dropped_files
+                    .iter()
+                    .filter_map(|f| f.path.clone())
+                    .collect()
+            });
+            for path in dropped {
+                ui::panel_ship::import_dropped_file(self, &path);
+            }
+        }
+
+        let is_ship = self.config.is_ship_station();
 
         egui::TopBottomPanel::top("top_bar")
             .frame(
@@ -940,94 +1058,98 @@ impl eframe::App for E02App {
                             .size(18.0)
                             .color(ui::theme::INK),
                     );
-                    ui.add_space(12.0);
-                    ui.label(
-                        egui::RichText::new(format!("工位 {}", self.config.station))
-                            .small()
-                            .color(ui::theme::MUTED),
+                    ui::theme::badge(
+                        ui,
+                        concat!("v", env!("CARGO_PKG_VERSION")),
+                        ui::theme::MUTED,
+                        ui::theme::CARD,
                     );
-                    if self.busy {
-                        if let Some(p) = &self.progress {
-                            let frac = p.done as f32 / p.total.max(1) as f32;
-                            let elapsed = p.started.elapsed();
-                            // V3.7：文字移出条外——ProgressBar 内嵌文字色取
-                            // visuals.selection.stroke（我们=珊瑚发丝线），
-                            // 画在珊瑚填充上不可读；条只作视觉，数字放旁边
-                            ui.add_space(10.0);
-                            ui.horizontal(|ui| {
-                                ui.add(
-                                    egui::ProgressBar::new(frac)
-                                        .desired_width(190.0)
-                                        .desired_height(10.0)
-                                        .fill(ui::theme::PRIMARY),
-                                );
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "{}/{} {} {:02}:{:02}",
-                                        p.done,
-                                        p.total,
-                                        self.current
-                                            .map(|i| i.label().to_string())
-                                            .unwrap_or_default(),
-                                        elapsed.as_secs() / 60,
-                                        elapsed.as_secs() % 60
-                                    ))
-                                    .small()
-                                    .color(ui::theme::BODY),
-                                );
-                            });
-                        }
+                    ui::theme::badge(
+                        ui,
+                        &format!(
+                            "{} · {}",
+                            Config::station_label(&self.config.station),
+                            self.model.label()
+                        ),
+                        ui::theme::INK,
+                        ui::theme::SELECTED,
+                    );
+
+                    // 顶栏进度条：测试工位与出厂写号工位共用同一组件
+                    let active_prog = if self.busy {
+                        self.progress.as_ref().map(|p| {
+                            (
+                                p,
+                                self.current
+                                    .map(|i| i.label().to_string())
+                                    .unwrap_or_default(),
+                            )
+                        })
+                    } else if self.ship.busy {
+                        self.ship.progress.as_ref().map(|p| {
+                            (
+                                p,
+                                self.ship
+                                    .current
+                                    .map(|s| s.label().to_string())
+                                    .unwrap_or_default(),
+                            )
+                        })
+                    } else {
+                        None
+                    };
+                    if let Some((p, cur_label)) = active_prog {
+                        let frac = p.done as f32 / p.total.max(1) as f32;
+                        let elapsed = p.started.elapsed();
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::ProgressBar::new(frac)
+                                    .desired_width(170.0)
+                                    .desired_height(10.0)
+                                    .fill(ui::theme::PRIMARY),
+                            );
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{}/{} {} {:02}:{:02}",
+                                    p.done,
+                                    p.total,
+                                    cur_label,
+                                    elapsed.as_secs() / 60,
+                                    elapsed.as_secs() % 60
+                                ))
+                                .small()
+                                .color(ui::theme::BODY),
+                            );
+                        });
                     }
+
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if self.mode == Mode::Ship && self.ship.busy {
+                        if self.ship.busy {
                             if ui.add(ui::theme::danger("停止写号")).clicked() {
-                                self.request_ship_stop();
+                                self.request_ship_stop(StopReason::User);
                             }
                         } else if self.busy && ui.add(ui::theme::danger("停止测试")).clicked() {
                             self.request_stop(StopReason::User);
                         }
                         if ui.button("报告中心").clicked() {
+                            self.refresh_stats();
+                            self.refresh_ship_stats();
                             self.refresh_reports();
                             self.report_open = true;
                         }
-                        if ui.button("设置").clicked() {
-                            // 台账快照随开窗刷新（V3.13：worker 落盘后这里取最新）
+                        if ui
+                            .add_enabled(!self.busy && !self.ship.busy, egui::Button::new("设置"))
+                            .on_disabled_hover_text("测试或写号进行中，请先等待结束或停止")
+                            .clicked()
+                        {
                             self.ledger_view =
                                 crate::ledger::Ledger::load(&crate::ledger::path_of(&self.config));
                             self.ledger_clear_armed = false;
+                            self.reload_fourg_template_buf();
                             self.settings_open = true;
                         }
-                        // 模式切换（V3.16）：测试 / 出厂写号；busy 期间锁定
-                        // （写号是设备写操作，不许中途切页失联）
-                        ui.add_space(12.0);
-                        let mode_locked = self.busy || self.ship.busy;
-                        ui.add_enabled_ui(!mode_locked, |ui| {
-                            ui.horizontal(|ui| {
-                                for (m, name) in [(Mode::Test, "测试"), (Mode::Ship, "出厂写号")] {
-                                    let sel = egui::SelectableLabel::new(
-                                        self.mode == m,
-                                        egui::RichText::new(name)
-                                            .size(14.0)
-                                            .color(if self.mode == m {
-                                                ui::theme::INK
-                                            } else {
-                                                ui::theme::MUTED
-                                            }),
-                                    );
-                                    if ui.add(sel).clicked() && self.mode != m {
-                                        self.mode = m;
-                                        if m == Mode::Ship {
-                                            // 进页取最新库存/统计（可能后台已变）
-                                            self.ship.stock =
-                                                stock::ProvisionStock::load(&stock::stock_path());
-                                            self.refresh_ship_stats();
-                                        }
-                                    }
-                                }
-                            });
-                        });
-                        // 设备在位指示（V3.8）：灰=未连接 绿=在线 琥珀=多台
-                        // （right_to_left 布局后加的在最左，呈 "● 设备 …" 排列）
+
                         ui.add_space(10.0);
                         let (dot_color, text) = match &self.dev {
                             DevState::Disconnected => (ui::theme::MUTED, "设备未连接".to_string()),
@@ -1039,7 +1161,7 @@ impl eframe::App for E02App {
                     });
                 });
             });
-        // 深底日志面板贴底（状态并入日志标题行，去掉独立状态条）
+
         egui::TopBottomPanel::bottom("log_panel")
             .default_height(140.0)
             .resizable(true)
@@ -1049,20 +1171,37 @@ impl eframe::App for E02App {
                     .inner_margin(egui::Margin::symmetric(16.0, 8.0)),
             )
             .show(ctx, |ui| ui::log_panel::show(ui, self));
-        if self.mode == Mode::Ship {
-            // 出厂写号页（V3.16）：整页交给 panel_ship（右列库存/数据管理，
-            // 主列扫码 + 步骤行 + 确认卡 + 大号判定）
+
+        if is_ship {
+            egui::SidePanel::left("ship_left_panel")
+                .resizable(false)
+                .exact_width(240.0)
+                .frame(
+                    egui::Frame::default()
+                        .fill(ui::theme::CANVAS)
+                        .inner_margin(egui::Margin::symmetric(14.0, 12.0)),
+                )
+                .show(ctx, |ui| ui::panel_ship::show_left(ui, self));
+            egui::SidePanel::right("ship_right_panel")
+                .resizable(false)
+                .exact_width(300.0)
+                .frame(
+                    egui::Frame::default()
+                        .fill(ui::theme::CANVAS)
+                        .inner_margin(egui::Margin::symmetric(14.0, 12.0)),
+                )
+                .show(ctx, |ui| ui::panel_ship::show_right(ui, self));
             egui::CentralPanel::default()
                 .frame(egui::Frame::default().fill(ui::theme::CANVAS))
-                .show(ctx, |ui| ui::panel_ship::show(ui, self));
+                .show(ctx, |ui| ui::panel_ship::show_center(ui, self));
+            ui::panel_ship::show_stock_dialog(ctx, self);
             ui::panel_settings::show(ctx, self);
             ui::dialog_report::show(ctx, self);
             return;
         }
+
         egui::SidePanel::left("test_panel")
             .resizable(false)
-            // 固定宽度：PanelState 会跨帧/跨次启动记忆面板实际宽度，
-            // 内容一旦收缩会被"锁"在窄宽度上，钉死免受污染
             .exact_width(240.0)
             .frame(
                 egui::Frame::default()
@@ -1079,22 +1218,17 @@ impl eframe::App for E02App {
                     .inner_margin(egui::Margin::symmetric(14.0, 12.0)),
             )
             .show(ctx, |ui| ui::panel_device::show(ui, self));
-        // 媒体区：深底"屏幕井"，拍照/录像内容突出呈现
         egui::CentralPanel::default()
             .frame(egui::Frame::default().fill(ui::theme::DARK))
             .show(ctx, |ui| ui::panel_media::show(ui, self));
-        // 人工判定模态窗（指示灯 / MIC·喇叭）
-        // 按键引导弹窗（V2.1）
+
         ui::dialog_keys::show(ctx, self);
-        ui::dialog_manual::show(ctx, self); // 非媒体井判定项（指示灯/麦克风）
-                                            // 设置窗口（V2.2）
+        ui::dialog_manual::show(ctx, self);
         ui::panel_settings::show(ctx, self);
-        // 报告中心（V3：历史浏览 + 今日统计）
         ui::dialog_report::show(ctx, self);
     }
 }
 
-/// 请求窗口管理器关注本窗口（任务栏闪烁），人工弹窗及时可见（V3）。
 fn attention(ctx: &egui::Context) {
     ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
         egui::UserAttentionType::Critical,

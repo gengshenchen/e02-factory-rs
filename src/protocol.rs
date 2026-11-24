@@ -46,23 +46,27 @@ impl CameraFactory {
     }
 }
 
-/// cf30 按键写命令（FQC §2）：`camera-factory 30 <文件> <节> <键> <值>`。
-/// 参数先过白名单校验（字母数字与安全标点，无空白/引号/控制字符），
-/// 防注入拼进 `adb shell` 的整串命令。
+/// cf30 按键写命令（FQC §2）：`camera-factory 30 '<文件>' '<节>' '<键>' '<值>'`。
+/// 参数先过安全校验（非空、无空白/控制字符/单引号及注入元字符），再以 shell
+/// 单引号包裹拼入 `adb shell`，彻底防止远端 sh 通配符展开或注释截断。
 pub fn cf30_cmd(file: &str, section: &str, key: &str, value: &str) -> Result<String> {
     for (what, s) in [("文件", file), ("节", section), ("键", key), ("值", value)] {
         if s.is_empty() {
             bail!("cf30 {what}为空");
         }
-        if let Some(bad) = s
-            .chars()
-            .find(|c| c.is_control() || c.is_whitespace() || matches!(c, '\'' | '"' | '`' | ';' | '|' | '&' | '$' | '>' | '<' | '\\'))
-        {
+        if let Some(bad) = s.chars().find(|c| {
+            c.is_control()
+                || c.is_whitespace()
+                || matches!(
+                    c,
+                    '\'' | '"' | '`' | ';' | '|' | '&' | '$' | '>' | '<' | '\\'
+                )
+        }) {
             bail!("cf30 {what}含非法字符 {bad:?}: {s:?}");
         }
     }
     Ok(format!(
-        "{} {file} {section} {key} {value}",
+        "{} '{file}' '{section}' '{key}' '{value}'",
         CameraFactory::ConfigWrite.device_cmd()
     ))
 }
@@ -71,7 +75,7 @@ pub fn cf30_cmd(file: &str, section: &str, key: &str, value: &str) -> Result<Str
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cf30Result {
     /// `config-update:true` → Some(true)；`config-update:false` → Some(false)；
-    /// 两者都无 → None（协议异常，按失败处理）
+    /// 两者都无或非预期值 → None（协议异常，按失败处理）
     pub updated: Option<bool>,
     /// `[节]` 作用域内目标键回显值（空值键 `uuid=` 为 Some("")）
     pub echo_value: Option<String>,
@@ -80,7 +84,10 @@ pub struct Cf30Result {
 /// 解析 cf30 输出：滤控制字符 → 按 `[Section]` 作用域隔离找目标键 →
 /// 读 `config-update:*` 状态行。回显即免费回读，键值判定以它为准。
 pub fn parse_cf30_response(output: &str, section: &str, key: &str) -> Cf30Result {
-    let clean: String = output.chars().filter(|c| *c == '\n' || !c.is_control()).collect();
+    let clean: String = output
+        .chars()
+        .filter(|c| *c == '\n' || !c.is_control())
+        .collect();
     let mut res = Cf30Result {
         updated: None,
         echo_value: None,
@@ -95,9 +102,16 @@ pub fn parse_cf30_response(output: &str, section: &str, key: &str) -> Cf30Result
             in_section = line[1..line.len() - 1].trim().eq_ignore_ascii_case(section);
             continue;
         }
-        // 状态行不是键值对（真机输出在文件末尾）
+        // 状态行不是键值对（真机输出在文件末尾）；仅认明确 true/false，其余算协议异常
         if let Some(v) = line.strip_prefix("config-update:") {
-            res.updated = Some(v.trim().eq_ignore_ascii_case("true"));
+            let v = v.trim();
+            res.updated = if v.eq_ignore_ascii_case("true") {
+                Some(true)
+            } else if v.eq_ignore_ascii_case("false") {
+                Some(false)
+            } else {
+                None
+            };
             continue;
         }
         if !in_section {
@@ -114,22 +128,32 @@ pub fn parse_cf30_response(output: &str, section: &str, key: &str) -> Cf30Result
 
 /// 电池电压数值解析（FQC §5：阈值 ≥ `min_batt_volts`，替代测试流程的
 /// "有电压行即过"）。**排除 `%` 百分比行**（`Battery voltage: 88%` 是电量
-/// 不是电压）；兼容 V 与 mV（>20 视作 mV 除以 1000）。
+/// 不是电压）；在 `vol`/`压` 关键词之后提取首个正浮点数（避免前缀含 `-` 或
+/// 通道号如 `adc0 bat-vol:4.326` 截错）；兼容 V（0.5..=20V）与 mV（500..=20000mV）。
 pub fn parse_battery_volts(output: &str) -> Option<f32> {
     for line in output.lines() {
-        let low = line.to_lowercase();
-        if line.contains('%') || !(low.contains("vol") || line.contains('压')) {
+        if line.contains('%') {
             continue;
         }
-        // 行内首个可解析数值即电压（`Vol:4.326,cur:0.235` 取 4.326）
-        let num: String = line
+        let low = line.to_lowercase();
+        let after = if let Some(pos) = low.find("vol") {
+            &line[pos + 3..]
+        } else if let Some(pos) = line.find('压') {
+            &line[pos + '压'.len_utf8()..]
+        } else {
+            continue;
+        };
+        let num: String = after
             .chars()
-            .skip_while(|c| !(c.is_ascii_digit() || *c == '-'))
+            .skip_while(|c| !c.is_ascii_digit())
             .take_while(|c| c.is_ascii_digit() || *c == '.')
             .collect();
         if let Ok(v) = num.parse::<f32>() {
-            if v > 0.0 {
-                return Some(if v > 20.0 { v / 1000.0 } else { v });
+            if (0.5..=20.0).contains(&v) {
+                return Some(v);
+            }
+            if (500.0..=20_000.0).contains(&v) {
+                return Some(v / 1000.0);
             }
         }
     }
@@ -638,7 +662,7 @@ mod tests {
         assert!(ccid_valid("898601151234567890")); // 18 位（下界）
         assert!(ccid_valid("8986011512345678901234")); // 22 位（上界）
         assert!(!ccid_valid("89860115123456789012345")); // 23 位
-        // FQC 定稿：CCID 放宽到十六进制（sn.ini 旧日志真机实样含 D）
+                                                         // FQC 定稿：CCID 放宽到十六进制（sn.ini 旧日志真机实样含 D）
         assert!(ccid_valid("898608691025D0768737"));
         assert!(ccid_valid("898608691025d0768737"));
         assert!(!ccid_valid("89860115123456789g")); // 非十六进制字母
@@ -648,10 +672,7 @@ mod tests {
     /// FQC cf30（2026-11-23 真机实测样例）。
     #[test]
     fn cf30_cmd_builds_and_validates() {
-        assert_eq!(
-            CameraFactory::ConfigWrite.device_cmd(),
-            "camera-factory 30"
-        );
+        assert_eq!(CameraFactory::ConfigWrite.device_cmd(), "camera-factory 30");
         let cmd = cf30_cmd(
             "webrtc_serno_file.ini",
             "ProvisionInfo",
@@ -661,7 +682,13 @@ mod tests {
         .unwrap();
         assert_eq!(
             cmd,
-            "camera-factory 30 webrtc_serno_file.ini ProvisionInfo sn 6302W1000288"
+            "camera-factory 30 'webrtc_serno_file.ini' 'ProvisionInfo' 'sn' '6302W1000288'"
+        );
+        // 含 # / * 等 glob 元字符经单引号安全包裹
+        let glob_val = cf30_cmd("a.ini", "ProvisionInfo", "auth_key", "abc#def*123").unwrap();
+        assert_eq!(
+            glob_val,
+            "camera-factory 30 'a.ini' 'ProvisionInfo' 'auth_key' 'abc#def*123'"
         );
         // 注入防护：空白/引号/控制字符/元字符拒绝
         assert!(cf30_cmd("a b", "s", "k", "v").is_err());
@@ -692,19 +719,26 @@ mod tests {
         // 失败标记
         let r = parse_cf30_response("config-update:false", "ProvisionInfo", "sn");
         assert_eq!(r.updated, Some(false));
+        // 非 true/false 的未知状态值 = 协议异常（None）
+        let r = parse_cf30_response("config-update:weird", "ProvisionInfo", "sn");
+        assert_eq!(r.updated, None);
         // 两者都无 = 协议异常
         let r = parse_cf30_response("garbage", "ProvisionInfo", "sn");
         assert_eq!(r.updated, None);
         // 跨 Section 同名键隔离：目标节外的键不串
         let cross = "[Other]\nsn=WRONG\n[ProvisionInfo]\nsn=RIGHT\nconfig-update:true";
         assert_eq!(
-            parse_cf30_response(cross, "ProvisionInfo", "sn").echo_value.as_deref(),
+            parse_cf30_response(cross, "ProvisionInfo", "sn")
+                .echo_value
+                .as_deref(),
             Some("RIGHT")
         );
         // 串口控制字符（DC1/EOT）滤除后再解析
         let dirty = "[ProvisionInfo]\nsn=6302W1000\x11288\x04\nconfig-update:true";
         assert_eq!(
-            parse_cf30_response(dirty, "ProvisionInfo", "sn").echo_value.as_deref(),
+            parse_cf30_response(dirty, "ProvisionInfo", "sn")
+                .echo_value
+                .as_deref(),
             Some("6302W1000288")
         );
     }
@@ -714,11 +748,27 @@ mod tests {
         // 真机已见格式
         assert_eq!(parse_battery_volts("Bat vol:4.390"), Some(4.390));
         assert_eq!(parse_battery_volts("Vol:4.326,cur:0.235"), Some(4.326));
-        assert_eq!(parse_battery_volts("voltage: 4.12V\ncurrent: 356mA"), Some(4.12));
+        assert_eq!(
+            parse_battery_volts("voltage: 4.12V\ncurrent: 356mA"),
+            Some(4.12)
+        );
+        // 带连字符前缀与通道编号前置（回归：此前停在 '-' 导致空串）
+        assert_eq!(parse_battery_volts("bat-vol:4.326"), Some(4.326));
+        assert_eq!(
+            parse_battery_volts("adc0 battery-voltage: 4.12V"),
+            Some(4.12)
+        );
+        assert_eq!(parse_battery_volts("电池电压: 3.95V"), Some(3.95));
         // mV 兼容
         assert_eq!(parse_battery_volts("vol:4326mV"), Some(4.326));
+        // 离谱脏值拒收
+        assert_eq!(parse_battery_volts("vol:0.0"), None);
+        assert_eq!(parse_battery_volts("vol:99999"), None);
         // 百分比行排除（电量不是电压）
-        assert_eq!(parse_battery_volts("Battery voltage: 88%\nvol:4.2"), Some(4.2));
+        assert_eq!(
+            parse_battery_volts("Battery voltage: 88%\nvol:4.2"),
+            Some(4.2)
+        );
         assert_eq!(parse_battery_volts("battery: 88%"), None);
         assert_eq!(parse_battery_volts("no number here"), None);
     }
@@ -726,7 +776,10 @@ mod tests {
     #[test]
     fn bt_version_extract() {
         assert_eq!(parse_bt_version("bt-ver:V1_7_4"), Some("V1_7_4".into()));
-        assert_eq!(parse_bt_version("BT Version: V1.7.4"), Some("V1.7.4".into()));
+        assert_eq!(
+            parse_bt_version("BT Version: V1.7.4"),
+            Some("V1.7.4".into())
+        );
         // 无 ver 关键字 → 首个非空行
         assert_eq!(parse_bt_version("\nV1_7_4\n"), Some("V1_7_4".into()));
         assert_eq!(parse_bt_version(""), None);

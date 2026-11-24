@@ -60,9 +60,13 @@ pub fn run(args: &[String]) -> i32 {
         }
     };
     if let Some(p) = &profile {
+        if p == Config::STATION_SHIP {
+            eprintln!("工位 `ship`（出厂写号）请在图形界面扫码执行");
+            return 2;
+        }
         if !cfg.profiles.contains_key(p) {
             eprintln!(
-                "工位 {p} 不存在（可选: {:?}）",
+                "工位 {p} 不存在（可选测试工位: {:?}）",
                 cfg.profiles.keys().collect::<Vec<_>>()
             );
             return 2;

@@ -30,6 +30,17 @@ pub fn show(ui: &mut egui::Ui, app: &mut E02App) {
                 ))
                 .color(theme::TEAL),
             );
+        } else if app.ship.busy {
+            ui.spinner();
+            let status = if app.ship.confirm.is_some() {
+                "写号待人工确认...".to_string()
+            } else {
+                format!(
+                    "写号中：{}",
+                    app.ship.current.map(|s| s.label()).unwrap_or("准备中")
+                )
+            };
+            ui.label(egui::RichText::new(status).color(theme::TEAL));
         } else {
             ui.label(egui::RichText::new("就绪").color(theme::ON_DARK_SOFT));
         }

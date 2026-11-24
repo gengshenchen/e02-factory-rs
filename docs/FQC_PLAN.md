@@ -1,9 +1,10 @@
 # FQC 出厂写号工位方案(V4 计划)
 
-> 2026-11-23 与产线/固件逐项确认并完成方案审查修订后定稿。来源:旧 `HEC-E02-SNwrite.exe`
+> 2026-11-24 与产线/固件逐项确认并经实机界面走查定稿。来源:旧 `HEC-E02-SNwrite.exe`
 > (sn_tool) 逆向 + 真机实测(camera-factory 30 已在固件落地)。本工位替代旧写号工具,
-> 集成进本程序,作为与"测试"并列的独立模式(不是第三个工位档案——工位只有
-> 模组/整机两档,V3.14.2 原则)。
+> 集成进本程序,作为产线第三个独立工位(`station = "ship"`,与 `module` 模组工位、
+> `complete` 整机工位并列,在「设置 → 工位选择」中切换并持久化到 `config.toml`),
+> 型号统一由顶层 `model = "E02W" | "E02E"` 控制(WiFi 版标为 `E02W`,eSIM 版标为 `E02E`)。
 
 ## 1. 背景与目标
 
@@ -68,36 +69,38 @@ config-update:true     ← 成功标记
 
 ```text
 扫码 SN(扫枪=键盘注入,自动剥回车、去空白、大写化;busy 期间锁输入防连扫)
- ⓪设备身份与现值采集:cf10(BT MAC) + cf3(SN/WiFi MAC/软件版本)
-   + cf20[eSIM](IMEI/CCID) + 读 config_path(取当前 sn/uuid/auth_key)
+ ⓪设备身份与现值采集:cf10(BT MAC 必填) + cf3(SN/WiFi MAC[E02 必填]/软件版本必填)
+   + cf20[eSIM](IMEI/CCID,缺失时从 ini 兜底并严格校验合法性,缺码拒写防空码出货)
+   + 读 config_path(取当前 sn/uuid/auth_key)
+   + 台账硬件绑定对冲突检查(check_pair:同蓝牙异绑定值或同绑定值异蓝牙=硬拦防烧重地址覆盖原机)
  ①闸门[gate_mode]:查本机(BT MAC)整机工位是否全测 PASS(strict=硬拦/warn=警告/off=跳过)
  ②SN 校验与异号防呆:
-   - 格式校验(档案 sn_pattern)
+   - 格式校验(当前型号 sn_pattern)
    - 设备现值比对(空/占位默认值/不匹配正式正则=未写号放行;已是另一合法正式 SN=硬拒)
    - 台账反查(该 SN 已绑其他设备=硬拦;已绑本机=标记同号重写)
  ③SN 池校验[已导入才启用]:在池且未写(同号重写允许复用已绑本机条目)
  ④版本核对:t32_ver/bt_ver 留空=配置缺失拒写;soft-ware == t32_ver 且 cf7 == bt_ver
  ⑤硬件终检:电池 cf12 ≥ min_batt_volts;SD 卡 cf8[check_sdcard=true 时启用]
  ⑥确认卡与确认闸门[auto_commit]:
-   展示 SN、目标凭据全值(若有)、设备现值;
-   - 若 auto_commit=true 且无告警(非同号重写、非覆盖设备自生成凭据)→ 自动继续
+   展示 SN、目标凭据全值(若有)、设备现值;仅响应鼠标点击放行(防扫码枪多余回车误确认);
+   - 若 auto_commit=true 且无告警(非同号重写、非覆盖设备自生成凭据、无闸门/型号告警)→ 自动继续
    - 若 auto_commit=false 或触发上述任一告警 → 暂停等待操作员点击确认
  ⑦凭据领用与预落盘[凭据型号](所有只读检查通过后、首条写入前执行):
    - 先按 bound_sn == target_sn 查既有 allocated/committed 凭据复用(幂等)
    - 否则池空=拒写;取下一个 available 凭据,在发首条 cf30 前原子落盘为
      allocated(记录 bound_sn + bound_bt_mac),防中途断电/崩溃导致双机撞凭据
- ⑧cf30 逐键写:按档案 keys 顺序写(sn → uuid → auth_key),设备现值已一致则跳过;
+ ⑧cf30 逐键写:按 keys 顺序写(sn → uuid → auth_key),设备现值已一致则跳过;
    每键判定:config-update:true + [ProvisionInfo] 回显键值精确匹配
- ⑨[eSIM 型号]4G 模组配置写入(§3.1)
- ⑩终检(重启前):以最后一次回显/读 config_path 复核全部目标键
+ ⑨[eSIM 型号且 fourg.enable=true]4G 模组配置写入(§3.1;enable=true 时模板缺失/为空硬拦绝不静默漏写)
+ ⑩终检(重启前):重读 config_path 复核全部目标键
  ⑪对时 + 收尾切正式版:
-   date -s + cf19(复用 sync_time)→ cf4 清 U 盘+切正式版
-   → 置"预期重启"标记(屏蔽 devwatch 拔出中止)→ adb reboot
+   date -s + cf19(固件校时)→ cf4 清 U 盘+切正式版 → sync 刷写闪存缓冲
+   → 置"预期重启"原子+事件双标记(屏蔽 devwatch 拔出中止)→ adb reboot
  ⑫重启后探测[reboot_verify_secs]:
    - 0 = 跳过(联调确认正式版无 adb 后置 0,避免每台白等 60s)
-   - >0 = 轮询等待 adb 回来 → 先跑 cf10 核对 BT MAC 与重启前一致(防换机串号)
-     → 读 config_path 复核目标键,不一致判 FAIL;超时未回记日志跳过
- → PASS:stock 推进为 committed + ledger.json 回填(mark_shipped upsert)
+   - >0 = 先等待设备真正离线沿,再轮询等待 adb 回连 → 跑 cf10 核对 BT MAC 与重启前一致(防换机串号)
+     → 读 config_path 复核目标键,不一致判 FAIL;超时未回记日志告警跳过
+ → PASS:stock 推进为 committed + ledger.json 回填(mark_shipped upsert,带冲突保护)
    + ship 报告落盘
 ```
 
@@ -222,52 +225,44 @@ eSIM 产品有第二套可写区:4G 模组的 `U:/config.ini`(服务器/APN 等,
 
 ## 5. 配置(`config.toml`)
 
-采用 `[provision]` 公共配置 + `[provision.profiles.<name>]` 强类型档案表(避免动态档案名
-与固定配置键混在同一层级),每个档案绑定所属产品型号(`E02`/`E02E`)并自带独立工单版本、
-正则、键集与可选 4G 配置。新增轻量正则依赖 `regex-lite`。
+工位统一由顶层 `station = "module" | "complete" | "ship"` 控制,产品型号统一由顶层
+`model = "E02" | "E02E"` 控制(单一型号真源);`[provision]` 下存放公共开关与按型号分档的
+`[provision.e02]` / `[provision.e02e]`(加载时自动迁移旧 `[provision.profiles.*]` 表)。
 
 ```toml
+station = "ship"                          # 工位: module(模组) | complete(整机) | ship(出厂写号)
+model = "E02W"                            # 产品型号: E02W(WiFi 版) | E02E(eSIM 版)
+
 [provision]
-active_profile = "e02"                    # 当前启用的出厂档案名
-gate_mode = "warn"                        # 闸门: warn(默认,警告可继续,兼容过渡期) | strict(硬拦) | off
-auto_commit = true                        # 扫码即自动开写(有告警仍弹窗确认);false=每台人工点确认
-reboot_verify_secs = 60                   # ⑫ 重启后探测秒数;0=跳过(正式版无 adb 时置 0)
-config_path = "/config/webrtc_serno_file.ini" # 设备端 ini 绝对路径(2026-11-24 已确认)
-placeholder_sns = ["00001", "002"]        # 工厂未写号占位 SN(附加判断:不匹配正式正则也视作未写号)
+gate_mode = "warn"                        # 整机测试校验: warn(提示确认) | strict(强制拦截) | off(不校验)
+auto_commit = true                        # 校验无异常自动写入;false=逐台人工确认
+reboot_verify_secs = 60                   # 重启回读等待秒数;0=跳过(正式版无 adb 时设为 0)
+config_path = "/config/webrtc_serno_file.ini" # 设备端 ini 绝对路径
+placeholder_sns = ["00001", "002"]        # 出厂前占位 SN
 
-[provision.profiles.e02]
-model = "E02"
-t32_ver = "V2.2.9"                        # 工单软件版本(留空拒写,完全相等判定)
-bt_ver  = "V1_7_4"                        # 工单蓝牙版本(留空拒写,完全相等判定)
-min_batt_volts = 3.5                      # 电池最低电压(V)
-check_sdcard = true                       # 是否校验 SD 卡在位(可配)
-sn_pattern = '^\d{4}W\d{7}$'              # 注意 TOML 单引号为字面量,单反斜杠
-keys = ["sn"]                             # 默认只写 sn
-
-[provision.profiles.e02_customer_x]       # 凭据客户档案
-model = "E02"
-t32_ver = "V2.2.9"
-bt_ver  = "V1_7_4"
-min_batt_volts = 3.5
-check_sdcard = true
-sn_pattern = '^\d{4}[WE]\d{7}$'
-keys = ["sn", "uuid", "auth_key"]
+[provision.e02w]                          # E02W(WiFi 版)写号参数(兼容读取旧 [provision.e02])
+t32_ver = "V2.2.9"                        # 工单软件版本(留空禁止写入)
+bt_ver  = "V1_7_4"                        # 工单蓝牙版本(留空禁止写入)
+min_batt_volts = 3.5                      # 最低电池电压(V)
+check_sdcard = true                       # 写入前检查 SD 卡在位
+sn_pattern = '^\d{4}W\d{7}$'              # 示例: 6472W1000016 / 6472W1000024
+keys = ["sn"]                             # 启用凭据时勾选 ["sn", "uuid", "auth_key"]
 uuid_pattern = '^uuid[0-9a-f]{16}$'
 key_pattern  = '^[A-Za-z0-9]{32}$'
 
-[provision.profiles.e02e]                 # eSIM 型号档案
-model = "E02E"
+[provision.e02e]                          # E02E(eSIM 版)写号参数
 t32_ver = "V2.2.9"
 bt_ver  = "V1_7_4"
 min_batt_volts = 3.5
 check_sdcard = true
-sn_pattern = '^\d{4}E\d{7}$'
+sn_pattern = '^\d{4}E\d{7}$'              # 示例: 6472E1000012 / 6472E1000020
 keys = ["sn"]
 
-[provision.profiles.e02e.fourg]           # 4G 模组配置写入(§3.1,可选;不配即跳过;设备端 4g-test 随固件落地)
-port = "/dev/ttyS2"                       # 设备端串口(2026-11-24 确认;留空 = 用 4g-test 自身默认)
-baud = 115200                             # 波特率(留空 = 用 4g-test 自身默认)
-template = "templates/e02e_4g.ini"
+[provision.e02e.fourg]                    # 4G 参数写入(§3.1)
+enable = false                            # false=跳过;true=模板缺失或回读不符判定不合格
+port = "/dev/ttyS2"                       # 设备端串口(留空用 4g-test 默认)
+baud = 115200                             # 波特率(0=默认 115200)
+template = "templates/e02e_4g.ini"        # 设置页支持在线编辑与语法检查
 ```
 
 ## 6. 重写与幂等规则
@@ -324,18 +319,19 @@ template = "templates/e02e_4g.ini"
   `refresh_stats()` 重扫**当日报告(目录扫描,无持久化状态);
 - 出厂页独立统计:扫 `ship-` 前缀 → 今日写号 N / 成功 x / 失败 y。
 
-## 9. UI
+## 9. UI(遵循 design-md/claude 规范)
 
-- 顶栏**模式切换**:测试 / 出厂写号(两个页面,不是工位档案;出厂模式下屏蔽测试自动开测);
-- 出厂页:
-  - 档案与库存条(当前档案名、SN/凭据余量常显,普通档案隐藏凭据项);
-  - 扫码输入框(焦点常驻、`busy` 锁输入防连扫)→ 确认卡(SN、凭据全值、设备当前值,
-    `auto_commit` 控制自动开写或手动确认,告警场景强制弹窗确认)→ 步骤进度与逐项判定
-    (复用结果行样式)→ 大号 PASS/FAIL;
-  - 数据管理区:SN txt / 凭据 txt 独立导入(预览校验结果与行号报错)、清空未用批次/异常作废、
-    **导出出货明细 CSV**(凭据档案提供"含 auth_key"勾选项);
-- 设置页:`[provision]` 可视化编辑(档案切换、工单版本、阈值、正则、闸门模式、`auto_commit`、
-  `check_sdcard`、`reboot_verify_secs`、`config_path`、4G 模板编辑)。
+- **设置页工位选择**:`模组工位` / `整机工位` / `出厂写号` 三工位并列持久化到 `config.toml`;
+  下方配置卡按工位显示(测试工位仅显测试项与配网,写号工位仅显工单版本、写入校验规则与 4G 参数模板);
+  顶栏统一显示 `v版本号` + `工位中文名 · 型号(E02W/E02E)`;
+- **出厂写号三栏主界面**(暖米画布 → 奶油内容卡 → 暖黑执行明细卡,明暗交替,无特殊符号字形):
+  - **左栏(240px `CANVAS`)**:写号流程清单 + 次级按钮「批次与库存」;
+  - **中栏(`CANVAS` 暖米底)**:工单版本与余量胶囊条 + 奶油扫码卡(等宽输入框 + 唯一珊瑚主按钮「开始写号」)
+    + 写入确认卡(仅鼠标点击放行)/ 结果色块横幅 / 深色「执行明细」卡(`DARK` + `DARK_SOFT`);
+  - **右栏(300px `CANVAS`)**:「被测设备」实时字段表(点击复制)+「写号结论」色块卡 +「当日统计」2×2 等宽瓦片;
+- **批次与库存窗口**:支持系统原生文件选择窗导入 `.txt/.csv`、拖拽文件导入与折叠粘贴导入、
+  凭据余量提醒、未完成占用条目释放/作废、导出出货明细 CSV;
+- **报告中心**:支持 `全部 / 整机 / 模组 / 出厂写号` 筛选与对应工位今日统计看板。
 
 CLI 对应(`e02-factory-rs ship --sn X [--dry-run]`)为后续可选项,不阻塞。
 

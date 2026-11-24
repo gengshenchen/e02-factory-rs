@@ -210,8 +210,8 @@ pub fn scan_stats(dir: &Path, day: &str, station: &str) -> DayStats {
     for e in entries.flatten() {
         let name = e.file_name();
         let Some(name) = name.to_str() else { continue };
-        // V3.14：型号前缀族（e02 / e02e）都计入；ship- 不属于测试统计
-        if !name.starts_with(ModelKind::E02.file_prefix()) || !name.contains(&day_mark) {
+        // V3.14：型号前缀族（e02w- / e02e- 及历史 e02-）都计入；ship- 不属于测试统计
+        if !name.starts_with("e02") || !name.contains(&day_mark) {
             continue;
         }
         let Ok(text) = std::fs::read_to_string(e.path()) else {
@@ -236,7 +236,7 @@ pub fn scan_stats(dir: &Path, day: &str, station: &str) -> DayStats {
 /// 解析不到（极老版本报告）返回 None，由调用方决定去留。
 pub fn report_station_of(text: &str) -> Option<String> {
     let line = text.lines().find(|l| l.starts_with("工位: "))?;
-    let v = line["工位: ".len()..].trim().split_whitespace().next()?;
+    let v = line["工位: ".len()..].split_whitespace().next()?;
     Some(v.to_string())
 }
 
@@ -279,10 +279,7 @@ pub fn list_reports(dir: &Path, limit: usize) -> Vec<PathBuf> {
         .map(|rd| {
             rd.flatten()
                 .filter_map(|e| e.file_name().into_string().ok())
-                .filter(|n| {
-                    (n.starts_with(ModelKind::E02.file_prefix()) || n.starts_with("ship-"))
-                        && n.ends_with(".txt")
-                })
+                .filter(|n| (n.starts_with("e02") || n.starts_with("ship-")) && n.ends_with(".txt"))
                 .map(|n| {
                     let date = n
                         .split('-')
@@ -358,7 +355,7 @@ mod tests {
     fn meta() -> ReportMeta {
         ReportMeta {
             station: "complete".into(),
-            model: crate::config::ModelKind::E02,
+            model: crate::config::ModelKind::E02w,
             started: "20261022-103012".into(),
             elapsed_secs: 155,
         }
@@ -422,7 +419,7 @@ mod tests {
             true,
         )
         .unwrap();
-        assert!(p1.ends_with("e02-20261022-complete-103012-unknown.txt"));
+        assert!(p1.ends_with("e02w-20261022-complete-103012-unknown.txt"));
         // 蓝牙 MAC 已知 → 同机同日一份（V3.13 键改蓝牙 MAC；SN 仅留证不作键）
         let dev = DeviceInfo {
             bt_mac: "0012A3B4C5D6".into(),
@@ -430,7 +427,7 @@ mod tests {
             ..Default::default()
         };
         let p2 = write_report(&dir, &meta(), &dev, std::slice::from_ref(&r), true).unwrap();
-        assert!(p2.ends_with("e02-20261022-complete-0012A3B4C5D6.txt"));
+        assert!(p2.ends_with("e02w-20261022-complete-0012A3B4C5D6.txt"));
         // 同机同日再写 → 同一路径（重测覆盖更新）
         let p3 = write_report(&dir, &meta(), &dev, &[], true).unwrap();
         assert_eq!(p2, p3);
@@ -438,7 +435,7 @@ mod tests {
         let mut bind = TestResult::new(TestItem::Binding);
         bind.verdict = Verdict::Fail;
         let p4 = write_report(&dir, &meta(), &dev, &[r, bind], true).unwrap();
-        assert!(p4.ends_with("e02-20261022-complete-0012A3B4C5D6-冲突103012.txt"));
+        assert!(p4.ends_with("e02w-20261022-complete-0012A3B4C5D6-冲突103012.txt"));
         // MAC 含冒号/路径字符 → 替换为 _（防目录穿越/非法文件名）
         let p5 = write_report(
             &dir,
@@ -451,7 +448,7 @@ mod tests {
             true,
         )
         .unwrap();
-        assert!(p5.ends_with("e02-20261022-complete-00_11_.._x.txt"));
+        assert!(p5.ends_with("e02w-20261022-complete-00_11_.._x.txt"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -515,12 +512,12 @@ mod tests {
         // 他日 BT9 沉底；最多取 2
         let list = list_reports(&dir, 2);
         assert_eq!(list.len(), 2);
-        assert!(list[0].ends_with("e02-20261022-module-BT4.txt"));
-        assert!(list[1].ends_with("e02-20261022-complete-BT3.txt"));
+        assert!(list[0].ends_with("e02w-20261022-module-BT4.txt"));
+        assert!(list[1].ends_with("e02w-20261022-complete-BT3.txt"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// FQC §8 排序修复：ship- 与 e02- 混排时按日期段统一倒排，
+    /// FQC §8 排序修复：ship- 与 e02w-/e02- 混排时按日期段统一倒排，
     /// 不再被 's' > 'e' 字典序压顶。
     #[test]
     fn ship_reports_sort_by_date_not_lexical() {
@@ -529,7 +526,7 @@ mod tests {
         // 昨天的 ship 报告 + 今天的测试报告：今天的在前
         let p_ship = dir.join(ship_file_name_for_test("20261021", "SHIPMAC"));
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(&p_ship, "E02 出厂写号报告\n结果: PASS\n工位: ship\n").unwrap();
+        std::fs::write(&p_ship, "E02W 出厂写号报告\n结果: PASS\n工位: ship\n").unwrap();
         write_report(
             &dir,
             &meta(),
@@ -544,7 +541,7 @@ mod tests {
         let list = list_reports(&dir, 10);
         assert_eq!(list.len(), 2);
         assert!(
-            list[0].ends_with("e02-20261022-complete-BT1.txt"),
+            list[0].ends_with("e02w-20261022-complete-BT1.txt"),
             "今日测试报告应在前: {list:?}"
         );
         assert!(list[1].ends_with("ship-20261021-SHIPMAC.txt"));
@@ -561,9 +558,18 @@ mod tests {
 
     #[test]
     fn ship_file_name_shapes() {
-        assert_eq!(ship_file_name("20261124", "0012A3B4C5D6", "103012"), "ship-20261124-0012A3B4C5D6.txt");
-        assert_eq!(ship_file_name("20261124", "", "103012"), "ship-20261124-103012-unknown.txt");
-        assert_eq!(ship_file_name("20261124", "00:11", "103012"), "ship-20261124-00_11.txt");
+        assert_eq!(
+            ship_file_name("20261124", "0012A3B4C5D6", "103012"),
+            "ship-20261124-0012A3B4C5D6.txt"
+        );
+        assert_eq!(
+            ship_file_name("20261124", "", "103012"),
+            "ship-20261124-103012-unknown.txt"
+        );
+        assert_eq!(
+            ship_file_name("20261124", "00:11", "103012"),
+            "ship-20261124-00_11.txt"
+        );
     }
 
     #[test]
