@@ -1,6 +1,6 @@
 [package]
 name = "e02-factory-rs"
-version = "0.4.7"
+version = "0.5.0"
 edition = "2021"
 description = "E02 工厂测试上位机（跨平台，Rust 重写）"
 authors = ["gengshenchen <karlchen.me@outlook.com>"]
@@ -23,6 +23,8 @@ rodio = { version = "0.20", default-features = false, features = ["wav"] }
 serde_json = "1"
 # WiFi 吞吐测试（V3.12）：枚举本机网卡，找与设备同网段的地址
 if-addrs = "0.13"
+# 出厂写号（FQC §5）：档案 SN/凭据正则（regex-lite 无 unicode 特性，编译快体积小）
+regex-lite = "0.1"
 
 # deb 打包元数据（cargo deb 使用）
 [package.metadata.deb]

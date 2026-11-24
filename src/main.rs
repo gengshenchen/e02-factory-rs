@@ -19,7 +19,9 @@ mod netip;
 mod paths;
 mod player;
 mod protocol;
+mod provision;
 mod report;
+mod stock;
 mod ui;
 // 仅 release 需要（GUI 子系统无控制台，CLI 要挂回终端）；debug 保留
 // 控制台，模块不编入（否则 debug 构建视其为死代码）

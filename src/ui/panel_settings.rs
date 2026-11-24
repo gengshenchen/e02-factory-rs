@@ -8,7 +8,7 @@
 //! exe 同目录 config.toml。
 
 use crate::app::E02App;
-use crate::config::{self, IperfDir, WifiDepth};
+use crate::config::{self, GateMode, IperfDir, WifiDepth};
 use crate::engine::TestItem;
 use crate::protocol::key_name;
 use crate::ui::theme;
@@ -159,6 +159,8 @@ pub fn show(ctx: &egui::Context, app: &mut E02App) {
                             for n in &names {
                                 if tab(ui, *n == station_before, n) && n != &station_before {
                                     app.config.station = n.clone();
+                                    // FQC §8：切工位立即按新工位重扫今日统计
+                                    app.refresh_stats();
                                 }
                             }
                         });
@@ -473,6 +475,246 @@ pub fn show(ctx: &egui::Context, app: &mut E02App) {
                             .changed();
                         ui.add_space(2.0);
                         caption(ui, "检测到 USB 设备上线即开始；测试中拔出立即中止");
+                    });
+
+                    ui.add_space(12.0);
+
+                    // —— 出厂写号（FQC §5，V3.16）：档案按产品型号区分，
+                    // 与工位测试项不共用；本卡编辑 [provision] 公共参数 +
+                    // 当前档案的键集/版本/正则与 4G（eSIM）——
+                    theme::card().show(ui, |ui| {
+                        card_begin(ui);
+                        let prov = &mut app.config.provision;
+                        card_head(
+                            ui,
+                            "出厂写号",
+                            Some(format!("档案 {}（{} 档）", prov.active_profile, prov.profiles.len())),
+                        );
+                        ui.add_space(4.0);
+                        caption(ui, "出厂页扫码写号用；空版本/空正则 = 工单配置缺失，写号会拒写");
+                        ui.add_space(6.0);
+                        // 档案切换（型号维度）
+                        ui.horizontal(|ui| {
+                            ui.label("档案");
+                            let names: Vec<String> = prov.profiles.keys().cloned().collect();
+                            for n in names {
+                                if tab(ui, prov.active_profile == n, &n)
+                                    && prov.active_profile != n
+                                {
+                                    prov.active_profile = n;
+                                    changed = true;
+                                }
+                            }
+                        });
+                        ui.add_space(4.0);
+                        // 整机闸门
+                        ui.horizontal(|ui| {
+                            ui.label("整机闸门");
+                            for (mode, name) in [
+                                (GateMode::Strict, "硬拦"),
+                                (GateMode::Warn, "告警可继续"),
+                                (GateMode::Off, "跳过"),
+                            ] {
+                                if tab(ui, prov.gate_mode == mode, name) {
+                                    prov.gate_mode = mode;
+                                    changed = true;
+                                }
+                            }
+                        });
+                        changed |= ui
+                            .checkbox(&mut prov.auto_commit, "扫码后无告警自动开写")
+                            .changed();
+                        ui.add_space(2.0);
+                        caption(
+                            ui,
+                            match prov.gate_mode {
+                                GateMode::Strict => {
+                                    "整机工位非全 PASS 一律拒写（台账覆盖全后启用）"
+                                }
+                                GateMode::Warn => "缺记录/非全 PASS 弹告警，人工确认后可继续（默认，过渡期）",
+                                GateMode::Off => "不查台账整机判定（调试用）",
+                            },
+                        );
+                        if prov.auto_commit {
+                            caption(ui, "自动开写仅限无告警；有告警仍弹确认卡等人工放行");
+                        }
+                        ui.add_space(6.0);
+                        egui::Grid::new("prov_common")
+                            .num_columns(2)
+                            .spacing([16.0, 8.0])
+                            .show(ui, |ui| {
+                                ui.label("重启探测");
+                                changed |= ui
+                                    .add(
+                                        egui::DragValue::new(&mut prov.reboot_verify_secs)
+                                            .suffix("s")
+                                            .range(0..=600),
+                                    )
+                                    .changed();
+                                caption(ui, "写完重启后回连核对；0=跳过");
+                                ui.end_row();
+                                ui.label("设备 ini 路径");
+                                changed |= ui
+                                    .add(
+                                        egui::TextEdit::singleline(&mut prov.config_path)
+                                            .desired_width(190.0)
+                                            .font(egui::TextStyle::Monospace),
+                                    )
+                                    .changed();
+                                caption(ui, "cf30 写入的设备端配置绝对路径");
+                                ui.end_row();
+                            });
+                        ui.add_space(6.0);
+                        ui.separator();
+                        ui.add_space(4.0);
+                        // 当前档案参数
+                        let active = prov.active_profile.clone();
+                        if let Some(p) = prov.profiles.get_mut(&active) {
+                            egui::Grid::new("prov_profile")
+                                .num_columns(2)
+                                .spacing([16.0, 8.0])
+                                .show(ui, |ui| {
+                                    ui.label("T32 版本");
+                                    changed |= ui
+                                        .add(
+                                            egui::TextEdit::singleline(&mut p.t32_ver)
+                                                .desired_width(190.0)
+                                                .font(egui::TextStyle::Monospace),
+                                        )
+                                        .changed();
+                                    caption(ui, "工单软件版本，完全相等才放行");
+                                    ui.end_row();
+                                    ui.label("蓝牙版本");
+                                    changed |= ui
+                                        .add(
+                                            egui::TextEdit::singleline(&mut p.bt_ver)
+                                                .desired_width(190.0)
+                                                .font(egui::TextStyle::Monospace),
+                                        )
+                                        .changed();
+                                    caption(ui, "cf7 回读版本，完全相等才放行");
+                                    ui.end_row();
+                                    ui.label("SN 正则");
+                                    changed |= ui
+                                        .add(
+                                            egui::TextEdit::singleline(&mut p.sn_pattern)
+                                                .desired_width(190.0)
+                                                .font(egui::TextStyle::Monospace),
+                                        )
+                                        .changed();
+                                    caption(ui, "扫码与 SN 池导入共用的格式校验");
+                                    ui.end_row();
+                                    ui.label("电池下限");
+                                    changed |= ui
+                                        .add(
+                                            egui::DragValue::new(&mut p.min_batt_volts)
+                                                .suffix("V")
+                                                .range(3.0..=4.5)
+                                                .speed(0.05),
+                                        )
+                                        .changed();
+                                    caption(ui, "cf12 电压低于此值拒写（防写一半断电）");
+                                    ui.end_row();
+                                    ui.label("SD 卡");
+                                    changed |= ui
+                                        .checkbox(&mut p.check_sdcard, "写前检查 SD 卡在位")
+                                        .changed();
+                                    caption(ui, "cf4 切正式版依赖 U 盘在场");
+                                    ui.end_row();
+                                });
+                            ui.add_space(4.0);
+                            // 写入键：sn 恒选，uuid/auth_key 可加（凭据档案）
+                            ui.horizontal(|ui| {
+                                ui.label("写入键");
+                                let mut sn_on = true;
+                                ui.add_enabled(
+                                    false,
+                                    egui::Checkbox::new(&mut sn_on, "sn"),
+                                );
+                                for key in ["uuid", "auth_key"] {
+                                    let mut on = p.keys.iter().any(|k| k == key);
+                                    if ui.checkbox(&mut on, key).changed() {
+                                        if on {
+                                            p.keys.push(key.into());
+                                        } else {
+                                            p.keys.retain(|k| k != key);
+                                        }
+                                        changed = true;
+                                    }
+                                }
+                            });
+                            if p.needs_credentials() {
+                                ui.add_space(2.0);
+                                caption(ui, "凭据档案：写号前从凭据池领用，缺池拒写");
+                                egui::Grid::new("prov_cred")
+                                    .num_columns(2)
+                                    .spacing([16.0, 8.0])
+                                    .show(ui, |ui| {
+                                        ui.label("uuid 正则");
+                                        changed |= ui
+                                            .add(
+                                                egui::TextEdit::singleline(&mut p.uuid_pattern)
+                                                    .desired_width(190.0)
+                                                    .font(egui::TextStyle::Monospace),
+                                            )
+                                            .changed();
+                                        caption(ui, "凭据池导入校验");
+                                        ui.end_row();
+                                        ui.label("auth_key 正则");
+                                        changed |= ui
+                                            .add(
+                                                egui::TextEdit::singleline(&mut p.key_pattern)
+                                                    .desired_width(190.0)
+                                                    .font(egui::TextStyle::Monospace),
+                                            )
+                                            .changed();
+                                        caption(ui, "凭据池导入校验");
+                                        ui.end_row();
+                                    });
+                            }
+                            // 4G（eSIM 档案可选）
+                            if let Some(f) = p.fourg.as_mut() {
+                                ui.add_space(4.0);
+                                caption(ui, "4G 模组配置（eSIM 型；模板为数据目录相对路径）");
+                                egui::Grid::new("prov_4g")
+                                    .num_columns(2)
+                                    .spacing([16.0, 8.0])
+                                    .show(ui, |ui| {
+                                        ui.label("串口");
+                                        changed |= ui
+                                            .add(
+                                                egui::TextEdit::singleline(&mut f.port)
+                                                    .desired_width(190.0)
+                                                    .font(egui::TextStyle::Monospace),
+                                            )
+                                            .changed();
+                                        caption(ui, "设备端 4g-test 串口（/dev/ttyS2）");
+                                        ui.end_row();
+                                        ui.label("波特率");
+                                        changed |= ui
+                                            .add(
+                                                egui::DragValue::new(&mut f.baud)
+                                                    .speed(100)
+                                                    .range(0..=921600),
+                                            )
+                                            .changed();
+                                        caption(ui, "0 = 用 4g-test 默认（115200）");
+                                        ui.end_row();
+                                        ui.label("模板");
+                                        changed |= ui
+                                            .add(
+                                                egui::TextEdit::singleline(&mut f.template)
+                                                    .desired_width(190.0)
+                                                    .font(egui::TextStyle::Monospace),
+                                            )
+                                            .changed();
+                                        caption(ui, "AT+CFG 行清单，支持 {{sn}} 占位");
+                                        ui.end_row();
+                                    });
+                            }
+                        } else {
+                            caption(ui, "档案表为空（config.toml [provision.profiles]）");
+                        }
                     });
 
                     ui.add_space(12.0);

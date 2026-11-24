@@ -16,7 +16,11 @@ pub enum CameraFactory {
     Video = 1,
     Photo = 2,
     DeviceInfo = 3,
+    /// 清 U 盘 + T32 切正式版（FQC 收尾，**最后执行**，重启后生效）
+    FactoryReset = 4,
     Wifi = 5,
+    /// 蓝牙固件版本（FQC 与工单 `bt_ver` 完全相等比对，输出格式联调校准）
+    BtVersion = 7,
     SdCard = 8,
     BtMac = 10,
     Battery = 12,
@@ -30,6 +34,9 @@ pub enum CameraFactory {
     /// 打印 CCID 与 IMEI（V3.14 E02E eSIM 型；输出按 `imei:`/`ccid:` 前缀
     /// 解析，格式真机联调时校准）
     CcidImei = 20,
+    /// 按键写配置（FQC：`camera-factory 30 <文件> <节> <键> <值>`，
+    /// 成功回 `config-update:true` 并回显写入后全文件）
+    ConfigWrite = 30,
 }
 
 impl CameraFactory {
@@ -37,6 +44,113 @@ impl CameraFactory {
     pub fn device_cmd(self) -> String {
         format!("camera-factory {}", self as u8)
     }
+}
+
+/// cf30 按键写命令（FQC §2）：`camera-factory 30 <文件> <节> <键> <值>`。
+/// 参数先过白名单校验（字母数字与安全标点，无空白/引号/控制字符），
+/// 防注入拼进 `adb shell` 的整串命令。
+pub fn cf30_cmd(file: &str, section: &str, key: &str, value: &str) -> Result<String> {
+    for (what, s) in [("文件", file), ("节", section), ("键", key), ("值", value)] {
+        if s.is_empty() {
+            bail!("cf30 {what}为空");
+        }
+        if let Some(bad) = s
+            .chars()
+            .find(|c| c.is_control() || c.is_whitespace() || matches!(c, '\'' | '"' | '`' | ';' | '|' | '&' | '$' | '>' | '<' | '\\'))
+        {
+            bail!("cf30 {what}含非法字符 {bad:?}: {s:?}");
+        }
+    }
+    Ok(format!(
+        "{} {file} {section} {key} {value}",
+        CameraFactory::ConfigWrite.device_cmd()
+    ))
+}
+
+/// cf30 响应解析结论（FQC §2，2026-11-23 真机实测约定）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Cf30Result {
+    /// `config-update:true` → Some(true)；`config-update:false` → Some(false)；
+    /// 两者都无 → None（协议异常，按失败处理）
+    pub updated: Option<bool>,
+    /// `[节]` 作用域内目标键回显值（空值键 `uuid=` 为 Some("")）
+    pub echo_value: Option<String>,
+}
+
+/// 解析 cf30 输出：滤控制字符 → 按 `[Section]` 作用域隔离找目标键 →
+/// 读 `config-update:*` 状态行。回显即免费回读，键值判定以它为准。
+pub fn parse_cf30_response(output: &str, section: &str, key: &str) -> Cf30Result {
+    let clean: String = output.chars().filter(|c| *c == '\n' || !c.is_control()).collect();
+    let mut res = Cf30Result {
+        updated: None,
+        echo_value: None,
+    };
+    let mut in_section = false;
+    for line in clean.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            in_section = line[1..line.len() - 1].trim().eq_ignore_ascii_case(section);
+            continue;
+        }
+        // 状态行不是键值对（真机输出在文件末尾）
+        if let Some(v) = line.strip_prefix("config-update:") {
+            res.updated = Some(v.trim().eq_ignore_ascii_case("true"));
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once('=') {
+            if k.trim().eq_ignore_ascii_case(key) {
+                res.echo_value = Some(v.trim().to_string());
+            }
+        }
+    }
+    res
+}
+
+/// 电池电压数值解析（FQC §5：阈值 ≥ `min_batt_volts`，替代测试流程的
+/// "有电压行即过"）。**排除 `%` 百分比行**（`Battery voltage: 88%` 是电量
+/// 不是电压）；兼容 V 与 mV（>20 视作 mV 除以 1000）。
+pub fn parse_battery_volts(output: &str) -> Option<f32> {
+    for line in output.lines() {
+        let low = line.to_lowercase();
+        if line.contains('%') || !(low.contains("vol") || line.contains('压')) {
+            continue;
+        }
+        // 行内首个可解析数值即电压（`Vol:4.326,cur:0.235` 取 4.326）
+        let num: String = line
+            .chars()
+            .skip_while(|c| !(c.is_ascii_digit() || *c == '-'))
+            .take_while(|c| c.is_ascii_digit() || *c == '.')
+            .collect();
+        if let Ok(v) = num.parse::<f32>() {
+            if v > 0.0 {
+                return Some(if v > 20.0 { v / 1000.0 } else { v });
+            }
+        }
+    }
+    None
+}
+
+/// cf7 蓝牙版本提取（FQC §2：输出格式未定，联调校准）。取含 ver 的行，
+/// 冒号后为版本；无则取首个非空行。
+pub fn parse_bt_version(output: &str) -> Option<String> {
+    let lines: Vec<&str> = output
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    let hit = lines
+        .iter()
+        .find(|l| l.to_lowercase().contains("ver"))
+        .or_else(|| lines.first())?;
+    let v = hit.split_once(':').map(|(_, v)| v).unwrap_or(hit);
+    let v = v.trim();
+    (!v.is_empty()).then(|| v.to_string())
 }
 
 /// 设备侧媒体文件远端路径（原程序 adb pull 的参数）。
@@ -140,10 +254,12 @@ pub fn imei_valid(s: &str) -> bool {
     !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) && (14..=16).contains(&s.len())
 }
 
-/// CCID 格式（V3.14 E02E）：纯数字 18–22 位（标称 19/20；容差到联调校准）。
+/// CCID 格式（V3.14 E02E）：18–22 位（标称 19/20；容差到联调校准）。
+/// FQC 定稿放宽字符集到十六进制：sn.ini 旧写号日志真机实样含字母
+/// `898608691025D0768737`，纯数字校验会误杀。
 pub fn ccid_valid(s: &str) -> bool {
     let s = s.trim();
-    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) && (18..=22).contains(&s.len())
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_hexdigit()) && (18..=22).contains(&s.len())
 }
 
 /// 电池测试（camera-factory 12，V3.5）：收集输出中含 电压/电流 关键词的行，
@@ -522,8 +638,98 @@ mod tests {
         assert!(ccid_valid("898601151234567890")); // 18 位（下界）
         assert!(ccid_valid("8986011512345678901234")); // 22 位（上界）
         assert!(!ccid_valid("89860115123456789012345")); // 23 位
-        assert!(!ccid_valid("89860115123456789a"));
+        // FQC 定稿：CCID 放宽到十六进制（sn.ini 旧日志真机实样含 D）
+        assert!(ccid_valid("898608691025D0768737"));
+        assert!(ccid_valid("898608691025d0768737"));
+        assert!(!ccid_valid("89860115123456789g")); // 非十六进制字母
         assert!(!ccid_valid(""));
+    }
+
+    /// FQC cf30（2026-11-23 真机实测样例）。
+    #[test]
+    fn cf30_cmd_builds_and_validates() {
+        assert_eq!(
+            CameraFactory::ConfigWrite.device_cmd(),
+            "camera-factory 30"
+        );
+        let cmd = cf30_cmd(
+            "webrtc_serno_file.ini",
+            "ProvisionInfo",
+            "sn",
+            "6302W1000288",
+        )
+        .unwrap();
+        assert_eq!(
+            cmd,
+            "camera-factory 30 webrtc_serno_file.ini ProvisionInfo sn 6302W1000288"
+        );
+        // 注入防护：空白/引号/控制字符/元字符拒绝
+        assert!(cf30_cmd("a b", "s", "k", "v").is_err());
+        assert!(cf30_cmd("a", "s", "k", "v;rm").is_err());
+        assert!(cf30_cmd("a", "s", "k", "v'x").is_err());
+        assert!(cf30_cmd("a", "s", "k", "v\x11").is_err());
+        assert!(cf30_cmd("", "s", "k", "v").is_err());
+    }
+
+    #[test]
+    fn cf30_response_parse_real_sample() {
+        // 真机实测：写入后回显全文件 + config-update:true
+        let out = "\r\n[ProvisionInfo]\r\nsn=6302W1000288\r\n\
+                   webrtc_id=HCSX-00-D1TV-KQZ5-00000688\r\n\
+                   enable_sub_record = true\r\nuuid=\r\nauth_key=\r\n\
+                   config-update:true\r\n";
+        let r = parse_cf30_response(out, "ProvisionInfo", "sn");
+        assert_eq!(r.updated, Some(true));
+        assert_eq!(r.echo_value.as_deref(), Some("6302W1000288"));
+        // 空值键（uuid=）与键两侧空格 trim
+        let r = parse_cf30_response(out, "ProvisionInfo", "uuid");
+        assert_eq!(r.echo_value.as_deref(), Some(""));
+        let r = parse_cf30_response(out, "ProvisionInfo", "enable_sub_record");
+        assert_eq!(r.echo_value.as_deref(), Some("true"));
+        // config-update 行不是键值对
+        let r = parse_cf30_response(out, "ProvisionInfo", "config-update");
+        assert_eq!(r.echo_value, None);
+        // 失败标记
+        let r = parse_cf30_response("config-update:false", "ProvisionInfo", "sn");
+        assert_eq!(r.updated, Some(false));
+        // 两者都无 = 协议异常
+        let r = parse_cf30_response("garbage", "ProvisionInfo", "sn");
+        assert_eq!(r.updated, None);
+        // 跨 Section 同名键隔离：目标节外的键不串
+        let cross = "[Other]\nsn=WRONG\n[ProvisionInfo]\nsn=RIGHT\nconfig-update:true";
+        assert_eq!(
+            parse_cf30_response(cross, "ProvisionInfo", "sn").echo_value.as_deref(),
+            Some("RIGHT")
+        );
+        // 串口控制字符（DC1/EOT）滤除后再解析
+        let dirty = "[ProvisionInfo]\nsn=6302W1000\x11288\x04\nconfig-update:true";
+        assert_eq!(
+            parse_cf30_response(dirty, "ProvisionInfo", "sn").echo_value.as_deref(),
+            Some("6302W1000288")
+        );
+    }
+
+    #[test]
+    fn battery_volts_numeric() {
+        // 真机已见格式
+        assert_eq!(parse_battery_volts("Bat vol:4.390"), Some(4.390));
+        assert_eq!(parse_battery_volts("Vol:4.326,cur:0.235"), Some(4.326));
+        assert_eq!(parse_battery_volts("voltage: 4.12V\ncurrent: 356mA"), Some(4.12));
+        // mV 兼容
+        assert_eq!(parse_battery_volts("vol:4326mV"), Some(4.326));
+        // 百分比行排除（电量不是电压）
+        assert_eq!(parse_battery_volts("Battery voltage: 88%\nvol:4.2"), Some(4.2));
+        assert_eq!(parse_battery_volts("battery: 88%"), None);
+        assert_eq!(parse_battery_volts("no number here"), None);
+    }
+
+    #[test]
+    fn bt_version_extract() {
+        assert_eq!(parse_bt_version("bt-ver:V1_7_4"), Some("V1_7_4".into()));
+        assert_eq!(parse_bt_version("BT Version: V1.7.4"), Some("V1.7.4".into()));
+        // 无 ver 关键字 → 首个非空行
+        assert_eq!(parse_bt_version("\nV1_7_4\n"), Some("V1_7_4".into()));
+        assert_eq!(parse_bt_version(""), None);
     }
 
     #[test]

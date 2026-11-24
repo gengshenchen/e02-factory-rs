@@ -250,6 +250,206 @@ pub struct Profile {
     pub items: Vec<String>,
 }
 
+/// 出厂闸门模式（FQC §3 ①）：写号前查本机整机工位是否全测 PASS。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GateMode {
+    /// 硬拦：查无台账记录或整机非全 PASS 一律拒写（台账覆盖全后切此档）
+    Strict,
+    /// **默认**：警告可继续（过渡期旧工具测完的机器无台账记录）
+    #[default]
+    Warn,
+    /// 跳过闸门检查
+    Off,
+}
+
+/// 4G 模组配置写入（FQC §3.1，eSIM 档案可选；不配即整步跳过）。
+/// 4g-test 是设备端 CLI（随固件落地，同 camera-factory），PC 经
+/// `adb shell` 转发，PC 不直接碰串口（2026-11-24 确认）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FourGCfg {
+    /// 设备端串口；留空 = 用 4g-test 自身默认（/dev/ttyS2）
+    #[serde(default = "d_fourg_port")]
+    pub port: String,
+    /// 波特率；0 = 用 4g-test 自身默认（115200）
+    #[serde(default = "d_fourg_baud")]
+    pub baud: u32,
+    /// 静态模板（数据目录相对路径，如 `templates/e02e_4g.ini`）
+    #[serde(default)]
+    pub template: String,
+}
+
+fn d_fourg_port() -> String {
+    "/dev/ttyS2".into()
+}
+fn d_fourg_baud() -> u32 {
+    115200
+}
+
+/// 出厂档案（FQC §5：`[provision.profiles.<name>]`，型号维度而非工位）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProvisionProfile {
+    /// 所属产品型号
+    #[serde(default)]
+    pub model: ModelKind,
+    /// 工单 T32 软件版本（完全相等判定；留空 = 配置缺失拒写）
+    #[serde(default)]
+    pub t32_ver: String,
+    /// 工单蓝牙固件版本（完全相等判定；留空 = 配置缺失拒写）
+    #[serde(default)]
+    pub bt_ver: String,
+    /// 电池最低电压（V）
+    #[serde(default = "d_min_batt_volts")]
+    pub min_batt_volts: f32,
+    /// 是否校验 SD 卡在位
+    #[serde(default = "d_check_sdcard")]
+    pub check_sdcard: bool,
+    /// 正式 SN 格式（TOML 单引号字面量串，单反斜杠）
+    #[serde(default = "d_sn_pattern")]
+    pub sn_pattern: String,
+    /// 写入键集（顺序即写序；凭据档案 = ["sn","uuid","auth_key"]）
+    #[serde(default = "d_prov_keys")]
+    pub keys: Vec<String>,
+    /// 凭据格式校验（凭据档案用；普通档案不消费）
+    #[serde(default = "d_uuid_pattern")]
+    pub uuid_pattern: String,
+    #[serde(default = "d_key_pattern")]
+    pub key_pattern: String,
+    /// 4G 模组配置（eSIM 档案可选）
+    #[serde(default)]
+    pub fourg: Option<FourGCfg>,
+}
+
+fn d_min_batt_volts() -> f32 {
+    3.5
+}
+fn d_check_sdcard() -> bool {
+    true
+}
+fn d_sn_pattern() -> String {
+    r"^\d{4}W\d{7}$".into()
+}
+fn d_prov_keys() -> Vec<String> {
+    vec!["sn".into()]
+}
+fn d_uuid_pattern() -> String {
+    r"^uuid[0-9a-f]{16}$".into()
+}
+fn d_key_pattern() -> String {
+    r"^[A-Za-z0-9]{32}$".into()
+}
+
+impl ProvisionProfile {
+    /// 凭据档案：键集要求 uuid/auth_key（凭据池导入强制、缺池拒写）。
+    pub fn needs_credentials(&self) -> bool {
+        self.keys.iter().any(|k| k == "uuid" || k == "auth_key")
+    }
+}
+
+/// 出厂写号配置（FQC §5：`[provision]` 公共 + `profiles` 档案表）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProvisionCfg {
+    /// 当前启用的出厂档案名
+    #[serde(default = "d_active_profile")]
+    pub active_profile: String,
+    #[serde(default)]
+    pub gate_mode: GateMode,
+    /// 扫码即自动开写（有告警仍弹窗确认）；false = 每台人工点确认
+    #[serde(default = "d_auto_commit")]
+    pub auto_commit: bool,
+    /// ⑫ 重启后探测秒数；0 = 跳过（正式版无 adb 时置 0 免白等）
+    #[serde(default = "d_reboot_verify")]
+    pub reboot_verify_secs: u64,
+    /// 设备端 ini 绝对路径（2026-11-24 已确认）
+    #[serde(default = "d_config_path")]
+    pub config_path: String,
+    /// 工厂未写号占位 SN（附加判断：不匹配正式正则也视作未写号）
+    #[serde(default = "d_placeholder_sns")]
+    pub placeholder_sns: Vec<String>,
+    #[serde(default = "d_prov_profiles")]
+    pub profiles: BTreeMap<String, ProvisionProfile>,
+}
+
+fn d_active_profile() -> String {
+    "e02".into()
+}
+fn d_auto_commit() -> bool {
+    true
+}
+fn d_reboot_verify() -> u64 {
+    60
+}
+fn d_config_path() -> String {
+    "/config/webrtc_serno_file.ini".into()
+}
+fn d_placeholder_sns() -> Vec<String> {
+    vec!["00001".into(), "002".into()]
+}
+fn d_prov_profiles() -> BTreeMap<String, ProvisionProfile> {
+    let mut m = BTreeMap::new();
+    m.insert(
+        "e02".into(),
+        ProvisionProfile {
+            model: ModelKind::E02,
+            t32_ver: String::new(),
+            bt_ver: String::new(),
+            min_batt_volts: d_min_batt_volts(),
+            check_sdcard: d_check_sdcard(),
+            sn_pattern: r"^\d{4}W\d{7}$".into(),
+            keys: vec!["sn".into()],
+            uuid_pattern: d_uuid_pattern(),
+            key_pattern: d_key_pattern(),
+            fourg: None,
+        },
+    );
+    m.insert(
+        "e02e".into(),
+        ProvisionProfile {
+            model: ModelKind::E02e,
+            t32_ver: String::new(),
+            bt_ver: String::new(),
+            min_batt_volts: d_min_batt_volts(),
+            check_sdcard: d_check_sdcard(),
+            sn_pattern: r"^\d{4}E\d{7}$".into(),
+            keys: vec!["sn".into()],
+            uuid_pattern: d_uuid_pattern(),
+            key_pattern: d_key_pattern(),
+            fourg: Some(FourGCfg {
+                port: d_fourg_port(),
+                baud: d_fourg_baud(),
+                // 缺省空 = 未配置（4G 步跳过）；工厂放好模板后在此填
+                // 数据目录相对路径（如 templates/e02e_4g.ini），配了而
+                // 文件缺失会拒写——宁拦勿漏
+                template: String::new(),
+            }),
+        },
+    );
+    m
+}
+
+impl Default for ProvisionCfg {
+    fn default() -> Self {
+        Self {
+            active_profile: d_active_profile(),
+            gate_mode: GateMode::default(),
+            auto_commit: d_auto_commit(),
+            reboot_verify_secs: d_reboot_verify(),
+            config_path: d_config_path(),
+            placeholder_sns: d_placeholder_sns(),
+            profiles: d_prov_profiles(),
+        }
+    }
+}
+
+impl ProvisionCfg {
+    /// 当前启用档案；档案名失效时回退首个（设置页保存前容错）。
+    pub fn active(&self) -> Option<&ProvisionProfile> {
+        self.profiles
+            .get(&self.active_profile)
+            .or_else(|| self.profiles.values().next())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Config {
     /// 当前工位名（须存在于 profiles）
@@ -273,6 +473,9 @@ pub struct Config {
     /// 型号（V3.14：E02 WiFi 型 / E02E eSIM 型；手动选定，缺省 E02）
     #[serde(default)]
     pub model: Option<ModelKind>,
+    /// 出厂写号（FQC）
+    #[serde(default)]
+    pub provision: ProvisionCfg,
 }
 
 fn d_station() -> String {
@@ -313,6 +516,7 @@ impl Default for Config {
             conn: ConnCfg::default(),
             binding: BindingCfg::default(),
             model: None,
+            provision: ProvisionCfg::default(),
         }
     }
 }

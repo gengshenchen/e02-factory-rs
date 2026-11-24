@@ -126,6 +126,7 @@ pub fn run_sequence(
         &ledger_path,
         &device,
         model,
+        &cfg.station,
         &mut results,
         tx,
     );
@@ -187,6 +188,7 @@ pub fn run_sequence(
                 &ledger_path,
                 &device,
                 model,
+                &cfg.station,
                 &mut results,
                 tx,
             );
@@ -228,6 +230,7 @@ pub fn run_sequence(
         ledger.set_verdict(
             &device.bt_mac,
             report::overall(&results, true),
+            &cfg.station,
             &report::time_str(SystemTime::now()),
         );
         if let Err(e) = ledger.save(&ledger_path) {
@@ -273,6 +276,7 @@ fn maybe_bind(
     ledger_path: &Path,
     device: &DeviceInfo,
     model: ModelKind,
+    cfg_station: &str,
     results: &mut Vec<TestResult>,
     tx: &Sender<UiEvent>,
 ) {
@@ -289,7 +293,14 @@ fn maybe_bind(
     let now = report::time_str(SystemTime::now());
     let mut ledger = Ledger::load(ledger_path);
     let mut r = TestResult::new(TestItem::Binding);
-    match ledger.bind(&device.bt_mac, partner, model.label(), &device.sn, &now) {
+    match ledger.bind(
+        &device.bt_mac,
+        partner,
+        model.label(),
+        &device.sn,
+        &cfg_station,
+        &now,
+    ) {
         BindCheck::New => {
             r.verdict = Verdict::Pass;
             r.detail = "新设备入账".into();

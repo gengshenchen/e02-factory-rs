@@ -966,7 +966,7 @@ checksum = "d8b14ccef22fc6f5a8f4d7d768562a182c04ce9a3b3157b91390b52ddfdf1a76"
 
 [[package]]
 name = "e02-factory-rs"
-version = "0.4.7"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -975,6 +975,7 @@ dependencies = [
  "encoding_rs",
  "if-addrs",
  "image",
+ "regex-lite",
  "rodio",
  "serde",
  "serde_json",
@@ -2890,6 +2891,12 @@ dependencies = [
  "memchr",
  "regex-syntax",
 ]
+
+[[package]]
+name = "regex-lite"
+version = "0.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cab834c73d247e67f4fae452806d17d3c7501756d98c8808d7c9c7aa7d18f973"
 
 [[package]]
 name = "regex-syntax"

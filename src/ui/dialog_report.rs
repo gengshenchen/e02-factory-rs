@@ -118,22 +118,60 @@ pub fn show(ctx: &egui::Context, app: &mut E02App) {
     }
 }
 
-/// 列表显示名：`e02-<yyyymmdd>-<SN|hhmmss-unknown>` → `10-22 SN_123` / `10-22 10:30:12（无SN）`。
+/// 列表显示名（FQC §7/§8 适配）：
+/// - 测试报告（新）：`e02-<yyyymmdd>-<工位>-<蓝牙MAC|hhmmss-unknown|MAC-冲突hhmmss>`
+/// - 出厂报告：`ship-<yyyymmdd>-<蓝牙MAC|hhmmss-unknown>`
+/// - 旧版测试报告（无工位段）：`e02-<yyyymmdd>-<SN|hhmmss-unknown>`
+/// 显示 `11-24 整机 0012A3B4C5D6` / `11-24 出厂 10:30:12（无MAC）` /
+/// `10-22 SN_123`（旧文件原样可读）。
 fn display_name(stem: &str) -> String {
-    let Some(rest) = stem.strip_prefix("e02-") else {
+    // 前缀族：e02e- 须先于 e02- 判（前缀包含）；ship- = 出厂报告
+    let (ship, rest) = if let Some(r) = stem.strip_prefix("ship-") {
+        (true, r)
+    } else if let Some(r) = stem.strip_prefix("e02e-") {
+        (false, r)
+    } else if let Some(r) = stem.strip_prefix("e02-") {
+        (false, r)
+    } else {
         return stem.to_string();
     };
-    let (day, tail) = rest.split_at(rest.len().min(8));
+    let segs: Vec<&str> = rest.split('-').collect();
+    let Some((&day, tail_segs)) = segs.split_first() else {
+        return stem.to_string();
+    };
     if day.len() != 8 || !day.bytes().all(|b| b.is_ascii_digit()) {
-        return rest.to_string();
+        return stem.to_string();
     }
     let date = format!("{}-{}", &day[4..6], &day[6..8]);
+    // 工位段判定：新命名日期后跟工位 token；旧版三段形状
+    // `<day>-<hhmmss>-unknown`（无工位）要排除，别把时间戳当工位
+    let old_unknown_shape = tail_segs.len() == 2
+        && tail_segs[1] == "unknown"
+        && tail_segs[0].len() == 6
+        && tail_segs[0].bytes().all(|b| b.is_ascii_digit());
+    let (station_label, tail) = if ship || tail_segs.len() < 2 || old_unknown_shape {
+        let label = if ship { "出厂 " } else { "" };
+        (label.to_string(), tail_segs.join("-"))
+    } else {
+        let label = match tail_segs[0] {
+            "module" => "模组 ".to_string(),
+            "complete" => "整机 ".to_string(),
+            s => format!("{s} "),
+        };
+        (label, tail_segs[1..].join("-"))
+    };
+    // 日期 + 工位标签合一前缀（日期后统一空格；标签自身带尾随空格）
+    let prefix = format!("{date} {station_label}");
+    // 时间戳兜底（蓝牙 MAC 未识别）→ 时分秒；冲突后缀收敛为 ·冲突
     if let Some(t) = tail.strip_suffix("-unknown") {
         if t.len() == 6 && t.bytes().all(|b| b.is_ascii_digit()) {
-            return format!("{date} {}:{}:{}（无SN）", &t[..2], &t[2..4], &t[4..6]);
+            return format!("{prefix}{}:{}:{}（无MAC）", &t[..2], &t[2..4], &t[4..6]);
         }
     }
-    format!("{date} {tail}")
+    if let Some((mac, _ts)) = tail.split_once("-冲突") {
+        return format!("{prefix}{mac}·冲突");
+    }
+    format!("{prefix}{tail}")
 }
 
 /// 用系统文件管理器打开报告目录（Windows explorer / Linux xdg-open）。
@@ -149,5 +187,52 @@ fn open_folder(dir: &std::path::Path) -> bool {
             .arg(dir)
             .spawn()
             .is_ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::display_name;
+
+    /// FQC §7/§8：工位段 + ship- 前缀 + 旧文件兼容。
+    #[test]
+    fn display_name_new_station_and_ship_prefixes() {
+        // 新测试报告：整机/模组工位 + 蓝牙 MAC
+        assert_eq!(
+            display_name("e02-20261124-complete-0012A3B4C5D6"),
+            "11-24 整机 0012A3B4C5D6"
+        );
+        assert_eq!(display_name("e02e-20261124-module-BT4"), "11-24 模组 BT4");
+        // MAC 未识别（时间戳兜底）——新命名带工位，与旧三段形状区分
+        assert_eq!(
+            display_name("e02-20261124-complete-103012-unknown"),
+            "11-24 整机 10:30:12（无MAC）"
+        );
+        // 绑定冲突：MAC·冲突
+        assert_eq!(
+            display_name("e02-20261124-complete-0012A3B4C5D6-冲突103012"),
+            "11-24 整机 0012A3B4C5D6·冲突"
+        );
+        // 出厂报告
+        assert_eq!(
+            display_name("ship-20261124-0012A3B4C5D6"),
+            "11-24 出厂 0012A3B4C5D6"
+        );
+        assert_eq!(
+            display_name("ship-20261124-103012-unknown"),
+            "11-24 出厂 10:30:12（无MAC）"
+        );
+    }
+
+    /// 旧文件名（无工位段）原样可读，不误伤。
+    #[test]
+    fn display_name_legacy_shapes() {
+        assert_eq!(display_name("e02-20261022-SN_123"), "10-22 SN_123");
+        assert_eq!(
+            display_name("e02-20261022-103012-unknown"),
+            "10-22 10:30:12（无MAC）"
+        );
+        // 非日期开头/无前缀 → 原样返回
+        assert_eq!(display_name("readme"), "readme");
     }
 }

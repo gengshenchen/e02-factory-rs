@@ -115,9 +115,11 @@ pub fn sanitize(text: &str) -> String {
 
 /// 写入报告，返回路径。文件名规则（V3.13 设备身份改蓝牙 MAC；V3.2 同机
 /// 重测更新同一份的语义保留）：
-/// - 蓝牙 MAC 已知：`e02-<日期>-<蓝牙MAC>.txt` —— 同机同日一份，重测/单项
-///   补测覆盖更新（SN 未烧写全厂默认 00001，不能再作键，多台会互踩）；
-/// - 蓝牙 MAC 未知：`e02-<日期>-<时分秒>-unknown.txt` —— 带时间戳不互踩；
+/// - 蓝牙 MAC 已知：`e02-<日期>-<工位>-<蓝牙MAC>.txt`（FQC §8 加工位段：
+///   同机同日跨模组/整机工位各自保留，旧命名互覆盖是丢数据）——同机同日
+///   同工位一份，重测/单项补测覆盖更新（SN 未烧写全厂默认 00001，不能
+///   再作键，多台会互踩）；
+/// - 蓝牙 MAC 未知：`e02-<日期>-<工位>-<时分秒>-unknown.txt` —— 带时间戳不互踩；
 /// - 绑定冲突（MAC 绑定判 FAIL）：追加 `-冲突<时分秒>`，冲突机不覆盖
 ///   台账原机的报告。
 ///
@@ -143,6 +145,7 @@ fn file_name(meta: &ReportMeta, device: &DeviceInfo, results: &[TestResult]) -> 
     } else {
         (ts.as_str(), "unknown")
     };
+    let station = sanitize_token(&meta.station);
     let tail = if device.bt_mac.is_empty() {
         format!("{hms}-unknown")
     } else {
@@ -153,7 +156,7 @@ fn file_name(meta: &ReportMeta, device: &DeviceInfo, results: &[TestResult]) -> 
             mac
         }
     };
-    format!("{}-{day}-{tail}.txt", meta.model.file_prefix())
+    format!("{}-{day}-{station}-{tail}.txt", meta.model.file_prefix())
 }
 
 /// 绑定冲突（V3.13）：MAC 绑定行判 FAIL（同址不同对），报告文件名加后缀。
@@ -194,7 +197,11 @@ pub struct DayStats {
 /// 扫描 `dir` 下文件名为 `<prefix>-<day>-*.txt`（e02-/e02e- 均计）的报告，
 /// 按"结果:"行统计。解析不到"结果:"行的旧版/中断报告计入 total 不计入
 /// pass/fail。
-pub fn scan_stats(dir: &Path, day: &str) -> DayStats {
+///
+/// FQC §8 工位分组：按报告内容 `工位:` 行归组（新报告文件名带工位段、
+/// 旧报告无工位段，`工位:` 行两种都有——scan 本就逐文件读，零额外开销），
+/// 只统计 `station` 工位；出厂报告（ship- 前缀）不计入测试统计。
+pub fn scan_stats(dir: &Path, day: &str, station: &str) -> DayStats {
     let mut s = DayStats::default();
     let Ok(entries) = std::fs::read_dir(dir) else {
         return s;
@@ -203,8 +210,47 @@ pub fn scan_stats(dir: &Path, day: &str) -> DayStats {
     for e in entries.flatten() {
         let name = e.file_name();
         let Some(name) = name.to_str() else { continue };
-        // V3.14：型号前缀族（e02 / e02e）都计入今日统计
+        // V3.14：型号前缀族（e02 / e02e）都计入；ship- 不属于测试统计
         if !name.starts_with(ModelKind::E02.file_prefix()) || !name.contains(&day_mark) {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(e.path()) else {
+            continue;
+        };
+        if report_station_of(&text).as_deref() != Some(station) {
+            continue;
+        }
+        s.total += 1;
+        if let Some(line) = text.lines().find(|l| l.starts_with("结果: ")) {
+            match line.trim_end() {
+                "结果: PASS" => s.pass += 1,
+                "结果: FAIL" => s.fail += 1,
+                _ => {}
+            }
+        }
+    }
+    s
+}
+
+/// 报告内容里的工位（`工位: complete    开始: ...` 行，取首个分词）。
+/// 解析不到（极老版本报告）返回 None，由调用方决定去留。
+pub fn report_station_of(text: &str) -> Option<String> {
+    let line = text.lines().find(|l| l.starts_with("工位: "))?;
+    let v = line["工位: ".len()..].trim().split_whitespace().next()?;
+    Some(v.to_string())
+}
+
+/// 出厂报告统计（FQC §8：出厂页独立统计——今日写号 N / 成功 x / 失败 y）。
+pub fn scan_ship_stats(dir: &Path, day: &str) -> DayStats {
+    let mut s = DayStats::default();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return s;
+    };
+    let day_mark = format!("-{day}-");
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with("ship-") || !name.contains(&day_mark) {
             continue;
         }
         s.total += 1;
@@ -221,20 +267,58 @@ pub fn scan_stats(dir: &Path, day: &str) -> DayStats {
     s
 }
 
-/// 报告列表（新→旧，文件名时间戳前缀字典序倒排即时间倒序），最多 `limit` 条。
-/// V3.14：e02- 与 e02e-（型号前缀族）都列出。
+/// 报告列表（新→旧），最多 `limit` 条。V3.14：e02-/e02e-（型号前缀族）
+/// 都列出；FQC §7 起含 ship- 出厂报告。
+///
+/// FQC §8 排序修复：此前按完整文件名字典序倒排，引入 `ship-` 后
+/// `'s' > 'e'` 会让全部出货报告永久压在测试报告之前、挤爆截断上限——
+/// 改为提取文件名日期段（第 2 段）统一倒排，同日以 mtime 细分；日期段
+/// 解析不到的极老文件沉底（mtime 兜底参与排序）。
 pub fn list_reports(dir: &Path, limit: usize) -> Vec<PathBuf> {
-    let mut names: Vec<String> = std::fs::read_dir(dir)
+    let mut names: Vec<(String, u64, String)> = std::fs::read_dir(dir)
         .map(|rd| {
             rd.flatten()
                 .filter_map(|e| e.file_name().into_string().ok())
-                .filter(|n| n.starts_with(ModelKind::E02.file_prefix()) && n.ends_with(".txt"))
+                .filter(|n| {
+                    (n.starts_with(ModelKind::E02.file_prefix()) || n.starts_with("ship-"))
+                        && n.ends_with(".txt")
+                })
+                .map(|n| {
+                    let date = n
+                        .split('-')
+                        .nth(1)
+                        .filter(|d| d.len() == 8 && d.bytes().all(|b| b.is_ascii_digit()))
+                        .unwrap_or("00000000")
+                        .to_string();
+                    // 纳秒精度：同日多份报告按真实落盘先后细分（秒级会把
+                    // 连续测试的先后序打成平局，落入 read_dir 的不确定序）
+                    let mtime = std::fs::metadata(dir.join(&n))
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_nanos() as u64)
+                        .unwrap_or(0);
+                    (date, mtime, n)
+                })
                 .collect()
         })
         .unwrap_or_default();
-    names.sort_unstable();
-    names.reverse();
-    names.into_iter().take(limit).map(|n| dir.join(n)).collect()
+    names.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+    names
+        .into_iter()
+        .take(limit)
+        .map(|(_, _, n)| dir.join(n))
+        .collect()
+}
+
+/// 出厂报告文件名（FQC §7）：`ship-<日期>-<蓝牙MAC>.txt`，同机同日重跑
+/// 覆盖最新；蓝牙 MAC 未读到兜底 `ship-<日期>-<时分秒>-unknown.txt`。
+pub fn ship_file_name(day: &str, bt_mac: &str, hms: &str) -> String {
+    if bt_mac.trim().is_empty() {
+        format!("ship-{day}-{hms}-unknown.txt")
+    } else {
+        format!("ship-{day}-{}.txt", sanitize_token(bt_mac))
+    }
 }
 
 /// 当前本地时间戳（日志用）。
@@ -338,7 +422,7 @@ mod tests {
             true,
         )
         .unwrap();
-        assert!(p1.ends_with("e02-20261022-103012-unknown.txt"));
+        assert!(p1.ends_with("e02-20261022-complete-103012-unknown.txt"));
         // 蓝牙 MAC 已知 → 同机同日一份（V3.13 键改蓝牙 MAC；SN 仅留证不作键）
         let dev = DeviceInfo {
             bt_mac: "0012A3B4C5D6".into(),
@@ -346,7 +430,7 @@ mod tests {
             ..Default::default()
         };
         let p2 = write_report(&dir, &meta(), &dev, std::slice::from_ref(&r), true).unwrap();
-        assert!(p2.ends_with("e02-20261022-0012A3B4C5D6.txt"));
+        assert!(p2.ends_with("e02-20261022-complete-0012A3B4C5D6.txt"));
         // 同机同日再写 → 同一路径（重测覆盖更新）
         let p3 = write_report(&dir, &meta(), &dev, &[], true).unwrap();
         assert_eq!(p2, p3);
@@ -354,7 +438,7 @@ mod tests {
         let mut bind = TestResult::new(TestItem::Binding);
         bind.verdict = Verdict::Fail;
         let p4 = write_report(&dir, &meta(), &dev, &[r, bind], true).unwrap();
-        assert!(p4.ends_with("e02-20261022-0012A3B4C5D6-冲突103012.txt"));
+        assert!(p4.ends_with("e02-20261022-complete-0012A3B4C5D6-冲突103012.txt"));
         // MAC 含冒号/路径字符 → 替换为 _（防目录穿越/非法文件名）
         let p5 = write_report(
             &dir,
@@ -367,7 +451,7 @@ mod tests {
             true,
         )
         .unwrap();
-        assert!(p5.ends_with("e02-20261022-00_11_.._x.txt"));
+        assert!(p5.ends_with("e02-20261022-complete-00_11_.._x.txt"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -401,7 +485,22 @@ mod tests {
             &[result(TestItem::Wifi, Verdict::Pass)],
             true,
         );
-        let s = scan_stats(&dir, "20261022");
+        // FQC §8：模组工位一台——同日跨工位各自保留、各自统计
+        let module_meta = ReportMeta {
+            station: "module".into(),
+            ..meta()
+        };
+        write_report(
+            &dir,
+            &module_meta,
+            &DeviceInfo {
+                bt_mac: "BT4".into(),
+                ..Default::default()
+            },
+            &[result(TestItem::Wifi, Verdict::Pass)],
+            true,
+        );
+        let s = scan_stats(&dir, "20261022", "complete");
         assert_eq!(
             s,
             DayStats {
@@ -410,12 +509,61 @@ mod tests {
                 fail: 1
             }
         );
-        // 列表新→旧：同日按文件名倒序，最多取 2
+        let s = scan_stats(&dir, "20261022", "module");
+        assert_eq!(s.total, 1);
+        // 列表新→旧：日期段倒排 + 同日 mtime 纳秒细分（最后写的 BT4 在前），
+        // 他日 BT9 沉底；最多取 2
         let list = list_reports(&dir, 2);
         assert_eq!(list.len(), 2);
-        assert!(list[0].ends_with("e02-20261022-BT3.txt"));
-        assert!(list[1].ends_with("e02-20261022-BT2.txt"));
+        assert!(list[0].ends_with("e02-20261022-module-BT4.txt"));
+        assert!(list[1].ends_with("e02-20261022-complete-BT3.txt"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// FQC §8 排序修复：ship- 与 e02- 混排时按日期段统一倒排，
+    /// 不再被 's' > 'e' 字典序压顶。
+    #[test]
+    fn ship_reports_sort_by_date_not_lexical() {
+        let dir = std::env::temp_dir().join(format!("e02-ship-sort-{}", std::process::id()));
+        let r = result(TestItem::Wifi, Verdict::Pass);
+        // 昨天的 ship 报告 + 今天的测试报告：今天的在前
+        let p_ship = dir.join(ship_file_name_for_test("20261021", "SHIPMAC"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&p_ship, "E02 出厂写号报告\n结果: PASS\n工位: ship\n").unwrap();
+        write_report(
+            &dir,
+            &meta(),
+            &DeviceInfo {
+                bt_mac: "BT1".into(),
+                ..Default::default()
+            },
+            std::slice::from_ref(&r),
+            true,
+        )
+        .unwrap();
+        let list = list_reports(&dir, 10);
+        assert_eq!(list.len(), 2);
+        assert!(
+            list[0].ends_with("e02-20261022-complete-BT1.txt"),
+            "今日测试报告应在前: {list:?}"
+        );
+        assert!(list[1].ends_with("ship-20261021-SHIPMAC.txt"));
+        // 今日统计不含 ship
+        let s = scan_stats(&dir, "20261021", "complete");
+        assert_eq!(s.total, 0, "ship 报告不计入测试统计");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 测试桩：直接以固定 MAC 落一个 ship 文件名（复用 ship_file_name 逻辑）。
+    fn ship_file_name_for_test(day: &str, mac: &str) -> String {
+        ship_file_name(day, mac, "080000")
+    }
+
+    #[test]
+    fn ship_file_name_shapes() {
+        assert_eq!(ship_file_name("20261124", "0012A3B4C5D6", "103012"), "ship-20261124-0012A3B4C5D6.txt");
+        assert_eq!(ship_file_name("20261124", "", "103012"), "ship-20261124-103012-unknown.txt");
+        assert_eq!(ship_file_name("20261124", "00:11", "103012"), "ship-20261124-00_11.txt");
     }
 
     #[test]
