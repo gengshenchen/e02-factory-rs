@@ -26,6 +26,7 @@ pub fn show(ui: &mut egui::Ui, app: &E02App) {
                 field(ui, "CCID", &app.device.ccid, false);
             }
             field(ui, "软件版本", &app.device.t32_ver, false);
+            field(ui, "蓝牙版本", &app.device.bt_ver, false);
             field(ui, "硬件版本", &app.device.hardware_ver, false);
             field(ui, "电池", &app.device.battery, false);
         });

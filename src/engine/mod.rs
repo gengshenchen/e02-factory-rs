@@ -125,11 +125,14 @@ impl TestItem {
         }
     }
 
-    /// 型号可用性（V3.14）：E02E 无 WiFi 模组；E02 无 eSIM（IMEI/CCID
-    /// 读不到必 FAIL）。设置勾选、工位模板、执行序列统一按此过滤。
+    /// 型号可用性：
+    /// - E02W（WiFi 版）：有 WiFi，无 eSIM，无陀螺仪；
+    /// - E02E（eSIM 版）：无 WiFi，有 eSIM（IMEI/CCID）与陀螺仪。
+    ///
+    /// 左侧测试清单、设置勾选、工位执行与报告判定统一按此过滤。
     pub fn available_for(self, model: crate::config::ModelKind) -> bool {
         match self {
-            TestItem::Esim => model == crate::config::ModelKind::E02e,
+            TestItem::Esim | TestItem::Gyro => model == crate::config::ModelKind::E02e,
             TestItem::Wifi => model.has_wifi(),
             _ => true,
         }

@@ -38,6 +38,8 @@ pub enum UiEvent {
     },
     /// 过程日志（底部日志面板实时滚动）
     Log(String),
+    /// 本台设备已完成时间同步（同一连接周期内不再重复下发校时）
+    TimeSynced,
     /// 序列结束（附报告路径）
     Finished { report: Option<PathBuf> },
 }

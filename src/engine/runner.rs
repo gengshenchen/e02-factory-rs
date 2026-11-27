@@ -46,9 +46,24 @@ pub fn run_auto(item: TestItem) -> RunOutcome {
             protocol::parse_device_info(&out)
                 .map_err(|e| format!("{e:#}（原始输出: {}）", one_line(&out)))
         }) {
-            Ok(info) if !info.bt_mac.is_empty() => {
+            Ok(mut info) if !info.bt_mac.is_empty() => {
+                // 顺带读取蓝牙固件版本（camera-factory 7），供右侧被测设备面板展示与报告留痕；
+                // 辅助读取失败不影响蓝牙 MAC 判定。
+                if let Ok(bt_out) = exec(&CameraFactory::BtVersion.device_cmd()) {
+                    if protocol::output_ok(&bt_out) {
+                        if let Some(ver) = protocol::parse_bt_version(&bt_out) {
+                            if !ver.eq_ignore_ascii_case("ok") {
+                                info.bt_ver = ver;
+                            }
+                        }
+                    }
+                }
                 r.verdict = Verdict::Pass;
-                r.detail = info.bt_mac.clone();
+                r.detail = if info.bt_ver.is_empty() {
+                    info.bt_mac.clone()
+                } else {
+                    format!("{}（版本 {}）", info.bt_mac, info.bt_ver)
+                };
                 Some(info)
             }
             Ok(_) => {

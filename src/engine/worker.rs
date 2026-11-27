@@ -70,6 +70,8 @@ fn upsert(results: &mut Vec<TestResult>, r: TestResult) {
 pub struct RunBase {
     pub device: DeviceInfo,
     pub results: Vec<TestResult>,
+    /// 当前连接的这台设备已校时过（true 时跳过前置校时，避免单点测试重复下发）
+    pub skip_time_sync: bool,
 }
 
 /// 返回报告文件路径；写入失败为 None。
@@ -96,8 +98,11 @@ pub fn run_sequence(
     // 单项超时（V2.3）：序列期间子进程统一看门狗，防止固件命令阻塞卡死序列
     let prev_timeout = exec::default_timeout();
     exec::set_default_timeout(timeout_opt(cfg.timeouts.item_secs));
-    // 序列前置（V3.5 #8）：宿主机时间写入设备再执行固件校时指令
-    sync_time(tx);
+    // 序列前置（V3.5 #8）：宿主机时间写入设备再执行固件校时指令；
+    // 同一接入周期内的同一台设备仅校时一次，单点补测不再重复下发
+    if !base.skip_time_sync {
+        sync_time(tx);
+    }
 
     // 自动项先行、人工项殿后（稳定排序保持组内原顺序）
     let mut ordered: Vec<TestItem> = items.to_vec();
@@ -421,7 +426,11 @@ fn run_item(
         TestItem::Photo => photo_flow(tx, manual, media_dir, cfg.timeouts.manual_secs),
         TestItem::Video => video_flow(tx, manual, media_dir, cfg.timeouts.manual_secs),
         TestItem::Keys => keys_flow(tx, manual, &cfg.keys, cfg.timeouts.manual_secs),
-        TestItem::Wifi => wifi_flow(tx, &cfg.wifi),
+        TestItem::Wifi => {
+            let mut wifi = cfg.wifi.clone();
+            wifi.depth = cfg.active_wifi_depth();
+            wifi_flow(tx, &wifi)
+        }
         TestItem::Led => dialog_flow(
             item,
             "指示灯显示是否正常？",
@@ -440,6 +449,7 @@ fn run_item(
 fn sync_time(tx: &Sender<UiEvent>) {
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
     let _ = tx.send(UiEvent::Log(format!("同步设备时间: date -s \"{now}\"")));
+    let mut ok = true;
     for (cmd, what) in [
         (format!("date -s \"{now}\""), "时间写入"),
         (CameraFactory::TimeSync.device_cmd(), "固件校时"),
@@ -452,9 +462,13 @@ fn sync_time(tx: &Sender<UiEvent>) {
                 )));
             }
             Err(e) => {
+                ok = false;
                 let _ = tx.send(UiEvent::Log(format!("{what}失败（继续测试）: {e:#}")));
             }
         }
+    }
+    if ok && !exec::abort_requested() {
+        let _ = tx.send(UiEvent::TimeSynced);
     }
 }
 
@@ -1853,10 +1867,12 @@ mod tests {
             .unwrap()
             .to_string_lossy()
             .ends_with("-unknown.txt"));
-        let txts = std::fs::read_dir(&reports)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_name().to_string_lossy().contains("-unknown"))
+        let txts = report::list_reports(&reports, 10)
+            .into_iter()
+            .filter(|p| {
+                p.file_name()
+                    .is_some_and(|n| n.to_string_lossy().contains("-unknown"))
+            })
             .count();
         assert_eq!(txts, 1, "同一序列只留最终文件");
 
@@ -2002,14 +2018,18 @@ mod tests {
              '20 packets transmitted, 20 received, 0% packet loss' \
              'rtt min/avg/max/mdev = 1.2/23.4/99.0/5.0 ms';;\n\
              *) printf 'ok\\n';;\nesac\n";
-        // driver 深度：不测吞吐，驱动过即过（wlan-up 标记使 IP 恒在）
+        // driver 深度（模组工位默认）：不测吞吐，驱动过即过（wlan-up 标记使 IP 恒在）
         std::fs::write(base.join("wlan-up"), b"").unwrap();
+        let drv_cfg = Config {
+            station: "module".into(),
+            ..Config::default()
+        };
         let (vs, n) = scenario(
             &wscript,
             items(TestItem::Wifi),
             &media,
             &reports,
-            Config::default(),
+            drv_cfg,
             wifi_case,
             || unreachable!(),
         );
@@ -2646,15 +2666,17 @@ mod tests {
                 ..Default::default()
             },
             results: vec![r_info, r_wifi],
+            skip_time_sync: false,
         };
         // 单项补测 WiFi（假桩输出 ok → 合格），应替换底稿槽位并重写整机报告
         let items = vec![TestItem::Wifi];
+        let mut cfg = Config::default();
+        cfg.set_active_wifi_depth(crate::config::WifiDepth::Driver);
         let (tx, rx) = mpsc::channel();
         let (_mtx, mrx) = mpsc::channel();
         let (m, r) = (media.clone(), reports.clone());
-        let handle = thread::spawn(move || {
-            run_sequence(&items, &tx, &mrx, &m, &r, &Config::default(), base, None)
-        });
+        let handle =
+            thread::spawn(move || run_sequence(&items, &tx, &mrx, &m, &r, &cfg, base, None));
         let mut verdicts = Vec::new();
         while let Ok(ev) = rx.recv_timeout(Duration::from_secs(30)) {
             if let UiEvent::Result(res, _) = ev {
@@ -2942,6 +2964,105 @@ mod tests {
         let text = std::fs::read_to_string(&report).unwrap();
         assert!(text.contains("sn-address:SERIAL123"), "{text}");
         assert_eq!(crate::adb::target(), None, "序列结束应恢复定向");
+        std::env::remove_var("ADB");
+        crate::exec::clear_abort();
+        let _ = std::fs::remove_dir_all(&base_dir);
+    }
+
+    /// 验证：1) 同一设备首次执行发校时并上报 TimeSynced，后续单点测试传 skip_time_sync=true 不再重复发校时；
+    /// 2) 蓝牙 MAC 项顺带采集 cf7 蓝牙版本，并在报告落盘 `bt-ver:`。
+    #[test]
+    fn skip_time_sync_and_bt_version_collection() {
+        let _g = crate::exec::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::exec::clear_abort();
+        let base_dir = std::env::temp_dir().join(format!("e02-sync-btv-{}", std::process::id()));
+        let reports = base_dir.join("reports");
+        std::fs::create_dir_all(&reports).unwrap();
+        let sync_log = base_dir.join("sync.log");
+        let script = base_dir.join("adb-sync");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\ncase \"$*\" in\n\
+                 *\"date -s\"*|*\"camera-factory 19\"*) echo \"$*\" >> '{}'; printf 'ok\\n';;\n\
+                 *\"camera-factory 10\"*) printf 'MAC:0011A3B4C5D6\\n';;\n\
+                 *\"camera-factory 7\"*) printf 'bt-ver:V3_9_2\\n';;\n\
+                 *) printf 'ok\\n';;\nesac\n",
+                sync_log.display()
+            ),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::env::set_var("ADB", &script);
+
+        // 第 1 次：未校时 → 执行校时并收到 TimeSynced，同时收集到 bt_ver
+        let (tx, rx) = mpsc::channel();
+        let (_mtx, mrx) = mpsc::channel();
+        let (m, r) = (base_dir.join("media"), reports.clone());
+        let h1 = thread::spawn(move || {
+            run_sequence(
+                &[TestItem::BtMac],
+                &tx,
+                &mrx,
+                &m,
+                &r,
+                &Config::default(),
+                RunBase::default(),
+                None,
+            )
+        });
+        let mut saw_synced = false;
+        let mut bt_ver = String::new();
+        while let Ok(ev) = rx.recv_timeout(Duration::from_secs(30)) {
+            match ev {
+                UiEvent::TimeSynced => saw_synced = true,
+                UiEvent::Result(_, Some(dev)) if !dev.bt_ver.is_empty() => bt_ver = dev.bt_ver,
+                _ => {}
+            }
+        }
+        let rep = h1.join().unwrap().expect("应产出报告");
+        assert!(saw_synced, "首次执行应上报 TimeSynced");
+        assert_eq!(bt_ver, "V3_9_2");
+        let rep_text = std::fs::read_to_string(&rep).unwrap();
+        assert!(rep_text.contains("bt-ver:V3_9_2"), "{rep_text}");
+        let lines_first = std::fs::read_to_string(&sync_log).unwrap().lines().count();
+        assert_eq!(lines_first, 2, "首次应执行 date -s 与 camera-factory 19");
+
+        // 第 2 次：同机单点重测（skip_time_sync = true）→ 不再调用校时命令
+        let (tx2, rx2) = mpsc::channel();
+        let (_mtx2, mrx2) = mpsc::channel();
+        let (m2, r2) = (base_dir.join("media"), reports.clone());
+        let h2 = thread::spawn(move || {
+            run_sequence(
+                &[TestItem::BtMac],
+                &tx2,
+                &mrx2,
+                &m2,
+                &r2,
+                &Config::default(),
+                RunBase {
+                    skip_time_sync: true,
+                    ..RunBase::default()
+                },
+                None,
+            )
+        });
+        let mut saw_synced2 = false;
+        while let Ok(ev) = rx2.recv_timeout(Duration::from_secs(30)) {
+            if matches!(ev, UiEvent::TimeSynced) {
+                saw_synced2 = true;
+            }
+        }
+        h2.join().unwrap();
+        assert!(!saw_synced2, "skip_time_sync 时不应再发校时");
+        let lines_second = std::fs::read_to_string(&sync_log).unwrap().lines().count();
+        assert_eq!(lines_second, 2, "二次单点测试不应再执行 date -s / cf19");
+
         std::env::remove_var("ADB");
         crate::exec::clear_abort();
         let _ = std::fs::remove_dir_all(&base_dir);

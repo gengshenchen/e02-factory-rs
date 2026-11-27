@@ -57,10 +57,11 @@ pub fn show(ui: &mut egui::Ui, app: &mut E02App) {
     }
 
     let active = app.config.active_items();
-    // 状态快照，避免行渲染借用与点击修改 app 冲突
+    // 仅展示当前产品型号支持的测试项（E02W 不含陀螺仪与 IMEI/CCID，E02E 不含 WiFi）
     let rows: Vec<(TestItem, Verdict, bool, bool)> = app
         .results
         .iter()
+        .filter(|r| r.item.available_for(app.model))
         .map(|r| {
             (
                 r.item,
@@ -80,7 +81,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut E02App) {
         .max_height(max_h)
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
-            ui.spacing_mut().item_spacing.y = 4.0; // 行距压紧：12 项一屏放下（1280×837）
+            ui.spacing_mut().item_spacing.y = 4.0; // 行距压紧：一屏放下
             section(ui, "自动测试");
             for &(item, verdict, enabled, running) in &autos {
                 row(ui, app, item, verdict, enabled, running);
@@ -91,15 +92,12 @@ pub fn show(ui: &mut egui::Ui, app: &mut E02App) {
             }
         });
 
+    let enabled_count = rows.iter().filter(|(_, _, enabled, _)| *enabled).count();
     ui.add_space(4.0);
     ui.label(
-        egui::RichText::new(format!(
-            "共 {} 项，已启用 {}",
-            TestItem::ALL.len(),
-            active.len()
-        ))
-        .small()
-        .color(theme::MUTED),
+        egui::RichText::new(format!("共 {} 项，已启用 {}", rows.len(), enabled_count))
+            .small()
+            .color(theme::MUTED),
     );
 }
 

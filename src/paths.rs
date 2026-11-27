@@ -17,7 +17,7 @@ pub fn exe_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-/// 可写数据目录（config.toml / reports / media 的父目录）。
+/// 可写数据目录（config.toml / reports / exports / media 的父目录）。
 pub fn data_dir() -> &'static Path {
     DATA.get_or_init(|| {
         let exe = exe_dir();
@@ -27,6 +27,21 @@ pub fn data_dir() -> &'static Path {
             fallback_dir()
         }
     })
+}
+
+/// 报告根目录（内部按 `YYYY-MM-DD` 日期子目录分类）。
+pub fn reports_dir() -> PathBuf {
+    data_dir().join("reports")
+}
+
+/// 出货明细 CSV 导出目录（`exports/shipments/`）。
+pub fn shipments_export_dir() -> PathBuf {
+    data_dir().join("exports").join("shipments")
+}
+
+/// 绑定记录 CSV 导出目录（`exports/bindings/`）。
+pub fn bindings_export_dir() -> PathBuf {
+    data_dir().join("exports").join("bindings")
 }
 
 /// 目录可写探测：实际创建再删除探针文件（权限位不可靠，Windows 尤其）。

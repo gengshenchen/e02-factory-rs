@@ -33,14 +33,14 @@ pub fn show_left(ui: &mut egui::Ui, app: &mut E02App) {
     );
     ui.add_space(4.0);
     let check_txt = match app.config.provision.gate_mode {
-        GateMode::Strict => "整机校验：强制拦截",
-        GateMode::Warn => "整机校验：提示确认",
-        GateMode::Off => "整机校验：不校验",
+        GateMode::Strict => "整机未过禁止写号",
+        GateMode::Warn => "整机未过弹窗提示",
+        GateMode::Off => "不查整机记录",
     };
     let commit_txt = if app.config.provision.auto_commit {
-        "自动写入"
+        "正常自动写入"
     } else {
-        "逐台确认"
+        "逐台确认写入"
     };
     ui.label(
         egui::RichText::new(format!("{check_txt} · {commit_txt}"))
@@ -63,7 +63,6 @@ pub fn show_left(ui: &mut egui::Ui, app: &mut E02App) {
     let profile = app.config.provision.for_model(app.model);
     let needs_cred = profile.needs_credentials();
     let fourg_on = profile.fourg.as_ref().is_some_and(|f| f.enable);
-    let probe_on = app.config.provision.reboot_verify_secs > 0;
     let has_sn_pool = app.ship.stock.has_sn_pool();
 
     let visible_steps = ShipStep::steps_for(app.model);
@@ -77,7 +76,6 @@ pub fn show_left(ui: &mut egui::Ui, app: &mut E02App) {
             let cfg_enabled = match step {
                 ShipStep::Claim => needs_cred || has_sn_pool,
                 ShipStep::FourG => fourg_on,
-                ShipStep::Probe => probe_on,
                 _ => true,
             };
             let running = app.ship.busy && app.ship.current == Some(step);
@@ -267,6 +265,23 @@ fn top_status_strip(ui: &mut egui::Ui, app: &mut E02App) {
         }
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+            let export_dir = crate::paths::shipments_export_dir();
+            let open_tip = if let Some(p) = &app.ship.last_export_path {
+                format!("打开导出文件所在位置：{}", p.display())
+            } else {
+                format!("打开出货明细目录：{}", export_dir.display())
+            };
+            if ui
+                .add(theme::secondary("打开文件位置"))
+                .on_hover_text(open_tip)
+                .clicked()
+            {
+                if let Some(p) = &app.ship.last_export_path {
+                    let _ = reveal_file(p);
+                } else {
+                    let _ = open_dir(&export_dir);
+                }
+            }
             if ui.add(theme::secondary("导出出货明细")).clicked() {
                 app.export_ship_csv();
             }
@@ -276,6 +291,11 @@ fn top_status_strip(ui: &mut egui::Ui, app: &mut E02App) {
 
 fn note_bar(ui: &mut egui::Ui, app: &mut E02App) {
     let mut dismiss = false;
+    let export_path = if app.ship.note.starts_with("出货明细已导出") {
+        app.ship.last_export_path.clone()
+    } else {
+        None
+    };
     egui::Frame::default()
         .fill(theme::SOFT)
         .stroke(theme::hairline(theme::HAIRLINE))
@@ -293,6 +313,11 @@ fn note_bar(ui: &mut egui::Ui, app: &mut E02App) {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
                     if ui.small_button("关闭").clicked() {
                         dismiss = true;
+                    }
+                    if let Some(p) = &export_path {
+                        if ui.small_button("打开文件位置").clicked() {
+                            let _ = reveal_file(p);
+                        }
                     }
                 });
             });
@@ -407,6 +432,7 @@ fn scan_card(ui: &mut egui::Ui, app: &mut E02App) {
     });
 
     if open_settings {
+        app.lock_admin();
         app.ledger_view = crate::ledger::Ledger::load(&crate::ledger::path_of(&app.config));
         app.ledger_clear_armed = false;
         app.reload_fourg_template_buf();
@@ -921,6 +947,11 @@ pub fn show_stock_dialog(ctx: &egui::Context, app: &mut E02App) {
                 .show(ui, |ui| {
                     ui.set_min_width(ui.available_width());
                     if !app.ship.note.is_empty() {
+                        let dialog_export = if app.ship.note.starts_with("出货明细已导出") {
+                            app.ship.last_export_path.clone()
+                        } else {
+                            None
+                        };
                         egui::Frame::default()
                             .fill(theme::SOFT)
                             .stroke(theme::hairline(theme::HAIRLINE))
@@ -928,11 +959,23 @@ pub fn show_stock_dialog(ctx: &egui::Context, app: &mut E02App) {
                             .inner_margin(egui::Margin::symmetric(12.0, 8.0))
                             .show(ui, |ui| {
                                 ui.set_min_width(ui.available_width());
-                                ui.label(
-                                    egui::RichText::new(&app.ship.note)
-                                        .small()
-                                        .color(theme::INK),
-                                );
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        egui::RichText::new(&app.ship.note)
+                                            .small()
+                                            .color(theme::INK),
+                                    );
+                                    if let Some(p) = &dialog_export {
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Min),
+                                            |ui| {
+                                                if ui.small_button("打开文件位置").clicked() {
+                                                    let _ = reveal_file(p);
+                                                }
+                                            },
+                                        );
+                                    }
+                                });
                             });
                         ui.add_space(12.0);
                     }
@@ -1214,14 +1257,18 @@ pub fn show_stock_dialog(ctx: &egui::Context, app: &mut E02App) {
                             if ui.button("导出出货明细 CSV").clicked() {
                                 app.export_ship_csv();
                             }
-                            if ui.button("打开数据目录").clicked() {
-                                let _ = open_dir(crate::paths::data_dir());
+                            if ui.button("打开文件位置").clicked() {
+                                if let Some(p) = &app.ship.last_export_path {
+                                    let _ = reveal_file(p);
+                                } else {
+                                    let _ = open_dir(&crate::paths::shipments_export_dir());
+                                }
                             }
                         });
                         ui.add_space(4.0);
                         caption(
                             ui,
-                            "导出 UTF-8 BOM CSV 至数据目录（Excel 可直接打开），列按型号自动适配。",
+                            "导出 UTF-8 BOM CSV 至 exports/shipments/ 目录（Excel 可直接打开），列按型号自动适配。",
                         );
                     });
                     ui.add_space(4.0);
@@ -1376,7 +1423,7 @@ pub fn import_dropped_file(app: &mut E02App, path: &Path) {
             .needs_credentials()
         {
             let msg = format!(
-                "文件 {tag} 为两列凭据格式，但当前型号未勾选 uuid/auth_key 写入项（请在设置中开启）"
+                "文件 {tag} 为两列凭据格式，但当前型号未勾选「同时写入客户凭据（uuid + auth_key）」（请在设置中开启）"
             );
             app.ship.note = msg.clone();
             app.push_log(msg);
@@ -1396,6 +1443,30 @@ pub fn open_dir(dir: &Path) -> bool {
         Command::new("open").arg(dir).spawn().is_ok()
     } else {
         Command::new("xdg-open").arg(dir).spawn().is_ok()
+    }
+}
+
+/// 在系统文件管理器中定位并选中导出的文件；文件不存在时回退打开所在目录。
+pub fn reveal_file(path: &Path) -> bool {
+    if !path.exists() {
+        return open_dir(path.parent().unwrap_or_else(|| crate::paths::data_dir()));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let escaped = path.to_string_lossy().replace('"', "");
+        Command::new("explorer")
+            .raw_arg(format!("/select,\"{escaped}\""))
+            .spawn()
+            .is_ok()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open").arg("-R").arg(path).spawn().is_ok()
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        open_dir(path.parent().unwrap_or_else(|| crate::paths::data_dir()))
     }
 }
 

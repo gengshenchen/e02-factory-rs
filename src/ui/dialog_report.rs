@@ -318,17 +318,7 @@ fn display_name(stem: &str) -> String {
 }
 
 fn open_folder(dir: &Path) -> bool {
-    if cfg!(windows) {
-        std::process::Command::new("explorer")
-            .arg(dir)
-            .spawn()
-            .is_ok()
-    } else {
-        std::process::Command::new("xdg-open")
-            .arg(dir)
-            .spawn()
-            .is_ok()
-    }
+    crate::ui::panel_ship::open_dir(dir)
 }
 
 #[cfg(test)]

@@ -256,22 +256,26 @@ impl Default for BindingCfg {
     }
 }
 
-/// 工位档案：启用的测试项（slug 列表，顺序即执行顺序参考）。
+/// 工位档案：启用的测试项（slug 列表）及该工位专属 WiFi 测试深度。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Profile {
     pub items: Vec<String>,
+    /// 工位专属 WiFi 测试深度（内置：`module` = `driver` 只测驱动，`complete` = `throughput` 驱动 + 速率）；
+    /// 未配置时回退全局 `wifi.depth`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wifi_depth: Option<WifiDepth>,
 }
 
-/// 出厂闸门模式（FQC §3 ①）：写号前查本机整机工位是否全测 PASS。
+/// 写号前整机测试检查模式：写号前查本机整机工位是否全测 PASS。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum GateMode {
-    /// 硬拦：查无台账记录或整机非全 PASS 一律拒写（台账覆盖全后切此档）
+    /// 未过则禁止写号（适合单机或共享台账严格防漏测）
     Strict,
-    /// **默认**：警告可继续（过渡期旧工具测完的机器无台账记录）
-    #[default]
+    /// 未过时弹窗提示确认
     Warn,
-    /// 跳过闸门检查
+    /// **默认**：不检查（整机工位与写号工位可能是不同电脑）
+    #[default]
     Off,
 }
 
@@ -354,7 +358,7 @@ fn d_min_batt_volts() -> f32 {
     3.5
 }
 fn d_check_sdcard() -> bool {
-    true
+    false
 }
 fn d_sn_pattern() -> String {
     r"^\d{4}W\d{7}$".into()
@@ -414,9 +418,6 @@ pub struct ProvisionCfg {
     /// 校验无异常时自动开始写入（有提醒仍暂停确认）；false = 每台人工确认
     #[serde(default = "d_auto_commit")]
     pub auto_commit: bool,
-    /// 重启后回读等待秒数；0 = 跳过
-    #[serde(default = "d_reboot_verify")]
-    pub reboot_verify_secs: u64,
     /// 设备端 ini 绝对路径
     #[serde(default = "d_config_path")]
     pub config_path: String,
@@ -437,9 +438,6 @@ pub struct ProvisionCfg {
 fn d_auto_commit() -> bool {
     true
 }
-fn d_reboot_verify() -> u64 {
-    60
-}
 fn d_config_path() -> String {
     "/config/webrtc_serno_file.ini".into()
 }
@@ -452,7 +450,6 @@ impl Default for ProvisionCfg {
         Self {
             gate_mode: GateMode::default(),
             auto_commit: d_auto_commit(),
-            reboot_verify_secs: d_reboot_verify(),
             config_path: d_config_path(),
             placeholder_sns: d_placeholder_sns(),
             e02w: ProvisionProfile::default_e02w(),
@@ -477,6 +474,14 @@ impl ProvisionCfg {
             ModelKind::E02e => &mut self.e02e,
         }
     }
+}
+
+/// 设置页管理员权限配置（仅保存密码哈希，绝不存明文）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct AuthCfg {
+    /// admin 账号密码 SHA-256 哈希；留空时使用内置默认密码
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub admin_hash: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -505,6 +510,9 @@ pub struct Config {
     /// 出厂写号（FQC）
     #[serde(default)]
     pub provision: ProvisionCfg,
+    /// 管理员权限（密码哈希）
+    #[serde(default)]
+    pub auth: AuthCfg,
 }
 
 fn d_station() -> String {
@@ -513,22 +521,24 @@ fn d_station() -> String {
 
 fn d_profiles() -> BTreeMap<String, Profile> {
     let mut m = BTreeMap::new();
+    // 模组工位：设备信息、蓝牙 MAC、WiFi（仅 E02W 且只测驱动）、SD 卡、拍照、指示灯、按键
     m.insert(
         "module".into(),
         Profile {
-            items: vec!["info", "btmac", "wifi", "sdcard", "photo", "led"]
+            items: vec!["info", "btmac", "wifi", "sdcard", "photo", "led", "keys"]
                 .into_iter()
                 .map(String::from)
                 .collect(),
+            wifi_depth: Some(WifiDepth::Driver),
         },
     );
-    // 整机工位 = 全项（V3.14.1：工位只有模组/整机两档，型号是产品属性
-    // 不建工位——项集按型号在展示/执行层过滤：E02 跑 WiFi，E02E 跑
-    // IMEI/CCID，互不可用项各自隐藏）
+    // 整机工位 = 全项（按型号过滤：E02W 跑全部非陀螺仪/eSIM 项且 WiFi 默认驱动+速率；
+    // E02E 无 WiFi，跑其余全部项含陀螺仪与 IMEI/CCID）
     m.insert(
         "complete".into(),
         Profile {
             items: TestItem::ALL.iter().map(|i| i.slug().to_string()).collect(),
+            wifi_depth: Some(WifiDepth::Throughput),
         },
     );
     m
@@ -546,6 +556,7 @@ impl Default for Config {
             binding: BindingCfg::default(),
             model: None,
             provision: ProvisionCfg::default(),
+            auth: AuthCfg::default(),
         }
     }
 }
@@ -644,6 +655,19 @@ impl Config {
             .expect("profiles 至少含内置档")
     }
 
+    /// 当前工位生效的 WiFi 测试深度（优先工位专属 `wifi_depth`，缺省回退全局 `wifi.depth`）。
+    pub fn active_wifi_depth(&self) -> WifiDepth {
+        self.active_profile().wifi_depth.unwrap_or(self.wifi.depth)
+    }
+
+    /// 设置当前工位的 WiFi 测试深度（仅影响当前工位档案，并同步写入全局回退字段）。
+    pub fn set_active_wifi_depth(&mut self, depth: WifiDepth) {
+        if let Some(p) = self.profiles.get_mut(&self.station) {
+            p.wifi_depth = Some(depth);
+        }
+        self.wifi.depth = depth;
+    }
+
     /// 当前工位启用的测试项（未知 slug 忽略）。设备信息与蓝牙 MAC 是
     /// 设备身份来源（报告键与绑定对的一半，V3.14.1 必测）：工位档案
     /// 漏勾也强制带上。
@@ -675,24 +699,71 @@ mod tests {
     fn builtin_profiles_and_items() {
         let cfg = Config::builtin();
         assert_eq!(cfg.station, "complete");
-        // 整机工位 = 全项（型号过滤在执行/展示层：E02 跑 WiFi、E02E 跑 IMEI/CCID）
-        assert_eq!(cfg.active_items().len(), TestItem::ALL.len());
-        assert!(cfg.active_items().contains(&TestItem::Wifi));
-        assert!(cfg.active_items().contains(&TestItem::Esim));
+        assert_eq!(
+            cfg.provision.gate_mode,
+            GateMode::Off,
+            "写号前整机检查默认不检查"
+        );
+        // E02W 整机工位：全部可用项（不含陀螺仪与 IMEI/CCID），WiFi 默认驱动+速率
+        assert_eq!(cfg.active_wifi_depth(), WifiDepth::Throughput);
+        let e02w_complete: Vec<TestItem> = cfg
+            .active_items()
+            .into_iter()
+            .filter(|i| i.available_for(ModelKind::E02w))
+            .collect();
+        assert_eq!(e02w_complete.len(), 10);
+        assert!(e02w_complete.contains(&TestItem::Wifi));
+        assert!(!e02w_complete.contains(&TestItem::Gyro));
+        assert!(!e02w_complete.contains(&TestItem::Esim));
+
+        // E02E 整机工位：全部可用项（不含 WiFi，含陀螺仪与 IMEI/CCID）
+        let e02e_complete: Vec<TestItem> = cfg
+            .active_items()
+            .into_iter()
+            .filter(|i| i.available_for(ModelKind::E02e))
+            .collect();
+        assert_eq!(e02e_complete.len(), 11);
+        assert!(!e02e_complete.contains(&TestItem::Wifi));
+        assert!(e02e_complete.contains(&TestItem::Gyro));
+        assert!(e02e_complete.contains(&TestItem::Esim));
+
+        // 模组工位：默认 WiFi 只测驱动；E02W 7 项（含 WiFi/按键），E02E 6 项（无 WiFi，含按键）
         let mut module = Config::builtin();
         module.station = "module".into();
-        // 模组工位无电池/按键/MIC/录像/陀螺仪/eSIM
-        let items = module.active_items();
-        assert!(!items.contains(&TestItem::Battery));
-        assert!(!items.contains(&TestItem::Keys));
-        assert!(items.contains(&TestItem::Wifi));
-        assert!(!items.contains(&TestItem::Esim));
+        assert_eq!(module.active_wifi_depth(), WifiDepth::Driver);
+        let e02w_mod: Vec<TestItem> = module
+            .active_items()
+            .into_iter()
+            .filter(|i| i.available_for(ModelKind::E02w))
+            .collect();
+        assert_eq!(e02w_mod.len(), 7);
+        for must in [
+            TestItem::Photo,
+            TestItem::DeviceInfo,
+            TestItem::Wifi,
+            TestItem::SdCard,
+            TestItem::Led,
+            TestItem::BtMac,
+            TestItem::Keys,
+        ] {
+            assert!(e02w_mod.contains(&must), "E02W 模组工位应包含 {must:?}");
+        }
+        let e02e_mod: Vec<TestItem> = module
+            .active_items()
+            .into_iter()
+            .filter(|i| i.available_for(ModelKind::E02e))
+            .collect();
+        assert_eq!(e02e_mod.len(), 6);
+        assert!(!e02e_mod.contains(&TestItem::Wifi));
+        assert!(e02e_mod.contains(&TestItem::Keys));
+
         // 必测项兜底（V3.14.1）：自建档漏勾 info/btmac 也强制补上
         let mut hand = Config::builtin();
         hand.profiles.insert(
             "hand".into(),
             Profile {
                 items: vec!["led".into()],
+                wifi_depth: None,
             },
         );
         hand.station = "hand".into();
@@ -776,11 +847,11 @@ mod tests {
         // 用户文件只写差异项，其余走默认
         let cfg: Config = toml::from_str("station = \"module\"\n").unwrap();
         assert_eq!(cfg.station, "module");
-        assert_eq!(cfg.wifi.depth, WifiDepth::Driver);
+        assert_eq!(cfg.active_wifi_depth(), WifiDepth::Driver);
         assert_eq!(cfg.keys.required, vec![4, 5, 6]);
         assert_eq!(cfg.timeouts.item_secs, 60);
         assert!(!cfg.conn.auto_start);
-        assert_eq!(cfg.active_items().len(), 6);
+        assert_eq!(cfg.active_items().len(), 7);
     }
 
     #[test]
@@ -832,5 +903,23 @@ mod tests {
     fn load_missing_file_gives_builtin() {
         let cfg = Config::load(Path::new("/nonexistent/e02-config.toml")).unwrap();
         assert_eq!(cfg, Config::builtin());
+    }
+
+    #[test]
+    fn provision_defaults_and_legacy_reboot_field_compat() {
+        let cfg = Config::builtin();
+        assert!(
+            !cfg.provision.e02w.check_sdcard,
+            "出厂写号默认不勾选 SD 卡检测"
+        );
+        assert!(
+            !cfg.provision.e02e.check_sdcard,
+            "出厂写号默认不勾选 SD 卡检测"
+        );
+        // 旧版配置文件中残留的 reboot_verify_secs 应平滑忽略，不报错
+        let legacy = "station = \"ship\"\n[provision]\nreboot_verify_secs = 60\n";
+        let loaded: Config = toml::from_str(legacy).unwrap();
+        assert!(loaded.is_ship_station());
+        assert!(!loaded.provision.e02w.check_sdcard);
     }
 }

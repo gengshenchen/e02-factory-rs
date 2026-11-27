@@ -1,12 +1,12 @@
-//! 出厂写号引擎（FQC §3）：worker 线程阻塞执行 ⓪–⑫ 流程，
-//! 经 [`ShipEvent`] 回传状态；确认闸门阻塞等待 [`ShipAnswer`]。
+//! 出厂写号引擎（FQC §3）：worker 线程阻塞执行 ⓪–⑪ 流程，
+//! 经 [`ShipEvent`] 回传状态；确认环节阻塞等待 [`ShipAnswer`]。
 //!
-//! 与测试序列（worker.rs）同构但独立通道：出厂页步骤行/确认卡/大号
-//! PASS/FAIL 都由本模块的事件驱动；⑪ `adb reboot` 前发 [`ShipEvent::Rebooting`]
+//! 与测试序列（worker.rs）同构但独立通道：出厂页步骤行/确认卡/结论横幅
+//! 都由本模块的事件驱动；⑪ `adb reboot` 前发 [`ShipEvent::Rebooting`]
 //! 让 UI 屏蔽 devwatch 的拔出中止（重启是预期行为不是拔线）。
 //!
 //! 失败隔离：⑧⑨ 任一步失败立即停、判 FAIL、**不执行 cf4**（不切正式版，
-//! 留产测态待返修）；凭据保持 allocated（已预落盘绑当前 SN，不会发给
+//! 留产测态待返修）；凭据保持 allocated（已锁定绑当前 SN，不会发给
 //! 下一台），重跑同 SN 自动复原。
 
 use crate::adb;
@@ -88,31 +88,29 @@ pub enum ShipAnswer {
     Confirm(bool),
 }
 
-/// 流程步骤（⓪–⑫ 映射；⑥ 确认闸门是对话不是步骤行）。
+/// 流程步骤（⓪–⑪ 映射；⑥ 写入确认是对话不是步骤行）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShipStep {
     /// ⓪ 身份与现值采集（cf10/cf3/cf20[eSIM]/cat config_path）
     Identity,
-    /// ① 整机闸门（gate_mode）
+    /// ① 整机校验（gate_mode）
     Gate,
     /// ②③ SN 校验 + 台账反查 + SN 池
     SnCheck,
-    /// ④ 版本核对（cf3 soft-ware / cf7 bt）
+    /// ④ 版本核对（cf3 soft-ware / cf7 bt，不区分大小写）
     Versions,
-    /// ⑤ 硬件终检（cf12 电池 / cf8 SD）
+    /// ⑤ 电量与存储检测（cf12 电池 / cf8 SD）
     Hardware,
-    /// ⑦ 凭据领用与预落盘
+    /// ⑦ 凭据分配与锁定
     Claim,
     /// ⑧ cf30 逐键写
     Write,
     /// ⑨ 4G 模组配置写入（eSIM）
     FourG,
-    /// ⑩ 终检（cat 复核全部目标键）
+    /// ⑩ 回读校验（cat 复核全部目标键）
     Verify,
     /// ⑪ 对时 + cf4 切正式版 + 重启
     Finalize,
-    /// ⑫ 重启后探测
-    Probe,
 }
 
 impl ShipStep {
@@ -129,12 +127,11 @@ impl ShipStep {
             ShipStep::FourG => "4G 参数",
             ShipStep::Verify => "回读校验",
             ShipStep::Finalize => "切换出厂",
-            ShipStep::Probe => "重启回读",
         }
     }
 
     /// 全部步骤（UI 初始化行序）。
-    pub const ALL: [ShipStep; 11] = [
+    pub const ALL: [ShipStep; 10] = [
         ShipStep::Identity,
         ShipStep::Gate,
         ShipStep::SnCheck,
@@ -145,7 +142,6 @@ impl ShipStep {
         ShipStep::FourG,
         ShipStep::Verify,
         ShipStep::Finalize,
-        ShipStep::Probe,
     ];
 
     /// 该步骤是否属于指定产品型号（E02 WiFi 型无 4G 模组，隐藏并跳过 FourG）。
@@ -257,7 +253,7 @@ pub fn run_ship(
     exec::clear_abort();
     REBOOTING.store(false, Ordering::Release);
     let _reboot_guard = RebootGuard;
-    let _target = adb::TargetGuard::new(serial.clone());
+    let _target = adb::TargetGuard::new(serial);
     let prev_timeout = exec::default_timeout();
     exec::set_default_timeout(timeout_opt(ctx.cfg.timeouts.item_secs));
     let _ = tx.send(ShipEvent::Started);
@@ -269,7 +265,6 @@ pub fn run_ship(
         ctx,
         profile,
         model,
-        serial,
         sn: scanned_sn.trim().to_uppercase(),
         bt_mac: String::new(),
         device: DeviceInfo::default(),
@@ -345,10 +340,7 @@ fn flow_inner(run: &mut ShipRun) -> Option<String> {
     if let Some(fail) = run.verify() {
         return Some(fail);
     }
-    if let Some(fail) = run.finalize() {
-        return Some(fail);
-    }
-    run.probe()
+    run.finalize()
 }
 
 /// 单轮状态（步骤方法共用的可变上下文）。
@@ -358,7 +350,6 @@ struct ShipRun<'a> {
     ctx: &'a ShipCtx,
     profile: ProvisionProfile,
     model: ModelKind,
-    serial: Option<String>,
     /// 扫码 SN（清洗后）
     sn: String,
     bt_mac: String,
@@ -642,11 +633,7 @@ impl ShipRun<'_> {
         let re = match regex_lite::Regex::new(&self.profile.sn_pattern) {
             Ok(re) => re,
             Err(e) => {
-                return self.fail_step(
-                    ShipStep::SnCheck,
-                    format!("设置中的 SN 格式正则无效: {e}"),
-                    t0,
-                )
+                return self.fail_step(ShipStep::SnCheck, format!("SN 格式规则配置异常: {e}"), t0)
             }
         };
         // ②-1 格式
@@ -654,8 +641,10 @@ impl ShipRun<'_> {
             return self.fail_step(
                 ShipStep::SnCheck,
                 format!(
-                    "SN 格式不匹配（规则 {}）: {}",
-                    self.profile.sn_pattern, self.sn
+                    "SN 格式不符（{} 示例 {}）: {}",
+                    self.model.label(),
+                    self.model.sn_example(),
+                    self.sn
                 ),
                 t0,
             );
@@ -769,7 +758,12 @@ impl ShipRun<'_> {
                 t0,
             );
         }
-        if self.device.t32_ver.trim() != self.profile.t32_ver.trim() {
+        if !self
+            .device
+            .t32_ver
+            .trim()
+            .eq_ignore_ascii_case(self.profile.t32_ver.trim())
+        {
             return self.fail_step(
                 ShipStep::Versions,
                 format!(
@@ -802,7 +796,7 @@ impl ShipRun<'_> {
         };
         self.bt_ver_seen = bt.clone();
         self.emit_device();
-        if bt.trim() != self.profile.bt_ver.trim() {
+        if !bt.trim().eq_ignore_ascii_case(self.profile.bt_ver.trim()) {
             return self.fail_step(
                 ShipStep::Versions,
                 format!(
@@ -815,7 +809,7 @@ impl ShipRun<'_> {
         self.done(
             ShipStep::Versions,
             StepVerdict::Pass,
-            format!("T32 {}，蓝牙 {}", self.profile.t32_ver, bt),
+            format!("T32 {}，蓝牙 {}", self.device.t32_ver.trim(), bt.trim()),
             t0,
         );
         None
@@ -1283,14 +1277,15 @@ impl ShipRun<'_> {
         Ok(out)
     }
 
-    // —— ⑩ 终检 ——
+    // —— ⑩ 回读校验 ——
 
     fn verify(&mut self) -> Option<String> {
         let t0 = self.begin(ShipStep::Verify);
         let text = match self.cat_config() {
             Ok(t) => t,
-            Err(e) => return self.fail_step(ShipStep::Verify, format!("终检 {e}"), t0),
+            Err(e) => return self.fail_step(ShipStep::Verify, format!("回读校验 {e}"), t0),
         };
+        let mut verified = Vec::new();
         for key in self.profile.keys.clone() {
             let value = match self.value_for(&key) {
                 Ok(v) => v,
@@ -1301,18 +1296,20 @@ impl ShipRun<'_> {
                 return self.fail_step(
                     ShipStep::Verify,
                     format!(
-                        "终检不符：{key} 现值 {} ≠ 目标 {}",
-                        clip_secret(r.echo_value.as_deref().unwrap_or("（缺失）")),
-                        clip_secret(&value)
+                        "回读不符：{key} 现值 {} ≠ 目标 {}",
+                        r.echo_value.as_deref().unwrap_or("（缺失）"),
+                        value
                     ),
                     t0,
                 );
             }
+            let actual = r.echo_value.as_deref().unwrap_or("");
+            verified.push(format!("{key}={actual}"));
         }
         self.done(
             ShipStep::Verify,
             StepVerdict::Pass,
-            "全部写入项回读一致",
+            format!("全部写入项回读一致（{}）", verified.join("，")),
             t0,
         );
         None
@@ -1365,123 +1362,6 @@ impl ShipRun<'_> {
         None
     }
 
-    // —— ⑫ 重启回读 ——
-
-    fn probe(&mut self) -> Option<String> {
-        let t0 = self.begin(ShipStep::Probe);
-        let secs = self.ctx.cfg.provision.reboot_verify_secs;
-        if secs == 0 {
-            self.done(ShipStep::Probe, StepVerdict::Skip, "已跳过重启回读", t0);
-            return None;
-        }
-        let deadline = Instant::now() + Duration::from_secs(secs);
-        let is_online = |devs: &[String]| match &self.serial {
-            Some(s) => devs.iter().any(|d| d == s),
-            None => !devs.is_empty(),
-        };
-        // 阶段 1：先等设备真正离线（防 adb shell reboot 异步返回导致立刻误检旧连接）
-        let mut saw_offline = false;
-        while Instant::now() < deadline {
-            if exec::abort_requested() {
-                return Some(format!("手动停止：{}", exec::abort_reason().text()));
-            }
-            match adb::devices() {
-                Ok(devs) if !is_online(&devs) => {
-                    saw_offline = true;
-                    break;
-                }
-                Err(_) => {
-                    saw_offline = true;
-                    break;
-                }
-                Ok(_) => {}
-            }
-            std::thread::sleep(Duration::from_millis(500));
-        }
-        if !saw_offline {
-            return self.fail_step(
-                ShipStep::Probe,
-                format!("{secs}s 内设备未断开离线（reboot 未生效，未完成重启复核）"),
-                t0,
-            );
-        }
-        // 阶段 2：离线后再等待设备重新上线
-        let mut back = false;
-        while Instant::now() < deadline {
-            if exec::abort_requested() {
-                return Some(format!("手动停止：{}", exec::abort_reason().text()));
-            }
-            if let Ok(devs) = adb::devices() {
-                if is_online(&devs) {
-                    back = true;
-                    break;
-                }
-            }
-            std::thread::sleep(Duration::from_millis(500));
-        }
-        if !back {
-            // 超时未回：记日志跳过（正式版无 adb 属预期配置），不算失败
-            self.done(
-                ShipStep::Probe,
-                StepVerdict::Warn,
-                format!("{secs}s 内未探测到设备回来（跳过——若正式版仍有 adb 请人工核对）"),
-                t0,
-            );
-            return None;
-        }
-        // 回来了：核对蓝牙 MAC（防换机串号）+ 复核目标键
-        let mac_cmd = CameraFactory::BtMac.device_cmd();
-        let out = match self.shell(&mac_cmd) {
-            Ok(o) => o,
-            Err(e) => return self.fail_step(ShipStep::Probe, format!("重启后 cf10 失败: {e}"), t0),
-        };
-        match parse_dev(&out) {
-            Ok(d) if d.bt_mac.eq_ignore_ascii_case(&self.bt_mac) => {}
-            Ok(d) => {
-                return self.fail_step(
-                    ShipStep::Probe,
-                    format!(
-                        "重启后蓝牙 MAC 不一致：{} ≠ {}（换机/串号？）",
-                        d.bt_mac, self.bt_mac
-                    ),
-                    t0,
-                )
-            }
-            Err(e) => {
-                return self.fail_step(
-                    ShipStep::Probe,
-                    format!("重启后 cf10 输出无法解析: {e}"),
-                    t0,
-                )
-            }
-        }
-        let text = match self.cat_config() {
-            Ok(t) => t,
-            Err(e) => return self.fail_step(ShipStep::Probe, format!("重启后 {e}"), t0),
-        };
-        for key in self.profile.keys.clone() {
-            let value = match self.value_for(&key) {
-                Ok(v) => v,
-                Err(e) => return self.fail_step(ShipStep::Probe, e, t0),
-            };
-            let r = protocol::parse_cf30_response(&text, SECTION, &key);
-            if r.echo_value.as_deref() != Some(value.as_str()) {
-                return self.fail_step(
-                    ShipStep::Probe,
-                    format!("重启后复核不符：{key} 现值 ≠ 目标"),
-                    t0,
-                );
-            }
-        }
-        self.done(
-            ShipStep::Probe,
-            StepVerdict::Pass,
-            "重启后探测通过（MAC 与目标键一致）",
-            t0,
-        );
-        None
-    }
-
     // —— 收尾：ship 报告 + PASS 落账 ——
 
     fn finish(&mut self, pass: bool, fail_detail: Option<&str>) -> Option<PathBuf> {
@@ -1524,8 +1404,9 @@ impl ShipRun<'_> {
         let ts = report::time_str(self.started_wall);
         let (day, hms) = ts.split_once('-').unwrap_or((ts.as_str(), "unknown"));
         let name = report::ship_file_name(day, &self.bt_mac, hms);
-        let path = self.ctx.reports_dir.join(name);
-        match std::fs::create_dir_all(&self.ctx.reports_dir)
+        let sub_dir = report::day_dir(&self.ctx.reports_dir, day);
+        let path = sub_dir.join(name);
+        match std::fs::create_dir_all(&sub_dir)
             .map_err(|e| e.to_string())
             .and_then(|_| std::fs::write(&path, text).map_err(|e| e.to_string()))
         {
@@ -1830,12 +1711,11 @@ mod unix_e2e_tests {
         }
     }
 
-    /// 构造默认 E02W 测试配置（已填工单版本、关闭重启等待）。
+    /// 构造默认 E02W 测试配置（已填工单版本）。
     fn e02w_cfg(gate_mode: GateMode) -> Config {
         let mut prov = ProvisionCfg {
             gate_mode,
             auto_commit: true,
-            reboot_verify_secs: 0,
             ..Default::default()
         };
         prov.e02w.t32_ver = "E02W-1.0.1".into();
@@ -1913,6 +1793,16 @@ esac
 
         let report = report.expect("应产出 ship 报告");
         assert!(pass, "E02W 全流程应 PASS");
+        let day_folder = report
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+        assert_eq!(
+            day_folder.len(),
+            10,
+            "出厂报告应按 YYYY-MM-DD 子目录归档: {report:?}"
+        );
         assert_eq!(confirms.len(), 1, "未过整机校验时必须人工确认");
         assert_eq!(confirms[0].sn, "6472W1000016");
         assert_eq!(confirms[0].bt_mac, "0012A3B4C5D6");
@@ -2122,9 +2012,9 @@ esac
         let _ = std::fs::remove_file(&cf4_mark);
     }
 
-    /// 步骤 ⑫ 重启回读：先经历离线再回连 → PASS；重启后换机 MAC 不符 → FAIL。
+    /// 核对版本号不区分大小写（V/v 均可）+ 回读校验在过程日志/步骤详情中完整显示全部回读键值。
     #[test]
-    fn ship_flow_probe_waits_offline_and_verifies_mac_and_keys() {
+    fn ship_flow_version_case_insensitive_and_verify_logs_readback_values() {
         let _lock = crate::exec::TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -2133,18 +2023,7 @@ esac
 #!/bin/sh
 dir=\"$(dirname \"$0\")\"
 st=\"$dir/state.ini\"
-devcnt=\"$dir/devcnt\"
 case \"$*\" in
-  devices)
-    n=$(cat \"$devcnt\" 2>/dev/null || echo 0); n=$((n+1)); echo $n > \"$devcnt\"
-    if [ $n -eq 1 ]; then
-      printf 'List of devices attached\\n123456\\tdevice\\n'
-    elif [ $n -eq 2 ]; then
-      printf 'List of devices attached\\n'
-    else
-      printf 'List of devices attached\\n123456\\tdevice\\n'
-    fi
-    ;;
   *'camera-factory 30'*)
     clean=$(printf '%s' \"$*\" | tr -d \"'\")
     k=$(printf '%s' \"$clean\" | awk '{print $(NF-1)}')
@@ -2153,46 +2032,62 @@ case \"$*\" in
     echo \"$k=$v\" >> \"$st\"
     printf '[ProvisionInfo]\\n'; cat \"$st\"; printf 'config-update:true\\n'
     ;;
-  *'camera-factory 10'*)
-    if [ -f \"$dir/swap-mac\" ] && [ -f \"$devcnt\" ]; then
-      printf 'MAC:AABBCCDDEEFF\\n'
-    else
-      printf 'MAC:0012A3B4C5D6\\n'
-    fi
-    ;;
-  *'camera-factory 3'*) printf 'sn-address:00001\\nwifi-mac:0060A70B9CF2\\nsoft-ware:E02W-1.0.1\\n';;
-  *'camera-factory 7'*) printf 'bt-ver:V1_7_4\\n';;
-  *'camera-factory 12'*) printf 'Bat vol:4.326\\n';;
-  *'camera-factory 8'*) printf 'true\\n';;
+  *'camera-factory 10'*) printf 'MAC:EB5393253F7B\\n';;
+  *'camera-factory 3'*) printf 'sn-address:0000111111\\nwifi-mac:0060A70B9CF2\\nsoft-ware:v2.4.3\\n';;
+  *'camera-factory 7'*) printf 'bt-ver:v3_9_2\\n';;
+  *'camera-factory 12'*) printf 'Bat vol:4.371\\n';;
   *'camera-factory 4'*) printf 'factory-reset true\\n';;
   *'cat '*) printf '[ProvisionInfo]\\n'; cat \"$st\" 2>/dev/null; printf '\\n';;
   *reboot*) exit 0;;
   *) printf 'ok\\n';;
 esac
 ";
-        let env = FakeAdbGuard::new("probe", script);
+        let env = FakeAdbGuard::new("ver-case-readback", script);
         let mut cfg = e02w_cfg(GateMode::Off);
-        cfg.provision.reboot_verify_secs = 10;
+        // 设备上报小写 v2.4.3 / v3_9_2，工单填写大写 V2.4.3 / V3_9_2 → 应校验通过
+        cfg.provision.e02w.t32_ver = "V2.4.3".into();
+        cfg.provision.e02w.bt_ver = "V3_9_2".into();
+        cfg.provision.e02w.keys = vec!["sn".into(), "uuid".into(), "auth_key".into()];
 
-        let (_, pass, _, steps) = run_and_collect("6472W1000016", env.ctx(cfg.clone()), true);
-        assert!(pass, "正常重启回连应 PASS");
-        assert!(steps
-            .iter()
-            .any(|s| s.step == ShipStep::Probe && s.verdict == StepVerdict::Pass));
+        let mut st = ProvisionStock::default();
+        st.import_credentials(
+            "uuid95fe79695a6df72f,B7uTB4QjoSLw55oHLk2wPSokAAwWXENH\n",
+            r"^uuid[0-9a-f]{16}$",
+            r"^[A-Za-z0-9]{32}$",
+            "t0",
+        );
+        st.save(&env.dir.join("stock.json")).unwrap();
+
+        let (report, pass, _, steps) = run_and_collect("6472W1000024", env.ctx(cfg), true);
+        assert!(pass, "大小写不同的版本号（V/v）应校验通过");
         assert!(!is_rebooting(), "run_ship 结束后原子重启位必须自动复位");
-
-        let _ = std::fs::remove_file(env.dir.join("devcnt"));
-        let _ = std::fs::remove_file(env.dir.join("state.ini"));
-        let _ = std::fs::remove_file(env.dir.join("ledger.json"));
-        std::fs::write(env.dir.join("swap-mac"), "1").unwrap();
-        let (_, pass, _, steps) = run_and_collect("6472W1000016", env.ctx(cfg), true);
-        assert!(!pass, "重启后蓝牙 MAC 不一致应判 FAIL");
-        assert!(steps
+        let verify_step = steps
             .iter()
-            .any(|s| s.step == ShipStep::Probe && s.detail.contains("蓝牙 MAC 不一致")));
+            .find(|s| s.step == ShipStep::Verify)
+            .expect("应包含回读校验步骤");
+        assert_eq!(verify_step.verdict, StepVerdict::Pass);
+        assert!(
+            verify_step.detail.contains("sn=6472W1000024"),
+            "{}",
+            verify_step.detail
+        );
+        assert!(
+            verify_step.detail.contains("uuid=uuid95fe79695a6df72f"),
+            "{}",
+            verify_step.detail
+        );
+        assert!(
+            verify_step
+                .detail
+                .contains("auth_key=B7uTB4QjoSLw55oHLk2wPSokAAwWXENH"),
+            "{}",
+            verify_step.detail
+        );
+        let report_text = std::fs::read_to_string(report.unwrap()).unwrap();
+        assert!(report_text.contains("sn=6472W1000024"), "{report_text}");
     }
 
-    /// 端到端 eSIM：凭据 + 4G 参数写入（首轮回读缺行自动整轮重试通过）。
+    /// 端到端 eSIM：凭据 + 4G 参数写入（首轮回读缺行自动整轮重试通过；cf20 使用真机 `=` 格式）。
     #[test]
     fn ship_flow_e02e_credentials_and_4g_retry() {
         let _lock = crate::exec::TEST_LOCK
@@ -2215,7 +2110,7 @@ case \"$*\" in
     ;;
   *'camera-factory 10'*) printf 'MAC:9999A3B4C5D6\\n';;
   *'camera-factory 3'*) printf 'sn-address:00001\\nsoft-ware:E02E-2.0.1\\n';;
-  *'camera-factory 20'*) printf 'imei:864192051234567\\nccid:898608691025D0768737\\n';;
+  *'camera-factory 20'*) printf 'imei=864192051234567\\nccid=898608691025D0768737\\n';;
   *'camera-factory 7'*) printf 'bt-ver:V2_0_1\\n';;
   *'camera-factory 12'*) printf 'Vol:4.100,cur:0.200\\n';;
   *'camera-factory 8'*) printf 'true\\n';;
@@ -2260,7 +2155,6 @@ esac
         let mut prov = ProvisionCfg {
             gate_mode: GateMode::Off,
             auto_commit: true,
-            reboot_verify_secs: 0,
             ..Default::default()
         };
         prov.e02e.t32_ver = "E02E-2.0.1".into();
@@ -2335,7 +2229,6 @@ esac
             ..Default::default()
         };
         e02e_cfg.provision.gate_mode = GateMode::Off;
-        e02e_cfg.provision.reboot_verify_secs = 0;
         e02e_cfg.provision.e02e.t32_ver = "E02E-2.0.1".into();
         e02e_cfg.provision.e02e.bt_ver = "V2_0_1".into();
         let (_, pass, _, steps) = run_and_collect("6472E1000012", env1.ctx(e02e_cfg.clone()), true);

@@ -160,8 +160,8 @@ pub fn parse_battery_volts(output: &str) -> Option<f32> {
     None
 }
 
-/// cf7 蓝牙版本提取（FQC §2：输出格式未定，联调校准）。取含 ver 的行，
-/// 冒号后为版本；无则取首个非空行。
+/// cf7 蓝牙版本提取（FQC §2）。取含 ver 的行，
+/// 冒号或等号后为版本；无则取首个非空行。
 pub fn parse_bt_version(output: &str) -> Option<String> {
     let lines: Vec<&str> = output
         .lines()
@@ -172,7 +172,11 @@ pub fn parse_bt_version(output: &str) -> Option<String> {
         .iter()
         .find(|l| l.to_lowercase().contains("ver"))
         .or_else(|| lines.first())?;
-    let v = hit.split_once(':').map(|(_, v)| v).unwrap_or(hit);
+    let v = hit
+        .split_once(':')
+        .or_else(|| hit.split_once('='))
+        .map(|(_, v)| v)
+        .unwrap_or(hit);
     let v = v.trim();
     (!v.is_empty()).then(|| v.to_string())
 }
@@ -188,6 +192,9 @@ pub struct DeviceInfo {
     pub wifi_mac: String,
     pub bt_mac: String,
     pub t32_ver: String,
+    /// 蓝牙固件版本（`camera-factory 7` 读取）
+    #[serde(default)]
+    pub bt_ver: String,
     pub hardware_ver: String,
     pub battery: String,
     /// eSIM 型（E02E）IMEI，`camera-factory 20` 读（V3.14）
@@ -199,13 +206,14 @@ pub struct DeviceInfo {
 }
 
 impl DeviceInfo {
-    /// 用非空字段覆盖合并（camera-factory 3 / 10 / 20 返回的字段子集不同）。
+    /// 用非空字段覆盖合并（camera-factory 3 / 7 / 10 / 20 返回的字段子集不同）。
     pub fn merge(&mut self, other: DeviceInfo) {
         let DeviceInfo {
             sn,
             wifi_mac,
             bt_mac,
             t32_ver,
+            bt_ver,
             hardware_ver,
             battery,
             imei,
@@ -216,6 +224,7 @@ impl DeviceInfo {
             (&mut self.wifi_mac, wifi_mac),
             (&mut self.bt_mac, bt_mac),
             (&mut self.t32_ver, t32_ver),
+            (&mut self.bt_ver, bt_ver),
             (&mut self.hardware_ver, hardware_ver),
             (&mut self.battery, battery),
             (&mut self.imei, imei),
@@ -228,7 +237,7 @@ impl DeviceInfo {
     }
 }
 
-/// 解析 `camera-factory 3` / `10` 的输出（样例见仓库 T32.txt）。
+/// 解析 `camera-factory 3` / `10` / `20` 的输出（样例见仓库 T32.txt）。
 pub fn parse_device_info(output: &str) -> Result<DeviceInfo> {
     let mut info = DeviceInfo::default();
     for line in output.lines() {
@@ -245,16 +254,19 @@ pub fn parse_device_info(output: &str) -> Result<DeviceInfo> {
             info.bt_mac = v.trim().to_uppercase();
         } else if let Some(v) = line.strip_prefix("Battery voltage:") {
             info.battery = v.trim().to_string();
-        } else if let Some(v) = ci_prefix(line, "imei:") {
-            info.imei = v.trim().to_string();
-        } else if let Some(v) = ci_prefix(line, "ccid:") {
-            info.ccid = v.trim().to_string();
+        } else if let Some(v) = ci_kv(line, "bt-ver") {
+            info.bt_ver = v.to_string();
+        } else if let Some(v) = ci_kv(line, "imei") {
+            info.imei = v.to_string();
+        } else if let Some(v) = ci_kv(line, "ccid") {
+            info.ccid = v.to_uppercase();
         }
     }
     let has_any = !(info.sn.is_empty()
         && info.wifi_mac.is_empty()
         && info.bt_mac.is_empty()
         && info.t32_ver.is_empty()
+        && info.bt_ver.is_empty()
         && info.imei.is_empty()
         && info.ccid.is_empty());
     if !has_any {
@@ -263,13 +275,14 @@ pub fn parse_device_info(output: &str) -> Result<DeviceInfo> {
     Ok(info)
 }
 
-/// 大小写不敏感的行前缀（imei:/ccid: 固件大小写未定，联调前放宽）。
-fn ci_prefix<'a>(line: &'a str, prefix: &str) -> Option<&'a str> {
-    if line.len() >= prefix.len() && line[..prefix.len()].eq_ignore_ascii_case(prefix) {
-        Some(&line[prefix.len()..])
-    } else {
-        None
+/// 大小写不敏感的键值行解析：同时兼容 `key:val` 与 `key=val`（真机 `cf20` 实测为 `imei=...` / `ccid=...`）。
+fn ci_kv<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    if line.len() < key.len() || !line[..key.len()].eq_ignore_ascii_case(key) {
+        return None;
     }
+    let rest = line[key.len()..].trim_start();
+    let val = rest.strip_prefix(':').or_else(|| rest.strip_prefix('='))?;
+    Some(val.trim())
 }
 
 /// IMEI 格式（V3.14 E02E）：纯数字 14–16 位（标称 15；容差到联调校准）。
@@ -640,10 +653,20 @@ mod tests {
         let d = parse_device_info("imei:864192051234567\nccid:89860115123456789012\n").unwrap();
         assert_eq!(d.imei, "864192051234567");
         assert_eq!(d.ccid, "89860115123456789012");
-        // 大写前缀（固件大小写未定，ci_prefix 放宽）
+        // 大写前缀（固件大小写未定，ci_kv 放宽）
         let d = parse_device_info("IMEI:864192051234568\r\nCCID:89860115123456789013\r\n").unwrap();
         assert_eq!(d.imei, "864192051234568");
         assert_eq!(d.ccid, "89860115123456789013");
+        // 真机 camera-factory 20 实测格式：使用 `=` 分隔（2026-11-24 产线日志）
+        let d = parse_device_info("imei=556575645345353\nccid=111233432455534356\n").unwrap();
+        assert_eq!(d.imei, "556575645345353");
+        assert_eq!(d.ccid, "111233432455534356");
+        assert!(imei_valid(&d.imei));
+        assert!(ccid_valid(&d.ccid));
+        // 含空白与小写十六进制 CCID 自动大写归一
+        let d = parse_device_info("IMEI = 864192051234567\nCCID = 898608691025d0768737\n").unwrap();
+        assert_eq!(d.imei, "864192051234567");
+        assert_eq!(d.ccid, "898608691025D0768737");
         // 只有 imei/ccid 也算有效输出（has_any）
         assert!(parse_device_info("").is_err());
         // IMEI 校验：标称 15 位，容差 14–16
@@ -776,6 +799,7 @@ mod tests {
     #[test]
     fn bt_version_extract() {
         assert_eq!(parse_bt_version("bt-ver:V1_7_4"), Some("V1_7_4".into()));
+        assert_eq!(parse_bt_version("bt-ver=V3_9_2"), Some("V3_9_2".into()));
         assert_eq!(
             parse_bt_version("BT Version: V1.7.4"),
             Some("V1.7.4".into())

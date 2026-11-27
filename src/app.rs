@@ -1,5 +1,6 @@
 //! 应用状态与窗口装配：worker 事件消费、媒体显示、人工判定应答、三工位统一布局。
 
+use crate::auth::{self, AuthRole};
 use crate::config::{self, Config};
 use crate::devwatch::{self, DevState};
 use crate::engine::events::{UiEvent, UiResponse};
@@ -144,6 +145,8 @@ pub struct ShipUi {
     pub cred_preview: String,
     /// 操作回执提示
     pub note: String,
+    /// 最近一次导出的出货明细 CSV 路径（用于「打开文件位置」）
+    pub last_export_path: Option<PathBuf>,
     /// 出货 CSV 勾选：附带 auth_key（默认只导 uuid）
     pub include_auth_key: bool,
     /// 作废输入（SN 或 uuid）
@@ -188,6 +191,7 @@ impl Default for ShipUi {
             sn_preview: String::new(),
             cred_preview: String::new(),
             note: String::new(),
+            last_export_path: None,
             include_auth_key: false,
             void_input: String::new(),
             void_armed: false,
@@ -199,12 +203,48 @@ impl Default for ShipUi {
     }
 }
 
+/// 设置页管理员登录与改密 UI 状态（关闭设置窗自动清空并锁定）。
+pub struct AdminAuthUi {
+    /// 已解锁角色（None = 普通模式，锁定高级设置）
+    pub role: Option<AuthRole>,
+    /// 展开登录输入框
+    pub login_open: bool,
+    pub user_input: String,
+    pub pass_input: String,
+    pub login_err: String,
+    /// 展开修改 admin 密码表单
+    pub change_pwd_open: bool,
+    pub new_pwd: String,
+    pub confirm_pwd: String,
+    pub pwd_msg: String,
+    pub pwd_is_err: bool,
+}
+
+impl Default for AdminAuthUi {
+    fn default() -> Self {
+        Self {
+            role: None,
+            login_open: false,
+            user_input: auth::ADMIN_USER.to_string(),
+            pass_input: String::new(),
+            login_err: String::new(),
+            change_pwd_open: false,
+            new_pwd: String::new(),
+            confirm_pwd: String::new(),
+            pwd_msg: String::new(),
+            pwd_is_err: false,
+        }
+    }
+}
+
 /// 应用全局状态。
 pub struct E02App {
     /// 被测设备信息（测试工位）
     pub device: DeviceInfo,
     /// 设备在位状态（V3.8 USB 插拔监测：开测门槛与拔出中止依据）
     pub dev: DevState,
+    /// 当前连接的这台设备是否已完成过时间同步（同一次接入只校时一次）
+    time_synced: bool,
     /// 各测试项结果，顺序与左侧面板一致
     pub results: Vec<TestResult>,
     /// 测试序列进行中
@@ -225,13 +265,19 @@ pub struct E02App {
     pub config: Config,
     /// 设置窗口开关
     pub settings_open: bool,
+    /// 设置页管理员权限状态
+    pub auth_ui: AdminAuthUi,
+    /// 最近一次导出的绑定记录 CSV 路径
+    pub last_binding_export_path: Option<PathBuf>,
+    /// 最近一次导出绑定记录的回执提示
+    pub binding_export_note: String,
     /// 最近一次报告路径（Finished 时更新，报告中心默认选中用）
     pub last_report: Option<PathBuf>,
     /// 报告中心窗口开关
     pub report_open: bool,
     /// 报告中心筛选维度
     pub report_filter: ui::dialog_report::ReportFilter,
-    /// 报告目录（数据目录下 reports/）
+    /// 报告目录（数据目录下 reports/，内部按 YYYY-MM-DD 日期分目录）
     pub reports_dir: PathBuf,
     /// 今日统计（测试工位）
     pub today: Option<report::DayStats>,
@@ -274,6 +320,7 @@ impl E02App {
         let mut app = Self {
             device: DeviceInfo::default(),
             dev: DevState::Disconnected,
+            time_synced: false,
             results: TestItem::ALL.map(TestResult::new).to_vec(),
             busy: false,
             current: None,
@@ -284,10 +331,13 @@ impl E02App {
             keys_prompt: None,
             config: cfg,
             settings_open: false,
+            auth_ui: AdminAuthUi::default(),
+            last_binding_export_path: None,
+            binding_export_note: String::new(),
             last_report: None,
             report_open: false,
             report_filter: ui::dialog_report::ReportFilter::All,
-            reports_dir: crate::paths::data_dir().join("reports"),
+            reports_dir: crate::paths::reports_dir(),
             today: None,
             report_list: Vec::new(),
             report_sel: None,
@@ -423,12 +473,16 @@ impl E02App {
                 results: self
                     .results
                     .iter()
-                    .filter(|r| active.contains(&r.item))
+                    .filter(|r| active.contains(&r.item) && r.item.available_for(self.model))
                     .cloned()
                     .collect(),
+                skip_time_sync: self.time_synced,
             }
         } else {
-            worker::RunBase::default()
+            worker::RunBase {
+                skip_time_sync: self.time_synced,
+                ..worker::RunBase::default()
+            }
         };
         thread::spawn(move || {
             let report =
@@ -600,7 +654,26 @@ impl E02App {
         }
     }
 
-    /// 导出出货明细 CSV（台账 shipped 记录 × 库存凭据关联）。
+    /// 是否处于管理员已解锁状态。
+    pub fn is_admin(&self) -> bool {
+        self.auth_ui.role.is_some()
+    }
+
+    /// 退出管理员模式并清空全部密码输入缓冲。
+    pub fn lock_admin(&mut self) {
+        self.auth_ui.role = None;
+        self.auth_ui.login_open = false;
+        self.auth_ui.pass_input.clear();
+        self.auth_ui.login_err.clear();
+        self.auth_ui.change_pwd_open = false;
+        self.auth_ui.new_pwd.clear();
+        self.auth_ui.confirm_pwd.clear();
+        self.auth_ui.pwd_msg.clear();
+        self.auth_ui.pwd_is_err = false;
+        self.ledger_clear_armed = false;
+    }
+
+    /// 导出出货明细 CSV（台账 shipped 记录 × 库存凭据关联，存放于 `exports/shipments/`）。
     pub fn export_ship_csv(&mut self) {
         let ledger = crate::ledger::Ledger::load(&crate::ledger::path_of(&self.config));
         let shipped = ledger.shipped();
@@ -635,12 +708,20 @@ impl E02App {
                 auth_key: cred.map(|c| c.auth_key.clone()).unwrap_or_default(),
             });
         }
-        let path = crate::paths::data_dir().join(format!(
+        let dir = crate::paths::shipments_export_dir();
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            let msg = format!("创建出货明细导出目录失败: {e}");
+            self.ship.note = msg.clone();
+            self.push_log(msg);
+            return;
+        }
+        let path = dir.join(format!(
             "出货明细-{}.csv",
             chrono::Local::now().format("%Y%m%d-%H%M%S")
         ));
         match std::fs::write(&path, stock::ship_csv(&rows, self.ship.include_auth_key)) {
             Ok(()) => {
+                self.ship.last_export_path = Some(path.clone());
                 let msg = format!("出货明细已导出 {} 台（{}）", rows.len(), path.display());
                 self.ship.note = format!("出货明细已导出 {} 台：{}", rows.len(), path.display());
                 self.push_log(msg);
@@ -657,6 +738,7 @@ impl E02App {
     fn clear_unit_state(&mut self) {
         self.results = TestItem::ALL.map(TestResult::new).to_vec();
         self.device = DeviceInfo::default();
+        self.time_synced = false;
         self.stop_audio();
         self.media = MediaState::Note("媒体区：拍照显示图片，录像解码后回放".into());
     }
@@ -793,6 +875,7 @@ impl E02App {
                     self.push_log("检测到多台设备，请只连接一台被测耳机");
                 }
                 DevState::Online(sn) => {
+                    self.time_synced = false;
                     self.push_log(format!("设备已连接: {sn}"));
                     if self.config.is_ship_station() {
                         // 出厂写号工位：不自动跑测试；若空闲则复位上一台的写号结论，待扫新码
@@ -813,6 +896,7 @@ impl E02App {
                     }
                 }
                 DevState::Disconnected => {
+                    self.time_synced = false;
                     if was_online {
                         self.push_log("设备已拔出");
                         let shipping = self.ship.busy;
@@ -941,6 +1025,7 @@ impl E02App {
                 }
             }
             UiEvent::Log(s) => self.push_log(s),
+            UiEvent::TimeSynced => self.time_synced = true,
             UiEvent::Finished { report } => {
                 self.busy = false;
                 self.current = None;
@@ -1060,12 +1145,6 @@ impl eframe::App for E02App {
                     );
                     ui::theme::badge(
                         ui,
-                        concat!("v", env!("CARGO_PKG_VERSION")),
-                        ui::theme::MUTED,
-                        ui::theme::CARD,
-                    );
-                    ui::theme::badge(
-                        ui,
                         &format!(
                             "{} · {}",
                             Config::station_label(&self.config.station),
@@ -1143,9 +1222,10 @@ impl eframe::App for E02App {
                             .on_disabled_hover_text("测试或写号进行中，请先等待结束或停止")
                             .clicked()
                         {
+                            self.lock_admin();
+                            self.binding_export_note.clear();
                             self.ledger_view =
                                 crate::ledger::Ledger::load(&crate::ledger::path_of(&self.config));
-                            self.ledger_clear_armed = false;
                             self.reload_fourg_template_buf();
                             self.settings_open = true;
                         }

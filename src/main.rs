@@ -9,6 +9,7 @@
 
 mod adb;
 mod app;
+mod auth;
 mod cli;
 mod config;
 mod devwatch;
