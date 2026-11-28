@@ -1,6 +1,6 @@
 //! 设置窗口（遵循 design-md/claude 规范 + 分级权限管理）：
-//! - 普通模式（无需密码）：仅开放「产品型号」「工位选择」「工单版本（出厂写号）」及「查看/导出设备绑定记录」；
-//! - 管理员模式（输入账号密码解锁）：开放测试项、WiFi/按键/超时/连接、写号检测与流程规则、4G 模板编辑、
+//! - 普通模式（无需密码）：仅开放「产品型号」「工位选择」「产线配网（WiFi 测速率时）」「工单版本（出厂写号）」及「查看/导出设备绑定记录」；
+//! - 管理员模式（输入账号密码解锁）：开放测试项、WiFi 深度/吞吐阈值、按键/超时/连接、写号检测与流程规则、4G 模板编辑、
 //!   删除/清空绑定记录以及修改管理员密码；关闭设置窗口或点击「锁定配置」自动重新锁定。
 
 use crate::app::E02App;
@@ -210,10 +210,17 @@ pub fn show(ctx: &egui::Context, app: &mut E02App) {
                         );
                     });
 
-                    // 3. 出厂写号工位：工单版本号（基础开放，换批次常需修改）
+                    // 3. 基础业务卡片（普通模式开放）：
+                    //    - 出厂写号工位：工单版本号（换批次常需修改）
+                    //    - 测试工位启用 WiFi 速率测试时（如 E02W 整机工位）：产线配网（换产线路由器常需修改）
                     if app.config.is_ship_station() {
                         ui.add_space(12.0);
                         show_ship_version_card(ui, app, &mut changed);
+                    } else if app.model.has_wifi()
+                        && app.config.active_wifi_depth() == WifiDepth::Throughput
+                    {
+                        ui.add_space(12.0);
+                        show_wifi_join_card(ui, app, &mut changed);
                     }
 
                     ui.add_space(12.0);
@@ -292,7 +299,7 @@ fn show_auth_bar(ui: &mut egui::Ui, app: &mut E02App, changed: &mut bool) {
                     theme::dot(ui, theme::MUTED);
                     ui.label(
                         egui::RichText::new(
-                            "普通模式：仅开放型号、工位、工单版本与导出记录；高级配置已锁定",
+                            "普通模式：仅开放型号、工位、产线配网/工单版本与导出记录；高级配置已锁定",
                         )
                         .small()
                         .color(theme::INK),
@@ -518,6 +525,43 @@ fn show_ship_version_card(ui: &mut egui::Ui, app: &mut E02App, changed: &mut boo
                 caption(ui, "核对 cf7 蓝牙版本（不区分大小写）");
                 ui.end_row();
             });
+    });
+}
+
+/// 产线配网基础卡片（WiFi 驱动+速率测试时开放，无需管理员解锁）。
+fn show_wifi_join_card(ui: &mut egui::Ui, app: &mut E02App, changed: &mut bool) {
+    theme::card().show(ui, |ui| {
+        card_begin(ui);
+        card_head(ui, "产线配网", Some("WiFi 速率测试".into()));
+        ui.add_space(4.0);
+        egui::Grid::new("wifi_join")
+            .num_columns(2)
+            .spacing([16.0, 8.0])
+            .show(ui, |ui| {
+                ui.label("产线 SSID");
+                *changed |= ui
+                    .add(
+                        egui::TextEdit::singleline(&mut app.config.wifi.ssid)
+                            .hint_text("留空 = 用耳机当前网络")
+                            .desired_width(190.0),
+                    )
+                    .changed();
+                ui.end_row();
+                ui.label("密码");
+                *changed |= ui
+                    .add(
+                        egui::TextEdit::singleline(&mut app.config.wifi.psk)
+                            .hint_text("开放网络留空")
+                            .desired_width(190.0),
+                    )
+                    .changed();
+                ui.end_row();
+            });
+        ui.add_space(2.0);
+        caption(
+            ui,
+            "填了即每次吞吐测试前推送重连，保证测的是指定 AP；留空则用耳机当前网络",
+        );
     });
 }
 
@@ -763,41 +807,6 @@ fn show_test_admin_cards(ui: &mut egui::Ui, app: &mut E02App, changed: &mut bool
                 caption(
                     ui,
                     "2.4G 单天线理论 72Mbps；阈值建议用金机在产线 AP 上实测校准",
-                );
-            });
-
-            ui.add_space(12.0);
-            theme::card().show(ui, |ui| {
-                card_begin(ui);
-                card_head(ui, "产线配网", None);
-                ui.add_space(4.0);
-                egui::Grid::new("wifi_join")
-                    .num_columns(2)
-                    .spacing([16.0, 8.0])
-                    .show(ui, |ui| {
-                        ui.label("产线 SSID");
-                        *changed |= ui
-                            .add(
-                                egui::TextEdit::singleline(&mut app.config.wifi.ssid)
-                                    .hint_text("留空 = 用耳机当前网络")
-                                    .desired_width(190.0),
-                            )
-                            .changed();
-                        ui.end_row();
-                        ui.label("密码");
-                        *changed |= ui
-                            .add(
-                                egui::TextEdit::singleline(&mut app.config.wifi.psk)
-                                    .hint_text("开放网络留空")
-                                    .desired_width(190.0),
-                            )
-                            .changed();
-                        ui.end_row();
-                    });
-                ui.add_space(2.0);
-                caption(
-                    ui,
-                    "填了即每次吞吐前推送重连，保证测的是指定 AP；留空则用耳机当前网络",
                 );
             });
         }
