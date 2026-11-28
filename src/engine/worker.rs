@@ -1393,10 +1393,20 @@ fn wifi_flow(tx: &Sender<UiEvent>, wifi: &WifiCfg) -> RunOutcome {
                     )));
                     ip = match protocol::parse_fw_wlan_ip(&out) {
                         Some(v) if old_ip.as_deref() == Some(v.as_str()) => {
-                            let _ = tx.send(UiEvent::Log(format!(
-                                "回读 {v} 与重连前相同，先不采信（等地址变化或重跑 5）"
-                            )));
-                            None
+                            // 同路由器双频/同网段（如 HEC → HEC 5G）DHCP 常分回原 IP：
+                            // 顺手核对关联 SSID，已切到目标热点则直接采信，免白等 20s
+                            if assoc_ssid().as_deref() == Some(wifi.ssid.as_str()) {
+                                let _ = tx.send(UiEvent::Log(format!(
+                                    "已切到 {}，地址保持 {v}（同网段正常）",
+                                    wifi.ssid
+                                )));
+                                Some(v)
+                            } else {
+                                let _ = tx.send(UiEvent::Log(format!(
+                                    "回读 {v} 与重连前相同，先不采信（等地址变化或 SSID 切换）"
+                                )));
+                                None
+                            }
                         }
                         rb => rb,
                     };
@@ -1420,15 +1430,21 @@ fn wifi_flow(tx: &Sender<UiEvent>, wifi: &WifiCfg) -> RunOutcome {
                     }
                     std::thread::sleep(std::time::Duration::from_secs(2));
                     let p = probe_ip();
+                    let switched_same_ip = p.is_some()
+                        && p == old_ip
+                        && assoc_ssid().as_deref() == Some(wifi.ssid.as_str());
                     let _ = tx.send(UiEvent::Log(match (&p, &old_ip) {
+                        (Some(p), Some(old)) if p == old && switched_same_ip => {
+                            format!("等地址({}/10): {p}（已切到 {}）", i + 1, wifi.ssid)
+                        }
                         (Some(p), Some(old)) if p == old => {
                             format!("等地址({}/10): {p}（未变化，继续等）", i + 1)
                         }
                         (Some(p), _) => format!("等地址({}/10): {p}", i + 1),
                         (None, _) => format!("等地址({}/10): 无", i + 1),
                     }));
-                    if p != old_ip {
-                        ip = p; // 与旧地址相同 = 陈旧窗口，继续等
+                    if p != old_ip || switched_same_ip {
+                        ip = p; // 地址已变化，或同网段已切到目标 SSID
                     }
                 }
                 if ip.is_some() || round == 1 {
@@ -1608,15 +1624,21 @@ fn wifi_flow(tx: &Sender<UiEvent>, wifi: &WifiCfg) -> RunOutcome {
                 }
             }
         };
-        // 边缘失败自动复测一次（共享 2.4G 下瞬时抢道不冤枉良品；
-        // 命令失败复测过的方向不再重复复测）
+        // 边缘失败或偶发 0Mbps 断流自动复测一次（共享无线环境下瞬时抢道/
+        // 反向流建连空跑不冤枉良品；命令失败已复测过的方向不再重复复测）
         if !o.pass() && t.retest && !o.retested {
+            let zero_stall = o.need > 0.0 && o.mbps <= 0.01;
             let marginal = (o.need > 0.0 && o.mbps >= o.need * 0.5)
                 || o.retr.is_some_and(|v| v <= o.retr_max * 2);
-            if marginal {
-                let _ = tx.send(UiEvent::Log(format!("{label} 边缘失败，复测一次...")));
+            if zero_stall || marginal {
+                let why = if zero_stall {
+                    "0Mbps 异常"
+                } else {
+                    "边缘失败"
+                };
+                let _ = tx.send(UiEvent::Log(format!("{label} {why}，复测一次...")));
                 if let Ok(sum) = run() {
-                    o = outcome(sum, o.retr, true);
+                    o = outcome(sum, None, true);
                 }
             }
         }
@@ -3064,6 +3086,107 @@ mod tests {
         assert_eq!(lines_second, 2, "二次单点测试不应再执行 date -s / cf19");
 
         std::env::remove_var("ADB");
+        crate::exec::clear_abort();
+        let _ = std::fs::remove_dir_all(&base_dir);
+    }
+
+    /// 回归（2026-11-28 真机日志）：
+    /// 1) 同路由器从 HEC 切 HEC 5G 且 DHCP 返回同一 IP（192.168.1.161）时，
+    ///    核对 assoc_ssid 已切换即直接采信，不白等 10 轮；
+    /// 2) 下行 iperf3 偶发 0.0Mbps 时自动复测一次并通过。
+    #[test]
+    fn wifi_same_subnet_ssid_switch_fast_and_zero_mbps_retest() {
+        let _g = crate::exec::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::exec::clear_abort();
+        let base_dir = std::env::temp_dir().join(format!("e02-wifi-reg-{}", std::process::id()));
+        let media = base_dir.join("media");
+        let reports = base_dir.join("reports");
+        std::fs::create_dir_all(&reports).unwrap();
+
+        let iscript = base_dir.join("iperf3-host");
+        std::fs::write(
+            &iscript,
+            "#!/bin/sh\nprintf '%s' '{\"start\":{},\"end\":{\"sum_sent\":{\"bits_per_second\":30e6,\"retransmits\":0}}}'\n",
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&iscript, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let wscript = base_dir.join("adb-wifi-reg");
+        let script = "\
+#!/bin/sh
+d=\"$(dirname \"$0\")\"
+case \"$*\" in
+  *wpa_cli*)
+    if [ -f \"$d/pushed.conf\" ]; then
+      printf 'ssid=HEC 5G\\nwpa_state=COMPLETED\\n'
+    else
+      printf 'ssid=HEC\\nwpa_state=COMPLETED\\n'
+    fi
+    ;;
+  push*)
+    cp \"$2\" \"$d/pushed.conf\" 2>/dev/null
+    printf 'ok\\n'
+    ;;
+  *'camera-factory 5'*)
+    printf 'Successfully initialized wpa_supplicant\\nwlan0-ip: 192.168.1.161\\nwifi-rssi:-28\\n'
+    ;;
+  *'ip -4 addr show wlan0'*)
+    printf 'inet 192.168.1.161/24 brd 192.168.1.255 scope global wlan0\\n'
+    ;;
+  *'iperf3 -c'*)
+    case \"$*\" in
+      *'-R'*)
+        n=$(cat \"$d/dl.n\" 2>/dev/null || echo 0); n=$((n+1)); echo $n > \"$d/dl.n\"
+        if [ \"$n\" -eq 1 ]; then
+          printf '%s' '{\"intervals\":[{\"sum\":{\"bits_per_second\":0}}],\"end\":{\"sum_received\":{\"bits_per_second\":0}}}'
+        else
+          printf '%s' '{\"intervals\":[{\"sum\":{\"bits_per_second\":39e6}}],\"end\":{\"sum_received\":{\"bits_per_second\":39e6}}}'
+        fi
+        ;;
+      *)
+        printf '%s' '{\"intervals\":[{\"sum\":{\"bits_per_second\":22e6}}],\"end\":{\"sum_sent\":{\"bits_per_second\":22e6,\"retransmits\":0}}}'
+        ;;
+    esac
+    ;;
+  *) printf 'ok\\n';;
+esac
+";
+        std::env::set_var("IPERF3", &iscript);
+        std::env::set_var("E02_LOCAL_IP", "192.168.1.183");
+        let mut cfg = Config::default();
+        cfg.wifi.ssid = "HEC 5G".into();
+        cfg.wifi.psk = "12345678".into();
+        let t0 = Instant::now();
+        let (vs, _) = scenario(
+            &wscript,
+            vec![TestItem::Wifi],
+            &media,
+            &reports,
+            cfg,
+            script,
+            || unreachable!(),
+        );
+        let elapsed = t0.elapsed();
+        std::env::remove_var("IPERF3");
+        std::env::remove_var("E02_LOCAL_IP");
+        std::env::remove_var("ADB");
+
+        assert_eq!(vs, vec![(TestItem::Wifi, Verdict::Pass)]);
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "同网段 SSID 已切换不应空等 20s，实测 {elapsed:?}"
+        );
+        let dl_runs: u32 = std::fs::read_to_string(base_dir.join("dl.n"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(dl_runs, 2, "下行 0.0Mbps 应自动复测一次");
+
         crate::exec::clear_abort();
         let _ = std::fs::remove_dir_all(&base_dir);
     }

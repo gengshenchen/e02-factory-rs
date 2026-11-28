@@ -614,6 +614,13 @@ impl Config {
                 complete.items.push("esim".into());
             }
         }
+        // 兼容旧 config.toml：模组工位未单独配置 wifi_depth 时固定默认只测驱动，
+        // 避免在整机工位切速率后污染模组工位。
+        if let Some(module) = cfg.profiles.get_mut("module") {
+            if module.wifi_depth.is_none() {
+                module.wifi_depth = Some(WifiDepth::Driver);
+            }
+        }
         // 迁移早期 `[provision.profiles.e02/e02w/e02e]` 表结构到 `provision.e02w/e02e`
         if !cfg.provision.profiles.is_empty() {
             let old = std::mem::take(&mut cfg.provision.profiles);
@@ -660,12 +667,13 @@ impl Config {
         self.active_profile().wifi_depth.unwrap_or(self.wifi.depth)
     }
 
-    /// 设置当前工位的 WiFi 测试深度（仅影响当前工位档案，并同步写入全局回退字段）。
+    /// 设置当前工位的 WiFi 测试深度（仅更新当前工位档案，不污染其他工位）。
     pub fn set_active_wifi_depth(&mut self, depth: WifiDepth) {
         if let Some(p) = self.profiles.get_mut(&self.station) {
             p.wifi_depth = Some(depth);
+        } else {
+            self.wifi.depth = depth;
         }
-        self.wifi.depth = depth;
     }
 
     /// 当前工位启用的测试项（未知 slug 忽略）。设备信息与蓝牙 MAC 是
@@ -921,5 +929,35 @@ mod tests {
         let loaded: Config = toml::from_str(legacy).unwrap();
         assert!(loaded.is_ship_station());
         assert!(!loaded.provision.e02w.check_sdcard);
+    }
+
+    #[test]
+    fn legacy_config_station_wifi_depth_isolated() {
+        // 旧版 config.toml：全局 wifi.depth = throughput，但 profiles.module 未写 wifi_depth
+        let dir = std::env::temp_dir().join(format!("e02-wifi-iso-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("config.toml");
+        std::fs::write(
+            &p,
+            "station = \"complete\"\n\
+             [wifi]\ndepth = \"throughput\"\n\
+             [profiles.module]\nitems = [\"info\", \"btmac\", \"wifi\"]\n\
+             [profiles.complete]\nitems = [\"info\", \"btmac\", \"wifi\"]\n",
+        )
+        .unwrap();
+        let mut cfg = Config::load(&p).unwrap();
+        assert_eq!(cfg.active_wifi_depth(), WifiDepth::Throughput);
+        cfg.station = "module".into();
+        assert_eq!(
+            cfg.active_wifi_depth(),
+            WifiDepth::Driver,
+            "旧版配置加载后模组工位必须保持只测驱动"
+        );
+        // 在整机工位切深度不影响模组工位
+        cfg.station = "complete".into();
+        cfg.set_active_wifi_depth(WifiDepth::Throughput);
+        cfg.station = "module".into();
+        assert_eq!(cfg.active_wifi_depth(), WifiDepth::Driver);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
